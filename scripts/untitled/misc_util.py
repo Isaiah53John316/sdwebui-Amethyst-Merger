@@ -155,8 +155,10 @@ def save_loaded_model(name,settings):
     return 'Model saved as: '+checkpoint_info.filename
 
 
-def save_state_dict(state_dict,name,settings,timer=None):
-    global recently_saved
+def save_state_dict(state_dict, name, settings, timer=None, discard_keys=None):
+    """
+    Save the state dict to a safetensors file.
+    """
     if 'fp16' in settings:
         fileext = ".fp16.safetensors"
     elif 'bf16' in settings:
@@ -168,34 +170,54 @@ def save_state_dict(state_dict,name,settings,timer=None):
     filename_no_ext = os.path.join(checkpoint_dir, name)
     try:
         filename_no_ext = filename_no_ext[0:225]
-    except: pass
+    except: 
+        pass
 
-    filename = filename_no_ext+fileext
+    filename = filename_no_ext + fileext
     if 'Overwrite' not in settings:
         n = 1
         while os.path.exists(filename):
             filename = f"{filename_no_ext}_{n}{fileext}"
-            n+=1
+            n += 1
+
+    # Log what we're about to filter
+    print(f"\n=== SAVE STATE DICT DEBUG ===")
+    print(f"Keys before filtering: {len(state_dict)}")
+    model_ema_before = sum(1 for k in state_dict.keys() if 'model_ema' in k)
+    print(f"model_ema keys before filtering: {model_ema_before}")
+    
+    # Filter out discarded keys before saving
+    if discard_keys:
+        print(f"Discard keys to remove: {len(discard_keys)}")
+        discard_ema = sum(1 for k in discard_keys if 'model_ema' in k)
+        print(f"model_ema keys in discard list: {discard_ema}")
+        state_dict = {k: v for k, v in state_dict.items() if k not in discard_keys}
+
+    print(f"Keys after filtering: {len(state_dict)}")
+    model_ema_after = sum(1 for k in state_dict.keys() if 'model_ema' in k)
+    print(f"model_ema keys after filtering: {model_ema_after}")
+    print(f"=== END DEBUG ===\n")
 
     if 'fp16' in settings:
-        for key,tensor in state_dict.items():
+        for key, tensor in state_dict.items():
             state_dict[key] = tensor.type(torch.float16)
 
     if 'bf16' in settings:
-        for key,tensor in state_dict.items():
+        for key, tensor in state_dict.items():
             state_dict[key] = tensor.type(torch.bfloat16)
 
     try:
-        safetensors.torch.save_file(state_dict,filename)
+        safetensors.torch.save_file(state_dict, filename)
     except safetensors.SafetensorError:
         print('Failed to save checkpoint. Applying contiguous to tensors and trying again...')
-        for key,tensor in state_dict.items():
+        for key, tensor in state_dict.items():
             state_dict[key] = tensor.contiguous()
-        safetensors.torch.save_file(state_dict,filename)
+        safetensors.torch.save_file(state_dict, filename)
 
     try:
         timer.record('Save checkpoint')
-    except: pass
+    except: 
+        pass
 
     checkpoint_info = sd_models.CheckpointInfo(filename)
     checkpoint_info.register()

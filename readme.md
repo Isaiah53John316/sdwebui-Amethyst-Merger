@@ -1,10 +1,16 @@
-# Untitled Merger - Advanced Model Merging for Stable Diffusion
+# Batteries Included - Advanced Model Merging for Stable Diffusion
 
-A powerful Stable Diffusion checkpoint merging extension with **15 merge algorithms**, **LoRA support**, and **intelligent caching**.
+A powerful Stable Diffusion checkpoint merging extension with **15 merge algorithms**, **LoRA support**, and **intelligent caching.
+
+Warning: LORA TAB IS UNHINGED and may need therapy. We've placed it under heavy supervision while we re-align it's morals. AKA: We've got it under construction because an LLM doesn't understand certain concepts.
 
 ## 🎉 Now Works on Forge!
 
-This is an actively maintained fork of [groinge/sd-webui-untitledmerger](https://github.com/groinge/sd-webui-untitledmerger) with major updates and Forge compatibility!
+This is an ongoing project to give diversity in the webUI economy... er by that we mean...
+
+It works on forge now. We're actively maintaining this and finding new adventurous toys that we can shove into this that gives this that EXPLORATORY FEEL! .. not the suppository feel.
+
+Batteries ARE included because some of us are still running on rechargeable batteries from 30+ years ago.
 
 ### ✨ What's New in This Fork
 
@@ -84,6 +90,8 @@ This is an actively maintained fork of [groinge/sd-webui-untitledmerger](https:/
 This extension builds upon the excellent work of:
 
 - **Original Extension:** [groinge/sd-webui-untitledmerger](https://github.com/groinge/sd-webui-untitledmerger)
+- **Silveroxides Fork** [silveroxides/sd-webui-untitledmerger](https://github.com/silveroxides/sd-webui-untitledmerger)
+- **Our Fork** [ktiseos_nyx/sd-webui-supermerger](https://github.com/Ktiseos-Nyx/sd-webui-untitledmerger)
 - **Supermerger:** [hako-mikan/sd-webui-supermerger](https://github.com/hako-mikan/sd-webui-supermerger) - UI patterns and merge algorithms
 - **DARE/Power-up:** [martyn/safetensors-merge-supermario](https://github.com/martyn/safetensors-merge-supermario) - Research implementation
 - **MergeLM:** [yule-BUAA/MergeLM](https://github.com/yule-BUAA/MergeLM) - Theoretical foundations
@@ -149,6 +157,14 @@ This extension builds upon the excellent work of:
 - [ ] Improve LoRA key matching for better compatibility
 - [ ] Block weight presets compatible with Supermerger format
 - [ ] Merge history logger
+
+
+---
+## Fork history
+
+
+
+Who forked it from this fork:
 
 ---
 

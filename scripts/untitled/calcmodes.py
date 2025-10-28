@@ -202,6 +202,7 @@ class Normal(CalcMode):
     name = 'normal'
     description = 'Standard calculation (no modifications)'
     compatible_modes = ['all']
+    input_models = 4  # Supports all merge modes (max 4 models)
 
     def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, **kwargs):
         return recipe
@@ -214,6 +215,7 @@ class TrainDifferenceCalc(CalcMode):
     name = 'trainDifference'
     description = 'Treats difference as fine-tuning with adaptive scaling'
     compatible_modes = ['Add Difference', 'Triple Sum', 'Sum Twice']  # Works with modes that have differences
+    input_models = 3  # Uses A, B, C
 
     def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, **kwargs):
         # Replace Sub operation with TrainDiff in AddDifference recipes
@@ -236,6 +238,7 @@ class ExtractCalc(CalcMode):
     name = 'extract'
     description = 'Adds (dis)similar features between models using cosine similarity'
     compatible_modes = ['Add Difference']
+    input_models = 3  # Uses A, B, C
 
     slid_a_info = 'model_b - model_c'
     slid_a_config = (0, 1, 0.01)
@@ -266,6 +269,7 @@ class TensorCalc(CalcMode):
     name = 'tensor'
     description = 'Swaps entire tensors from A or B based on probability (not weighted blend)'
     compatible_modes = ['Weight-Sum']
+    input_models = 2  # Uses A, B
 
     slid_a_info = "probability of using model_b"
     slid_a_config = (0, 1, 0.01)
@@ -284,6 +288,7 @@ class SelfCalc(CalcMode):
     name = 'self'
     description = 'Multiply model weights by scalar value (single model operation)'
     compatible_modes = ['Weight-Sum']  # Works as modification of WeightSum with one model
+    input_models = 2  # Compatible with 2-model mode, but only uses A (loads B but ignores)
 
     slid_a_info = "weight multiplier"
     slid_a_config = (0, 2, 0.01)
@@ -301,6 +306,7 @@ class InterpDifferenceCalc(CalcMode):
     name = 'Comparative Interp'
     description = 'Interpolates between values depending on their difference relative to other values'
     compatible_modes = ['Weight-Sum']
+    input_models = 2  # Uses A, B
 
     slid_a_info = "concave - convex"
     slid_a_config = (0, 1, 0.01)
@@ -325,6 +331,7 @@ class ManEnhInterpDifferenceCalc(CalcMode):
     name = 'Enhanced Man Interp'
     description = 'Enhanced interpolation with manual threshold control'
     compatible_modes = ['Weight-Sum']
+    input_models = 2  # Uses A, B
 
     slid_a_info = "interpolation strength"
     slid_a_config = (0, 1, 0.001)
@@ -350,6 +357,7 @@ class AutoEnhInterpDifferenceCalc(CalcMode):
     name = 'Enhanced Auto Interp'
     description = 'Interpolates with automatic threshold calculation'
     compatible_modes = ['Weight-Sum']
+    input_models = 2  # Uses A, B
 
     slid_a_info = "interpolation strength"
     slid_a_config = (0, 1, 0.001)
@@ -373,6 +381,7 @@ class PowerUpCalc(CalcMode):
     name = 'Power-up (DARE)'
     description = 'Adds the capabilities of model B to model A using dropout and rescaling'
     compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3  # Max from compatibles; uses only A, B but loads C if present
 
     slid_a_info = "dropout rate"
     slid_a_config = (0, 1, 0.01)
@@ -397,6 +406,7 @@ class AddDissimilarityCalc(CalcMode):
     name = 'Add Dissimilarities'
     description = 'Adds dissimilar features between model_b and model_c to model_a'
     compatible_modes = ['Add Difference']
+    input_models = 3  # Uses A, B, C
 
     slid_a_info = 'model_b - model_c'
     slid_a_config = (0, 1, 0.01)

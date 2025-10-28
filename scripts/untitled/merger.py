@@ -90,7 +90,7 @@ def parse_arguments(progress,mergemode_name,calcmode_name,model_a,model_b,model_
     checkpoints = []
     progress('Using Checkpoints:')
     for n, model in enumerate((model_a,model_b,model_c,model_d)):
-        if n+1 > calcmode.input_models:
+        if n+1 > mergemode.input_models:
             checkpoints.append('')
             continue
         name = model.split(' ')[0]
@@ -112,8 +112,11 @@ def parse_arguments(progress,mergemode_name,calcmode_name,model_a,model_b,model_
     with safe_open(cmn.primary,framework='pt',device='cpu') as file:
         keys = file.keys()
 
-    discard_regex = re.compile(mutil.target_to_regex(discards))
-    discard_keys = list(filter(lambda x: re.search(discard_regex,x),keys))
+    # CRITICAL FIX: Only create discard_regex if there are actual discard patterns
+    discard_keys = []
+    if discards:  # Only process if discard list is not empty
+        discard_regex = re.compile(mutil.target_to_regex(discards))
+        discard_keys = list(filter(lambda x: re.search(discard_regex,x),keys))
 
     desired_keys = keys
     if cludes:
@@ -155,22 +158,21 @@ def assign_weights_to_keys(targets,keys,already_assigned=None) -> dict:
     return assigned_keys
 
 
-def create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys,checkpoints):
+def create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints):
     tasks = []
     n = 0
     for key in keys:
-        if key in discard_keys:continue
-        elif key in SKIP_KEYS or 'model_ema' in key or 'first_stage_model' in key:
-            tasks.append(oper.LoadTensor(key,cmn.primary))
+        # NOTE: discard_keys should NOT filter during merge, only during save
+        # Removed: if key in discard_keys:continue
+        if key in SKIP_KEYS or 'first_stage_model' in key:
+            tasks.append(oper.LoadTensor(key, cmn.primary))
         elif key in assigned_keys.keys():
             n += 1
-            # Create base recipe from merge mode
-            base_recipe = mergemode.create_recipe(key,*checkpoints,**assigned_keys[key])
-            # Let calc mode modify it
+            base_recipe = mergemode.create_recipe(key, *checkpoints, **assigned_keys[key])
             final_recipe = calcmode.modify_recipe(base_recipe, key, *checkpoints, **assigned_keys[key])
             tasks.append(final_recipe)
         else:
-            tasks.append(oper.LoadTensor(key,cmn.primary))
+            tasks.append(oper.LoadTensor(key, cmn.primary))
 
     progress('Assigned tasks: ')
     progress('Merges', v=n)
@@ -191,7 +193,6 @@ def prepare_merge(progress,save_name,save_settings,finetune,*merge_args):
     sd_unet.apply_unet("None")
     sd_hijack.model_hijack.undo_hijack(shared.sd_model)
 
-    #Merge process begins here:
     state_dict = merge(progress,tasks,checkpoints,finetune,timer)
 
     merge_name = mutil.create_name(checkpoints,f"{mergemode.name}+{calcmode.name}",0)
@@ -201,10 +202,10 @@ def prepare_merge(progress,save_name,save_settings,finetune,*merge_args):
     checkpoint_info.name_for_extra = '_TEMP_MERGE_'+merge_name
 
     if 'Autosave' in save_settings:
-        checkpoint_info = mutil.save_state_dict(state_dict,save_name or merge_name,save_settings,timer)
+        checkpoint_info = mutil.save_state_dict(state_dict, save_name or merge_name, save_settings, timer, discard_keys)
     
     with mutil.NoCaching():
-        mutil.load_merged_state_dict(state_dict,checkpoint_info)
+        mutil.load_merged_state_dict(state_dict, checkpoint_info)
     
     timer.record('Load model')
     del state_dict
