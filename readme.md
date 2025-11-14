@@ -1,3 +1,11 @@
+# Personal Edits and Fixes:
+Contains slider-help, soft-disable, corrected mode logic, corrected slider descriptions, UI fixes.
+LoRA tab fixed inside Blocks context WIP
+Fixed save with model_ema - 
+Works now with Dev branch of Automatic1111 - needed for 50xx.
+
+Feel free to use anything you see.
+
 # Batteries Included - Advanced Model Merging for Stable Diffusion
 
 A powerful Stable Diffusion checkpoint merging extension with **15 merge algorithms**, **LoRA support**, and **intelligent caching.
