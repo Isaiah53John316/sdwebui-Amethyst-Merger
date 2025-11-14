@@ -12,6 +12,7 @@ import torch,os,re,gc,random
 from tqdm import tqdm
 from copy import copy,deepcopy
 from modules import devices,shared,script_loading,paths,paths_internal,sd_models,sd_unet,sd_hijack
+from functools import lru_cache
 
 # Try Forge path first, fallback to old A1111 path for backwards compatibility
 try:
@@ -37,6 +38,9 @@ SKIP_KEYS = [
     "sqrt_recip_alphas_cumprod",
     "sqrt_recipm1_alphas_cumprod"
 ]
+
+# Compile once at module level
+SKIP_KEYS_COMPILED = {key: re.compile(f"^{re.escape(key)}$") for key in SKIP_KEYS}
 
 VALUE_NAMES = ('alpha','beta','gamma','delta')
 
@@ -252,18 +256,14 @@ def merge(progress,tasks,checkpoints,finetune,timer) -> dict:
     with safe_open_multiple(checkpoints,device=cmn.device()) as cmn.loaded_checkpoints:
         with concurrent.futures.ThreadPoolExecutor(max_workers=cmn.opts['threads']) as executor:
             futures = [executor.submit(initialize_task, task) for task in tasks]
-            while True:
-                done, not_done = concurrent.futures.wait(futures,timeout=0.1)
-                progressbar.update(len(done)-progressbar.n)
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                state_dict.update({result[0]: result[1]})
+                progressbar.update(1)
+
                 if cmn.stop:
                     progress.interrupt('Stopped',popup=False)
-                    
-                if len(not_done) == 0:
-                    results = [future.result() for future in done]
-                    break
     
-    state_dict.update(dict(results))
-
     fine = fineman(finetune, 'SDXL' in cmn.checkpoints_types[cmn.primary])
     if finetune:
         for key in FINETUNES:
