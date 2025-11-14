@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import safetensors.torch
 from safetensors import safe_open
 import scripts.untitled.common as cmn
@@ -139,7 +139,7 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
         base_key, lora_type = parse_lora_key(lora_key)
         if base_key is None:
             if progress:
-                progress(f"  ? Could not parse: {lora_key}")
+                progress(f"  ⚠ Could not parse: {lora_key}")
             continue
 
         if base_key not in lora_groups:
@@ -154,7 +154,7 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
     for base_key, lora_parts in lora_groups.items():
         if 'up' not in lora_parts or 'down' not in lora_parts:
             skipped_count += 1
-            debug_info.append(f"  ? Missing up/down for {base_key}")
+            debug_info.append(f"  ⚠ Missing up/down for {base_key}")
             continue
 
         # Find matching checkpoint key
@@ -162,7 +162,7 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
 
         if checkpoint_key is None or checkpoint_tensor is None:
             skipped_count += 1
-            debug_info.append(f"  ? No checkpoint match for {base_key}")
+            debug_info.append(f"  ✗ No checkpoint match for {base_key}")
             continue
 
         try:
@@ -193,17 +193,17 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
                     lora_delta = lora_delta.reshape(original_weight.shape)
                 else:
                     skipped_count += 1
-                    debug_info.append(f"  ? Shape mismatch for {checkpoint_key}: {original_weight.shape} vs {lora_delta.shape}")
+                    debug_info.append(f"  ⚠ Shape mismatch for {checkpoint_key}: {original_weight.shape} vs {lora_delta.shape}")
                     continue
 
             # Apply the LoRA delta
             checkpoint_dict[checkpoint_key] = original_weight + lora_delta.to(original_weight.dtype)
             merged_count += 1
-            debug_info.append(f"  ? Merged {checkpoint_key}")
+            debug_info.append(f"  ✓ Merged {checkpoint_key}")
 
         except Exception as e:
             if progress:
-                progress(f"  ? Error merging {base_key}: {str(e)}")
+                progress(f"  ✗ Error merging {base_key}: {str(e)}")
             skipped_count += 1
             continue
 
@@ -220,7 +220,7 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
     safetensors.torch.save_file(checkpoint_dict, output_path)
 
     if progress:
-        progress(f"? LoRA merge complete!", popup=True)
+        progress(f"✓ LoRA merge complete!", popup=True)
 
     return f"Successfully merged {merged_count} layers (skipped {skipped_count})"
 
@@ -280,6 +280,6 @@ def merge_loras(lora_paths, output_path, weights=None, progress=None):
     safetensors.torch.save_file(merged_dict, output_path)
 
     if progress:
-        progress(f"? LoRA merge complete!", popup=True)
+        progress(f"✓ LoRA merge complete!", popup=True)
 
     return f"Successfully merged {len(lora_paths)} LoRAs into {len(merged_dict)} keys"

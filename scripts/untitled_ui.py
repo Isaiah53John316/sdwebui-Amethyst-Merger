@@ -7,7 +7,7 @@ import shutil
 import torch
 import safetensors
 import safetensors.torch
-from time import time  # ? ADDED
+from time import time  # ✅ ADDED
 from modules import sd_models,script_callbacks,scripts,shared,ui_components,paths,sd_samplers,ui,call_queue
 from modules.ui_common import plaintext_to_html, create_refresh_button
 from scripts.untitled import merger,misc_util
@@ -240,10 +240,10 @@ def mode_changed(mergemode_name, calcmode_name):
     header = f"{mergemode.name} (merge) • {calcmode.name} (calc)"
     slider_help_text = (
         f"{header}\n\n"
-        f"a (alpha): {a_info or '-'}\n"
-        f"ß (beta) : {b_info or '-'}\n"
-        f"? (gamma): {c_info or '-'}\n"
-        f"d (delta): {d_info or '-'}\n\n"
+        f"α (alpha): {a_info or '-'}\n"
+        f"β (beta) : {b_info or '-'}\n"
+        f"γ (gamma): {c_info or '-'}\n"
+        f"δ (delta): {d_info or '-'}\n\n"
         f"(Note: unused sliders are visible but disabled.)"
     )
     slider_help_update = gr.update(value=slider_help_text)
@@ -343,24 +343,24 @@ def validate_merge_config(model_a, model_b, weight_editor, merge_mode):
     errors = []
     
     if not model_a or model_a == "":
-        errors.append("? Model A (Primary) is required")
+        errors.append("❌ Model A (Primary) is required")
     if not model_b or model_b == "":
-        errors.append("? Model B (Secondary) is required")
+        errors.append("❌ Model B (Secondary) is required")
     
     if weight_editor.strip() == "":
-        errors.append("?? Weight editor is empty - only default-to-A merge will occur")
+        errors.append("⚠️ Weight editor is empty - only default-to-A merge will occur")
     
     try:
         lines = [l.strip() for l in weight_editor.split('\n') if l.strip() and not l.strip().startswith('#')]
         for line in lines:
             if ':' not in line:
-                errors.append(f"? Invalid syntax: '{line}' (missing colon)")
+                errors.append(f"❌ Invalid syntax: '{line}' (missing colon)")
     except:
         pass
     
     if errors:
         return False, '\n'.join(errors)
-    return True, "? Configuration valid"
+    return True, "✓ Configuration valid"
 
 # ---------------------------
 # UI: build tabs
@@ -398,7 +398,7 @@ def on_ui_tabs():
                         with gr.Column(variant='compact',min_width=150,scale=slider_scale):
                             with gr.Row():
                                 model_a = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_a [Primary]",scale=slider_scale)
-                                swap_models_AB = gr.Button(value='?', elem_classes=["tool"],scale=1)
+                                swap_models_AB = gr.Button(value='⇆', elem_classes=["tool"],scale=1)
                             model_a_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
                             # update model info when changed
                             model_a.change(fn=checkpoint_changed, inputs=model_a, outputs=model_a_info)
@@ -407,21 +407,21 @@ def on_ui_tabs():
                         with gr.Column(variant='compact',min_width=150,scale=slider_scale):
                             with gr.Row():
                                 model_b = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_b [Secondary]",scale=slider_scale)
-                                swap_models_BC = gr.Button(value='?', elem_classes=["tool"],scale=1)
+                                swap_models_BC = gr.Button(value='⇆', elem_classes=["tool"],scale=1)
                             model_b_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
                             model_b.change(fn=checkpoint_changed,inputs=model_b,outputs=model_b_info)
 
                         with gr.Column(variant='compact',min_width=150,scale=slider_scale):
                             with gr.Row():
                                 model_c = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_c [Tertiary]",scale=slider_scale)
-                                swap_models_CD = gr.Button(value='?', elem_classes=["tool"],scale=1)
+                                swap_models_CD = gr.Button(value='⇆', elem_classes=["tool"],scale=1)
                             model_c_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
                             model_c.change(fn=checkpoint_changed,inputs=model_c,outputs=model_c_info)
 
                         with gr.Column(variant='compact',min_width=150,scale=slider_scale):
                             with gr.Row():
                                 model_d = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_d [Supplementary]",scale=slider_scale)
-                                refresh_button = gr.Button(value='??', elem_classes=["tool"],scale=1)
+                                refresh_button = gr.Button(value='🔄', elem_classes=["tool"],scale=1)
                             model_d_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
                             model_d.change(fn=checkpoint_changed,inputs=model_d,outputs=model_d_info)
 
@@ -445,19 +445,19 @@ def on_ui_tabs():
 
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
 
-                    # MAIN SLIDERS - ? Updated to 0.0000001 for 7 decimal places (float32 precision)
+                    # MAIN SLIDERS - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
                     with gr.Row(equal_height=True):
-                        alpha = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_a [a] (alpha)", info='model_a - model_b', value=0.5, elem_classes=['main_sliders'])
-                        beta  = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_b [ß] (beta)",  info='-', value=0.5, elem_classes=['main_sliders'])
-                        gamma = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_c [?] (gamma)", info='-', value=0.25, elem_classes=['main_sliders'])
-                        delta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_d [d] (delta)", info='-', value=0.25, elem_classes=['main_sliders'])
+                        alpha = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_a [α] (alpha)", info='model_a - model_b', value=0.5, elem_classes=['main_sliders'])
+                        beta  = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_b [β] (beta)",  info='-', value=0.5, elem_classes=['main_sliders'])
+                        gamma = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_c [γ] (gamma)", info='-', value=0.25, elem_classes=['main_sliders'])
+                        delta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_d [δ] (delta)", info='-', value=0.25, elem_classes=['main_sliders'])
 
                     # CUSTOM SLIDERS UI
                     with ui_components.InputAccordion(False, label='Custom sliders') as enable_sliders:
                         with gr.Accordion(label = 'Presets'):
                             with gr.Row(variant='compact'):
                                 sliders_preset_dropdown = gr.Dropdown(label='Preset Name',allow_custom_value=True,choices=get_slider_presets(),value='blocks',scale=4)
-                                slider_refresh_button = gr.Button(value='??', elem_classes=["tool"],scale=1,min_width=40)
+                                slider_refresh_button = gr.Button(value='🔄', elem_classes=["tool"],scale=1,min_width=40)
                                 slider_refresh_button.click(fn=lambda:gr.update(choices=get_slider_presets()),outputs=sliders_preset_dropdown)
                                 sliders_preset_load = gr.Button(variant='secondary',value='Load presets',scale=2)
                                 sliders_preset_save = gr.Button(variant='secondary',value='Save sliders as preset',scale=2)
@@ -476,12 +476,12 @@ def on_ui_tabs():
                                                 custom_sliders.append(gr.Textbox(show_label=False,visible=True,value=slid_defaults.__next__(),placeholder='target',min_width=100,scale=1,lines=1,max_lines=1))
                                                 custom_sliders.append(gr.Slider(show_label=False,value=slid_defaults.__next__(),scale=6,minimum=0,maximum=1,step=0.0000001))
 
-                    # Supermerger Adjust - ? Updated to 0.0000001 for 7 decimal places (float32 precision)
+                    # Supermerger Adjust - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
                     with gr.Accordion("Supermerger Adjust", open=False) as acc_ad:
                         with gr.Row(variant="compact"):
                             finetune = gr.Textbox(label="Adjust", show_label=False, info="Adjust IN,OUT,OUT2,Contrast,Brightness,COL1,COL2,COL3", visible=True, value="", lines=1)
-                            finetune_write = gr.Button(value="?", elem_classes=["tool"])
-                            finetune_read = gr.Button(value="?", elem_classes=["tool"])
+                            finetune_write = gr.Button(value="↑", elem_classes=["tool"])
+                            finetune_read = gr.Button(value="↓", elem_classes=["tool"])
                             finetune_reset = gr.Button(value="\U0001f5d1\ufe0f", elem_classes=["tool"])
                         with gr.Row(variant="compact"):
                             with gr.Column(scale=1, min_width=100):
@@ -631,7 +631,7 @@ def on_ui_tabs():
                     validation_output = gr.Textbox(
                         max_lines=3,
                         label="Validation",
-                        value="? Ready",
+                        value="✓ Ready",
                         interactive=False,
                         lines=3
                     )
@@ -767,7 +767,7 @@ Differences:
             
         # LoRA Tab
         with gr.Tab("LoRA", elem_id="tab_lora"):
-            gr.Markdown("## ?? LORA MERGING\nLoRA merging is functional but experimental. Needs real-world testing and refinement. Use at your own risk!")
+            gr.Markdown("## ⚠️ LORA MERGING\nLoRA merging is functional but experimental. Needs real-world testing and refinement. Use at your own risk!")
             lora_status = gr.Textbox(max_lines=20,lines=12,show_label=False,info="",interactive=False,render=True)
 
             with gr.Accordion("Merge LoRA(s) to Checkpoint", open=True):
@@ -830,11 +830,11 @@ Differences:
                 outputs=lora_status
             )
             
-        # ? ENHANCEMENT 3: Merge Presets & History Tab
+        # ✅ ENHANCEMENT 3: Merge Presets & History Tab
         with gr.Tab("Presets & History"):
             with gr.Row():
                 with gr.Column():
-                    gr.Markdown("## ?? Saved Merge Presets")
+                    gr.Markdown("## 📋 Saved Merge Presets")
                     
                     with gr.Row():
                         preset_selector = gr.Dropdown(
@@ -842,7 +842,7 @@ Differences:
                             label="Select Preset",
                             scale=3
                         )
-                        preset_refresh_btn = gr.Button("??", scale=1)
+                        preset_refresh_btn = gr.Button("🔄", scale=1)
                     
                     with gr.Row():
                         preset_load_btn = gr.Button("Load Preset", variant="primary", scale=2)
@@ -863,7 +863,7 @@ Differences:
                         preset_save_btn = gr.Button("Save", variant="secondary", scale=1)
                 
                 with gr.Column():
-                    gr.Markdown("## ?? Merge History")
+                    gr.Markdown("## 📊 Merge History")
                     
                     history_display = gr.Textbox(
                         label="Recent Merges",
@@ -928,16 +928,16 @@ script_callbacks.on_ui_tabs(on_ui_tabs)
 def start_merge(*args):
     progress = Progress()
     try:
-        # ? ENHANCEMENT 2: Initialize real-time ETA tracking
+        # ✅ ENHANCEMENT 2: Initialize real-time ETA tracking
         progress.start_merge(1000)  # Will be updated during merge
         
         merger.prepare_merge(progress, *args)
         
-        # ? Save to history on success
+        # ✅ Save to history on success
         save_to_history({
             'models': str(args[3:7]),
             'modes': f"{args[2]}+{args[1]}"
-        }, "? Success")
+        }, "✓ Success")
         
     except Exception as error:
         merger.clear_cache()
@@ -945,7 +945,7 @@ def start_merge(*args):
             sd_models.reload_model_weights(forced_reload=True)
         
         # Save failed merge to history
-        save_to_history({'status': 'Failed'}, f"? {str(error)[:30]}")
+        save_to_history({'status': 'Failed'}, f"✗ {str(error)[:30]}")
         
         if not isinstance(error,merger.MergeInterruptedError):
             raise
@@ -1046,7 +1046,7 @@ def merge_loras_ui(lora1, weight1, lora2, weight2, lora3, weight3, output_name):
     except Exception as e:
         return f"Error: {str(e)}"
 
-# ? ENHANCEMENT 1: Merge Presets Management
+# ✅ ENHANCEMENT 1: Merge Presets Management
 def get_merge_presets():
     """Load all merge presets"""
     try:
@@ -1066,7 +1066,7 @@ def save_merge_preset(preset_name, model_a_val, model_b_val, model_c_val, model_
         presets = {}
     
     if not preset_name or preset_name.strip() == '':
-        return "? Preset name required"
+        return "❌ Preset name required"
     
     presets[preset_name] = {
         'model_a': model_a_val,
@@ -1085,7 +1085,7 @@ def save_merge_preset(preset_name, model_a_val, model_b_val, model_c_val, model_
     with open(merge_presets_filename, 'w') as f:
         json.dump(presets, f, indent=2)
     
-    return f"? Preset '{preset_name}' saved"
+    return f"✓ Preset '{preset_name}' saved"
 
 def load_merge_preset(preset_name):
     """Load merge configuration from preset"""
@@ -1094,7 +1094,7 @@ def load_merge_preset(preset_name):
             presets = json.load(f)
         
         if preset_name not in presets:
-            return [gr.update()] * 14 + ["? Preset not found"]
+            return [gr.update()] * 14 + ["❌ Preset not found"]
         
         preset = presets[preset_name]
         updates = [
@@ -1112,11 +1112,11 @@ def load_merge_preset(preset_name):
             gr.update(value=preset.get('discard', '')),
             gr.update(value=preset.get('clude', '')),
             gr.update(value=preset.get('clude_mode', 'Exclude')),
-            f"? Loaded preset: {preset_name}"
+            f"✓ Loaded preset: {preset_name}"
         ]
         return updates
     except Exception as e:
-        return [gr.update()] * 14 + [f"? Error loading preset: {str(e)}"]
+        return [gr.update()] * 14 + [f"❌ Error loading preset: {str(e)}"]
 
 def delete_merge_preset(preset_name):
     """Delete a saved preset"""
@@ -1128,13 +1128,13 @@ def delete_merge_preset(preset_name):
             del presets[preset_name]
             with open(merge_presets_filename, 'w') as f:
                 json.dump(presets, f, indent=2)
-            return f"? Deleted preset: {preset_name}", gr.update(choices=list(presets.keys()))
+            return f"✓ Deleted preset: {preset_name}", gr.update(choices=list(presets.keys()))
         else:
-            return "? Preset not found", gr.update()
+            return "❌ Preset not found", gr.update()
     except Exception as e:
-        return f"? Error: {str(e)}", gr.update()
+        return f"❌ Error: {str(e)}", gr.update()
 
-# ? ENHANCEMENT 2: Merge History Tracking
+# ✅ ENHANCEMENT 2: Merge History Tracking
 def save_to_history(merge_config, result_status):
     """Save successful merge to history"""
     try:
@@ -1166,7 +1166,7 @@ def get_merge_history():
         items = []
         for entry in history[-10:]:  # Last 10
             ts = entry.get('timestamp', '')[:16]
-            status = '?' if 'success' in entry.get('status', '').lower() else '?'
+            status = '✓' if 'success' in entry.get('status', '').lower() else '✗'
             items.append(f"{status} {ts}")
         
         return list(reversed(items))
