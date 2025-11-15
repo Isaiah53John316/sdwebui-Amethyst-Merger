@@ -168,7 +168,7 @@ def create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_key
     for key in keys:
         # NOTE: discard_keys should NOT filter during merge, only during save
         # Removed: if key in discard_keys:continue
-        if key in SKIP_KEYS or 'first_stage_model' in key:
+        if any(regex.match(key) for regex in SKIP_KEYS_COMPILED.values()) or 'first_stage_model' in key:
             tasks.append(oper.LoadTensor(key, cmn.primary))
         elif key in assigned_keys.keys():
             n += 1

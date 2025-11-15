@@ -5,6 +5,7 @@ import scripts.untitled.common as cmn
 import scripts.untitled.misc_util as mutil
 from modules import sd_models
 import re
+import os
 
 
 def get_lora_keys(lora_path):
@@ -103,37 +104,21 @@ def find_checkpoint_key(base_key, checkpoint_keys, checkpoint_dict=None, lora_sh
     return None, None
 
 
-def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1.0, progress=None):
+def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progress=None):
     """
-    Merge a LoRA into a checkpoint by applying the LoRA transformations
-
-    Args:
-        checkpoint_path: Path to base checkpoint
-        lora_path: Path to LoRA file
-        output_path: Where to save merged checkpoint
-        strength: How strongly to apply the LoRA (0-1, can go higher)
-        progress: Progress callback function
+    Applies a single LoRA's transformations to an in-memory checkpoint dictionary.
+    Returns the modified checkpoint dictionary and a summary string.
     """
-    if progress:
-        progress(f"Loading checkpoint: {checkpoint_path}")
-
-    # Load checkpoint
-    with safe_open(checkpoint_path, framework='pt', device='cpu') as checkpoint_file:
-        checkpoint_keys = list(checkpoint_file.keys())
-        checkpoint_dict = {k: checkpoint_file.get_tensor(k) for k in checkpoint_keys}
-
     if progress:
         progress(f"Loading LoRA: {lora_path}")
 
-    # Load LoRA
     with safe_open(lora_path, framework='pt', device='cpu') as lora_file:
         lora_keys = list(lora_file.keys())
         lora_dict = {k: lora_file.get_tensor(k) for k in lora_keys}
 
     if progress:
-        progress(f"Merging LoRA into checkpoint...")
+        progress(f"Applying LoRA transformations...")
 
-    # Group LoRA keys by their base key
     lora_groups = {}
     for lora_key in lora_keys:
         base_key, lora_type = parse_lora_key(lora_key)
@@ -149,15 +134,14 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
     merged_count = 0
     skipped_count = 0
     debug_info = []
+    checkpoint_keys = list(checkpoint_dict.keys()) # Get keys for lookup
 
-    # Apply LoRA to checkpoint
     for base_key, lora_parts in lora_groups.items():
         if 'up' not in lora_parts or 'down' not in lora_parts:
             skipped_count += 1
             debug_info.append(f"  ⚠ Missing up/down for {base_key}")
             continue
 
-        # Find matching checkpoint key
         checkpoint_key, checkpoint_tensor = find_checkpoint_key(base_key, checkpoint_keys, checkpoint_dict, lora_dict[lora_parts['down']].shape)
 
         if checkpoint_key is None or checkpoint_tensor is None:
@@ -166,29 +150,16 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
             continue
 
         try:
-            # Get LoRA components
             lora_up = lora_dict[lora_parts['up']]
             lora_down = lora_dict[lora_parts['down']]
 
-            # Get alpha (default to rank if not present)
-            if 'alpha' in lora_parts:
-                alpha = lora_dict[lora_parts['alpha']].item()
-            else:
-                alpha = float(lora_down.shape[0])  # Use rank as default alpha
-
-            # Calculate rank
+            alpha = lora_dict[lora_parts['alpha']].item() if 'alpha' in lora_parts else float(lora_down.shape[0])
             rank = lora_down.shape[0]
 
-            # Calculate LoRA delta: (up @ down) * (alpha / rank) * strength
-            # up shape: [out_dim, rank], down shape: [rank, in_dim]
-            # Result shape: [out_dim, in_dim]
             lora_delta = (lora_up @ lora_down) * (alpha / rank) * strength
-
-            # Ensure shapes match and handle broadcasting if needed
             original_weight = checkpoint_tensor
             
             if original_weight.shape != lora_delta.shape:
-                # Try to reshape or broadcast
                 if original_weight.numel() == lora_delta.numel():
                     lora_delta = lora_delta.reshape(original_weight.shape)
                 else:
@@ -196,33 +167,52 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
                     debug_info.append(f"  ⚠ Shape mismatch for {checkpoint_key}: {original_weight.shape} vs {lora_delta.shape}")
                     continue
 
-            # Apply the LoRA delta
             checkpoint_dict[checkpoint_key] = original_weight + lora_delta.to(original_weight.dtype)
             merged_count += 1
             debug_info.append(f"  ✓ Merged {checkpoint_key}")
 
         except Exception as e:
             if progress:
-                progress(f"  ✗ Error merging {base_key}: {str(e)}")
+                progress(f"  ✗ Error applying {base_key}: {str(e)}")
             skipped_count += 1
             continue
+    
+    summary = f"Applied {merged_count} layers (skipped {skipped_count}) from {os.path.basename(lora_path)}"
+    return checkpoint_dict, summary
 
+
+def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1.0, progress=None, save_model=True):
+    """
+    Merge a single LoRA into a checkpoint by applying the LoRA transformations.
+    If save_model is False, returns the modified checkpoint_dict instead of saving to disk.
+
+    Args:
+        checkpoint_path: Path to base checkpoint
+        lora_path: Path to LoRA file
+        output_path: Where to save merged checkpoint (only used if save_model is True)
+        strength: How strongly to apply the LoRA (0-1, can go higher)
+        progress: Progress callback function
+        save_model: If True, save the merged model to disk. If False, return the dict.
+    """
     if progress:
-        # Print detailed debug info
-        if debug_info and len(debug_info) <= 20:
-            for info in debug_info:
-                progress(info)
-        
-        progress(f"\nMerged {merged_count} layers, skipped {skipped_count}")
-        progress(f"Saving to: {output_path}")
+        progress(f"Loading base checkpoint: {checkpoint_path}")
 
-    # Save merged checkpoint
-    safetensors.torch.save_file(checkpoint_dict, output_path)
+    with safe_open(checkpoint_path, framework='pt', device='cpu') as checkpoint_file:
+        checkpoint_dict = {k: checkpoint_file.get_tensor(k) for k in checkpoint_file.keys()}
 
-    if progress:
-        progress(f"✓ LoRA merge complete!", popup=True)
+    checkpoint_dict, summary = _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength, progress)
 
-    return f"Successfully merged {merged_count} layers (skipped {skipped_count})"
+    if save_model:
+        if progress:
+            progress(f"Saving merged checkpoint to: {output_path}")
+        safetensors.torch.save_file(checkpoint_dict, output_path)
+        if progress:
+            progress(f"✓ LoRA merge complete!", popup=True)
+        return summary
+    else:
+        if progress:
+            progress(f"✓ LoRA merge applied in-memory (not saved to disk).")
+        return checkpoint_dict, summary
 
 
 def merge_loras(lora_paths, output_path, weights=None, progress=None):

@@ -786,7 +786,10 @@ Differences:
                 with gr.Row():
                     lora_to_ckpt_strength = gr.Slider(minimum=-2, maximum=2, step=0.0000001, value=1.0, label="Global LoRA Strength", info="Apply this strength to all checked LoRAs (1.0 = normal)")
                     lora_to_ckpt_name = gr.Textbox(label="Output Name", placeholder="model_with_loras", info="Name for merged checkpoint")
-
+                
+                with gr.Row():
+                    lora_to_ckpt_save_toggle = gr.Checkbox(label="Save Merged Model to Disk", value=True, info="If unchecked, the model will be loaded temporarily but not saved.")
+                
                 lora_to_ckpt_button = gr.Button("Merge LoRA(s) to Checkpoint", variant="primary")
 
             with gr.Accordion("Merge Multiple LoRAs", open=False):
@@ -815,7 +818,7 @@ Differences:
             # Wire up the LoRA merge buttons
             lora_to_ckpt_button.click(
                 fn=merge_loras_to_checkpoint_ui,
-                inputs=[lora_to_ckpt_checkpoint, lora_checkbox_group, lora_to_ckpt_name, lora_to_ckpt_strength],
+                inputs=[lora_to_ckpt_checkpoint, lora_checkbox_group, lora_to_ckpt_name, lora_to_ckpt_strength, lora_to_ckpt_save_toggle],
                 outputs=lora_status
             )
 
@@ -973,35 +976,61 @@ def checkpoint_changed(name):
     sdversion, dtype = misc_util.id_checkpoint(name)
     return plaintext_to_html(f"{sdversion} | {str(dtype).split('.')[1]}",classname='untitled_sd_version')
 
-def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, strength):
-    """UI wrapper for merging LoRAs to checkpoint"""
+def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, strength, save_model):
+    """UI wrapper for merging multiple LoRAs to a checkpoint"""
     progress = Progress()
     try:
         if not checkpoint_name:
             return "Error: Please select a base checkpoint"
         if not lora_paths or len(lora_paths) == 0:
             return "Error: Please select at least one LoRA"
-        if not output_name:
-            return "Error: Please provide an output name"
+        if not output_name and save_model: # Output name is only required if saving
+            return "Error: Please provide an output name if saving the model"
 
         checkpoint_info = sd_models.get_closet_checkpoint_match(checkpoint_name)
         if not checkpoint_info:
             return f"Error: Could not find checkpoint {checkpoint_name}"
 
-        checkpoint_path = checkpoint_info.filename
-        output_dir = os.path.dirname(checkpoint_path)
+        base_checkpoint_path = checkpoint_info.filename
+        output_dir = os.path.dirname(base_checkpoint_path)
         output_path = os.path.join(output_dir, f"{output_name}.safetensors")
 
-        result = lora_merge.merge_lora_to_checkpoint(
-            checkpoint_path, 
-            lora_paths[0] if lora_paths and len(lora_paths) > 0 else None,
-            output_path,
-            strength=strength,
-            progress=progress
-        )
+        # Load the initial checkpoint into memory
+        if progress:
+            progress(f"Loading base checkpoint: {base_checkpoint_path}")
+        with safetensors.torch.safe_open(base_checkpoint_path, framework='pt', device='cpu') as checkpoint_file:
+            merged_checkpoint_dict = {k: checkpoint_file.get_tensor(k) for k in checkpoint_file.keys()}
+        
+        all_summaries = []
+        for i, lora_path in enumerate(lora_paths):
+            if progress:
+                progress(f"Applying LoRA {i+1}/{len(lora_paths)}: {os.path.basename(lora_path)}")
+            
+            # Apply each LoRA sequentially to the in-memory checkpoint dictionary
+            merged_checkpoint_dict, summary = lora_merge._apply_single_lora_to_dict(
+                merged_checkpoint_dict, 
+                lora_path, 
+                strength=strength, 
+                progress=progress
+            )
+            all_summaries.append(summary)
 
-        sd_models.list_models()
-        return progress.get_report()
+        final_report = "\n".join(all_summaries)
+
+        if save_model:
+            if progress:
+                progress(f"Saving final merged checkpoint to: {output_path}")
+            safetensors.torch.save_file(merged_checkpoint_dict, output_path)
+            if progress:
+                progress(f"✓ All LoRAs merged and saved!", popup=True)
+            final_report += f"\nFinal model saved as: {output_path}"
+        else:
+            if progress:
+                progress(f"✓ All LoRAs merged in-memory (not saved to disk).", popup=True)
+            final_report += "\nModel loaded temporarily (not saved to disk)."
+
+        sd_models.list_models() # Refresh model list in UI
+        return progress.get_report() + "\n" + final_report
     except Exception as e:
         return f"Error: {str(e)}"
 
