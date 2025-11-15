@@ -1,6 +1,6 @@
 # Personal Edits and Fixes:
 Contains slider-help, soft-disable, corrected mode logic, corrected slider descriptions, UI fixes.
-LoRA tab fixed inside Blocks context WIP: cannot merge more than one Lora into Model at a time. Need a AutoSave Toggle. Also need to add autoload after merge.
+LoRA tab fixed inside Blocks context WIP: Keep Autosave Toggle on, it does not temporarily load into memory yet when finished. Be sure to enter name for the checkpoint to be saved on Lora Tab. Multiple Loras can be merged at once now into the same checkpoint.
 Fixed save with model_ema removed from Discard.
 History and Preset Tab added.
 Works now with Dev branch of Automatic1111 - needed for 50xx.
