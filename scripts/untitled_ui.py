@@ -7,6 +7,8 @@ import shutil
 import torch
 import safetensors
 import safetensors.torch
+import tempfile  # Add this import at the top of untitled_ui.py if not already present
+from datetime import datetime  # For cleaner temp naming
 from time import time  # ✅ ADDED
 from modules import sd_models,script_callbacks,scripts,shared,ui_components,paths,sd_samplers,ui,call_queue
 from modules.ui_common import plaintext_to_html, create_refresh_button
@@ -976,7 +978,7 @@ def checkpoint_changed(name):
     sdversion, dtype = misc_util.id_checkpoint(name)
     return plaintext_to_html(f"{sdversion} | {str(dtype).split('.')[1]}",classname='untitled_sd_version')
 
-def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, strength, save_model):
+def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, strength, save_model, verbose=False):
     """UI wrapper for merging multiple LoRAs to a checkpoint"""
     progress = Progress()
     try:
@@ -984,7 +986,7 @@ def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, stren
             return "Error: Please select a base checkpoint"
         if not lora_paths or len(lora_paths) == 0:
             return "Error: Please select at least one LoRA"
-        if not output_name and save_model: # Output name is only required if saving
+        if save_model and not output_name:
             return "Error: Please provide an output name if saving the model"
 
         checkpoint_info = sd_models.get_closet_checkpoint_match(checkpoint_name)
@@ -993,9 +995,8 @@ def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, stren
 
         base_checkpoint_path = checkpoint_info.filename
         output_dir = os.path.dirname(base_checkpoint_path)
-        output_path = os.path.join(output_dir, f"{output_name}.safetensors")
 
-        # Load the initial checkpoint into memory
+        # Load the initial checkpoint into memory (build merged dict)
         if progress:
             progress(f"Loading base checkpoint: {base_checkpoint_path}")
         with safetensors.torch.safe_open(base_checkpoint_path, framework='pt', device='cpu') as checkpoint_file:
@@ -1011,27 +1012,54 @@ def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, stren
                 merged_checkpoint_dict, 
                 lora_path, 
                 strength=strength, 
-                progress=progress
+                progress=progress,
+                verbose=verbose
             )
             all_summaries.append(summary)
 
         final_report = "\n".join(all_summaries)
 
-        if save_model:
-            if progress:
-                progress(f"Saving final merged checkpoint to: {output_path}")
-            safetensors.torch.save_file(merged_checkpoint_dict, output_path)
-            if progress:
-                progress(f"✓ All LoRAs merged and saved!", popup=True)
-            final_report += f"\nFinal model saved as: {output_path}"
-        else:
-            if progress:
-                progress(f"✓ All LoRAs merged in-memory (not saved to disk).", popup=True)
-            final_report += "\nModel loaded temporarily (not saved to disk)."
+        # FIXED: Unload current model if loaded, then load base cleanly, then apply merged state dict
+        if progress:
+            progress("Unloading current model if any, loading base, then applying LoRA merges...")
+        
+        # Unload any existing model to start fresh
+        if shared.sd_model:
+            sd_models.unload_model_weights(shared.sd_model)
+            shared.sd_model = None
+        
+        # Load the clean base model (uses standard init, no meta issues)
+        sd_models.load_model(checkpoint_info)
+        
+        # Apply the full merged state dict to the live model (overlays deltas safely; strict=False for flexibility)
+        shared.sd_model.load_state_dict(merged_checkpoint_dict, strict=False)
+        
+        load_status = f"Loaded '{checkpoint_name}' + LoRAs into memory (applied {len(lora_paths)} LoRAs)."
 
-        sd_models.list_models() # Refresh model list in UI
+        if save_model:
+            # Optional: Save the merged dict to disk
+            if not output_name.endswith('.safetensors'):
+                output_name += '.safetensors'
+            output_path = os.path.join(output_dir, output_name)
+            if progress:
+                progress(f"Saving merged checkpoint to: {output_path}")
+            safetensors.torch.save_file(merged_checkpoint_dict, output_path)
+            final_report += f"\nSaved to: {output_path}"
+            load_status += " Saved to disk."
+
+        final_report += f"\n{load_status}"
+        if progress:
+            progress(f"✓ All LoRAs merged and loaded!", popup=True)
+
+        sd_models.list_models()  # Refresh UI list
         return progress.get_report() + "\n" + final_report
     except Exception as e:
+        # Reload base on error to avoid broken state
+        try:
+            if checkpoint_info:
+                sd_models.load_model(checkpoint_info)
+        except:
+            pass
         return f"Error: {str(e)}"
 
 def merge_loras_ui(lora1, weight1, lora2, weight2, lora3, weight3, output_name):

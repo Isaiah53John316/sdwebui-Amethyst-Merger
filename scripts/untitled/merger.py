@@ -282,6 +282,46 @@ def merge(progress,tasks,checkpoints,finetune,timer) -> dict:
             
     timer.record('Merge')
     return state_dict
+    
+class MergerState:
+    def __init__(self):
+        self.temp_models = {}
+
+    def apply_lora(self, lora_path, strength=1.0, progress=None):
+        """
+        Applies LORA transformations to the current state_dict and stores it in temp_models.
+        """
+        if progress:
+            progress(f"Applying LoRA: {lora_path}")
+
+        base_checkpoint_path = cmn.primary
+        with safe_open(base_checkpoint_path, framework='pt', device='cpu') as checkpoint_file:
+            checkpoint_dict = {k: checkpoint_file.get_tensor(k) for k in checkpoint_file.keys()}
+
+        checkpoint_dict, summary = _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength, progress)
+
+        key = os.path.basename(lora_path)
+        self.temp_models[key] = checkpoint_dict
+
+        if progress:
+            progress(summary)
+        return checkpoint_dict
+
+    def load_temp_model(self, key):
+        """
+        Loads a previously applied LORA model by its key.
+        """
+        if key in self.temp_models:
+            return self.temp_models[key]
+        return None
+
+    def clear_temp_models(self):
+        """
+        Clears all stored temporary models.
+        """
+        self.temp_models.clear()
+
+cmn.merger_state = MergerState()
 
 
 def initialize_task(task) -> tuple:

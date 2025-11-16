@@ -37,8 +37,6 @@ def parse_lora_key(lora_key):
         return None, None
 
     # Convert LoRA naming prefixes to model naming conventions
-    # This is the critical part - must match exactly what's in the checkpoint
-    
     if base_key.startswith('lora_te2_'):
         # SDXL second text encoder: lora_te2_text_model_ -> conditioner.embedders.1.model.
         base_key = base_key.replace('lora_te2_text_model_', 'conditioner.embedders.1.model.', 1)
@@ -59,12 +57,18 @@ def parse_lora_key(lora_key):
     # Convert underscores to dots for pytorch naming, but preserve numeric indices
     # e.g., down_blocks_0_attentions_0 -> down_blocks.0.attentions.0
     base_key = re.sub(r'_(\d+)_', r'.\1.', base_key)
-    # Replace remaining underscores with dots
-    base_key = base_key.replace('_', '.')
+    
+    # FIXED: Map LoRA block names to checkpoint block names (critical for SDXL/Pony)
+    base_key = base_key.replace('down_blocks', 'input_blocks')
+    base_key = base_key.replace('mid_block', 'middle_block')
+    base_key = base_key.replace('up_blocks', 'out.0.blocks')
+    
+    # FIXED: Remove aggressive replace that breaks "proj_in" -> "proj.in"
+    # No need: re.sub already handles hierarchy; module names like "proj_in" keep '_'
     
     # Ensure it ends with .weight if not already a specific suffix
     if not base_key.endswith('.weight') and not base_key.endswith('.bias'):
-        base_key = base_key + '.weight'
+        base_key += '.weight'
 
     return base_key, lora_type
 
@@ -104,7 +108,7 @@ def find_checkpoint_key(base_key, checkpoint_keys, checkpoint_dict=None, lora_sh
     return None, None
 
 
-def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progress=None):
+def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progress=None, verbose=False):
     """
     Applies a single LoRA's transformations to an in-memory checkpoint dictionary.
     Returns the modified checkpoint dictionary and a summary string.
@@ -114,6 +118,8 @@ def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progres
 
     with safe_open(lora_path, framework='pt', device='cpu') as lora_file:
         lora_keys = list(lora_file.keys())
+        if verbose and progress and lora_keys:
+            progress(f"  LoRA keys sample: {lora_keys[:3]}... (total: {len(lora_keys)})")
         lora_dict = {k: lora_file.get_tensor(k) for k in lora_keys}
 
     if progress:
@@ -123,7 +129,7 @@ def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progres
     for lora_key in lora_keys:
         base_key, lora_type = parse_lora_key(lora_key)
         if base_key is None:
-            if progress:
+            if verbose and progress:
                 progress(f"  ⚠ Could not parse: {lora_key}")
             continue
 
@@ -131,23 +137,39 @@ def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progres
             lora_groups[base_key] = {}
         lora_groups[base_key][lora_type] = lora_key
 
+    # Sample checkpoint keys for debugging
+    checkpoint_keys = list(checkpoint_dict.keys())
+    if verbose and progress and checkpoint_keys:
+        progress(f"  Checkpoint keys sample: {checkpoint_keys[:3]}... (total: {len(checkpoint_keys)})")
+
     merged_count = 0
     skipped_count = 0
     debug_info = []
-    checkpoint_keys = list(checkpoint_dict.keys()) # Get keys for lookup
 
     for base_key, lora_parts in lora_groups.items():
+        if verbose and progress:
+            progress(f"  Trying base_key: {base_key} (parts: {list(lora_parts.keys())})")
+        
         if 'up' not in lora_parts or 'down' not in lora_parts:
             skipped_count += 1
-            debug_info.append(f"  ⚠ Missing up/down for {base_key}")
+            msg = f"  ⚠ Missing up/down for {base_key}"
+            debug_info.append(msg)
+            if verbose and progress:
+                progress(msg)
             continue
 
         checkpoint_key, checkpoint_tensor = find_checkpoint_key(base_key, checkpoint_keys, checkpoint_dict, lora_dict[lora_parts['down']].shape)
 
         if checkpoint_key is None or checkpoint_tensor is None:
             skipped_count += 1
-            debug_info.append(f"  ✗ No checkpoint match for {base_key}")
+            msg = f"  ✗ No checkpoint match for {base_key}"
+            debug_info.append(msg)
+            if verbose and progress:
+                progress(msg)
             continue
+
+        if verbose and progress:
+            progress(f"  Found match: {checkpoint_key}")
 
         try:
             lora_up = lora_dict[lora_parts['up']]
@@ -164,12 +186,18 @@ def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progres
                     lora_delta = lora_delta.reshape(original_weight.shape)
                 else:
                     skipped_count += 1
-                    debug_info.append(f"  ⚠ Shape mismatch for {checkpoint_key}: {original_weight.shape} vs {lora_delta.shape}")
+                    msg = f"  ⚠ Shape mismatch for {checkpoint_key}: {original_weight.shape} vs {lora_delta.shape}"
+                    debug_info.append(msg)
+                    if verbose and progress:
+                        progress(msg)
                     continue
 
             checkpoint_dict[checkpoint_key] = original_weight + lora_delta.to(original_weight.dtype)
             merged_count += 1
-            debug_info.append(f"  ✓ Merged {checkpoint_key}")
+            msg = f"  ✓ Merged {checkpoint_key}"
+            debug_info.append(msg)
+            if verbose and progress:
+                progress(msg)
 
         except Exception as e:
             if progress:
@@ -177,11 +205,15 @@ def _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength=1.0, progres
             skipped_count += 1
             continue
     
+    # Log full debug if any issues
+    if debug_info and verbose and progress:
+        progress(f"  Debug summary: {len([d for d in debug_info if '✓' in d])} merged, {skipped_count} skipped")
+    
     summary = f"Applied {merged_count} layers (skipped {skipped_count}) from {os.path.basename(lora_path)}"
     return checkpoint_dict, summary
 
 
-def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1.0, progress=None, save_model=True):
+def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1.0, progress=None, save_model=True, verbose=False):
     """
     Merge a single LoRA into a checkpoint by applying the LoRA transformations.
     If save_model is False, returns the modified checkpoint_dict instead of saving to disk.
@@ -193,6 +225,7 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
         strength: How strongly to apply the LoRA (0-1, can go higher)
         progress: Progress callback function
         save_model: If True, save the merged model to disk. If False, return the dict.
+        verbose: Enable detailed logging
     """
     if progress:
         progress(f"Loading base checkpoint: {checkpoint_path}")
@@ -200,7 +233,7 @@ def merge_lora_to_checkpoint(checkpoint_path, lora_path, output_path, strength=1
     with safe_open(checkpoint_path, framework='pt', device='cpu') as checkpoint_file:
         checkpoint_dict = {k: checkpoint_file.get_tensor(k) for k in checkpoint_file.keys()}
 
-    checkpoint_dict, summary = _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength, progress)
+    checkpoint_dict, summary = _apply_single_lora_to_dict(checkpoint_dict, lora_path, strength, progress, verbose)
 
     if save_model:
         if progress:
