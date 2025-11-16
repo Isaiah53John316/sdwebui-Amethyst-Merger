@@ -1,6 +1,6 @@
 # Personal Edits and Fixes:
 Contains slider-help, soft-disable, corrected mode logic, corrected slider descriptions, greyed out sliders for non-functional ones dependant on setting.
-LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA merges. Be sure to enter name for the checkpoint to be saved on LorRA Tab for saving. Multiple Loras can be merged at once now into the same checkpoint.
+LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA merges. Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving. Multiple Loras can be merged at once now into the same checkpoint.
 Fixed save with model_ema removed from Discard.
 History and Preset Tab added.
 Works now with Dev branch of Automatic1111 - needed for 50xx.
