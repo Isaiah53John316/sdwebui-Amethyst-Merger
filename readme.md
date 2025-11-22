@@ -1,12 +1,18 @@
 # Personal Edits and Fixes:
-Contains slider-help, soft-disable, corrected mode logic, corrected slider descriptions, greyed out sliders for non-functional ones dependant on setting.
-LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA merges. Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving. Multiple Loras can be merged at once now into the same checkpoint.
-Fixed save with model_ema removed from Discard.
-History and Preset Tab added.
-Works now with Dev branch of Automatic1111 - needed for 50xx.
+- Contains slider-help, soft-disable, corrected mode logic, corrected slider descriptions, greyed out sliders for non-functional ones dependant on setting.
+- Performance optimizations and memory optimizations for merging checkpoint to checkpoint.
+- LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA merges. 
+- Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving (same for LoRA to LoRA). 2 - 6 LoRAs can be merged at once now into the same checkpoint with individual weight adjustment.
+- LoRA to LoRA merge now has checkboxes for selection and can now merge differant tensor sizes together. 
+- Fixed save with model_ema removed from Discard causing crash. Removing clip from excluded does allow the clip to be merged changing the output.
+- History and Preset Tab added.
+- Works now with Dev branch of Automatic1111 - needed for 50xx: I suggest updating your xformers to "set XFORMERS_PACKAGE=xformers==0.0.30", using the most recent Flash Attention for the Python version you use. 
+- I use 3.11 Python and 12:8 CUDA in Automatic1111 so for me it would be: https://github.com/PLISGOOD/flash-attention-windows-wheels/releases/tag/v2.7.4.post1. Update in venv.
 
 Planned:
-I want to change the interface for the Lora to Lora merge to simply be check boxes for selection of Loras instead of directories.
+- Save loaded checkpoint on LoRA tab. 
+- Save loaded checkpoint FP32 support. 
+- Forge support - it probably will need a seperate branch.
 
 Feel free to use anything you see. Credit to all below for all their work.
 
