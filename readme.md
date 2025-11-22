@@ -1,7 +1,7 @@
 # Personal Edits and Fixes:
-- Contains slider-help, soft-disable, corrected mode logic, corrected slider descriptions, greyed out sliders for non-functional ones dependant on setting.
+- Corrected slider descriptions, greyed out sliders for non-functional ones dependant on setting.
 - Performance optimizations and memory optimizations for merging checkpoint to checkpoint.
-- LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA merges. 
+- LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA to checkpoint merges. 
 - Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving (same for LoRA to LoRA). 2 - 6 LoRAs can be merged at once now into the same checkpoint with individual weight adjustment.
 - LoRA to LoRA merge now has checkboxes for selection and can now merge differant tensor sizes together. 
 - Fixed save with model_ema removed from Discard causing crash. Removing clip from excluded does allow the clip to be merged changing the output.
