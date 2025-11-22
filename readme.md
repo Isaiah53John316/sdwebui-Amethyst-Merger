@@ -10,9 +10,9 @@
 - ---------------------------------------------------------------------------------------------------------
 
 - Works now with Dev branch of Automatic1111 - needed for 50xx: This is not required for normal function: 
-- I suggest updating your xformers for perforamance increase with additional line of "set XFORMERS_PACKAGE=xformers==0.0.30" in your start.bat, and using the most recent Flash Attention for the Python version you use. 
+- I suggest updating your xformers for performance increase with additional line of "set XFORMERS_PACKAGE=xformers==0.0.30" in your start.bat, and using the most recent Flash Attention for the Python version you use. 
 - I use 3.11 Python and 12:8 CUDA in Automatic1111 so for me it would be: https://github.com/PLISGOOD/flash-attention-windows-wheels/releases/tag/v2.7.4.post1. Update in venv - Use a AI to help figure out which version you need and how to install it.
-- Using these command lines in the start.bat to force enable for 50xx users. "set COMMANDLINE_ARGS=--force-enable-xformers --xformers-flash-attention".
+- Use these command lines in the start.bat to force enable for 50xx users. "set COMMANDLINE_ARGS=--force-enable-xformers --xformers-flash-attention".
 
 -----------------------------------------------------------------------------------------------------------
 
