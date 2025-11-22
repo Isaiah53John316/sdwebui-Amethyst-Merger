@@ -306,3 +306,97 @@ def merge_loras(lora_paths, output_path, weights=None, progress=None):
         progress(f"✓ LoRA merge complete!", popup=True)
 
     return f"Successfully merged {len(lora_paths)} LoRAs into {len(merged_dict)} keys"
+
+def merge_loras_resilient(lora_paths, output_path, weights=None, progress=None):
+    """Safe LoRA merge: auto-resizes mismatched tensors (SD1.5 + SDXL + Pony)"""
+    if weights is None:
+        weights = [1.0 / len(lora_paths)] * len(lora_paths)
+
+    if progress:
+        progress(f"Loading {len(lora_paths)} LoRAs with safe resize...")
+
+    merged = None
+    for i, (path, weight) in enumerate(zip(lora_paths, weights)):
+        if progress:
+            progress(f"Adding {os.path.basename(path)} × {weight:.3f}")
+
+        try:
+            with safetensors.torch.safe_open(path, framework="pt", device="cpu") as f:
+                lora_dict = {k: f.get_tensor(k) for k in f.keys()}
+        except Exception as e:
+            if progress:
+                progress(f"Error loading {path}: {e}")
+            continue
+
+        if merged is None:
+            # First LoRA sets the base shapes
+            merged = {k: t.clone() * weight for k, t in lora_dict.items()}
+            # Track expected shapes
+            expected_shapes = {k: t.shape for k, t in merged.items()}
+        else:
+            for k in lora_dict:
+                if k not in merged:
+                    continue  # Skip keys not in base
+
+                t_new = lora_dict[k] * weight
+                t_base = merged[k]
+
+                # Only resize if shapes differ (and not 1D scalars)
+                if t_new.shape != t_base.shape and len(t_new.shape) > 1:
+                    if progress:
+                        progress(f"Resizing {k}: {t_new.shape} → {t_base.shape}")
+
+                    # Simple pad/trim for matrix shapes (common in LoRAs)
+                    if len(t_new.shape) == 2:  # Linear layers
+                        rows, cols = t_base.shape
+                        if t_new.shape[0] < rows:
+                            # Pad rows
+                            pad_rows = rows - t_new.shape[0]
+                            t_new = torch.nn.functional.pad(t_new, (0, 0, 0, pad_rows))
+                        elif t_new.shape[0] > rows:
+                            # Trim rows
+                            t_new = t_new[:rows, :]
+
+                        if t_new.shape[1] < cols:
+                            # Pad cols
+                            pad_cols = cols - t_new.shape[1]
+                            t_new = torch.nn.functional.pad(t_new, (0, pad_cols))
+                        elif t_new.shape[1] > cols:
+                            # Trim cols
+                            t_new = t_new[:, :cols]
+
+                    elif len(t_new.shape) == 3:  # Conv layers
+                        # Similar padding/trim for H/W dims
+                        c, h, w = t_base.shape
+                        if t_new.shape[1] < h or t_new.shape[2] < w:
+                            # Pad height/width (simple zero-pad)
+                            pad_h = max(0, h - t_new.shape[1])
+                            pad_w = max(0, w - t_new.shape[2])
+                            t_new = torch.nn.functional.pad(t_new, (0, pad_w, 0, pad_h))
+                        else:
+                            # Trim
+                            t_new = t_new[:, :h, :w]
+
+                    # Final force-resize if still mismatched (rare)
+                    if t_new.shape != t_base.shape:
+                        t_new = torch.nn.functional.interpolate(
+                            t_new.unsqueeze(0),  # Add batch dim temporarily
+                            size=t_base.shape[1:],  # Target spatial dims
+                            mode='bilinear' if len(t_base.shape) == 3 else 'linear'
+                        ).squeeze(0)
+
+                # Add to merged
+                merged[k] += t_new
+
+    if merged is None:
+        return "Error: No valid LoRAs loaded"
+
+    if progress:
+        progress("Saving merged LoRA...")
+    safetensors.torch.save_file(merged, output_path)
+
+    key_count = len(merged)
+    if progress:
+        progress(f"Saved {key_count} tensors → {os.path.basename(output_path)}")
+
+    return f"Merged {len(lora_paths)} LoRAs ({key_count} keys) → {os.path.basename(output_path)}"
