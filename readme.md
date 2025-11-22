@@ -6,8 +6,11 @@
 - LoRA to LoRA merge now has checkboxes for selection and can now merge differant tensor sizes together. 
 - Fixed save with model_ema removed from Discard causing crash. Removing clip from excluded does allow the clip to be merged changing the output.
 - History and Preset Tab added.
-- Works now with Dev branch of Automatic1111 - needed for 50xx: I suggest updating your xformers to "set XFORMERS_PACKAGE=xformers==0.0.30", using the most recent Flash Attention for the Python version you use. 
-- I use 3.11 Python and 12:8 CUDA in Automatic1111 so for me it would be: https://github.com/PLISGOOD/flash-attention-windows-wheels/releases/tag/v2.7.4.post1. Update in venv.
+
+- Works now with Dev branch of Automatic1111 - needed for 50xx: This is not required for normal function: 
+- I suggest updating your xformers for perforamance increase with additional line of "set XFORMERS_PACKAGE=xformers==0.0.30" in your start.bat, and using the most recent Flash Attention for the Python version you use. 
+- I use 3.11 Python and 12:8 CUDA in Automatic1111 so for me it would be: https://github.com/PLISGOOD/flash-attention-windows-wheels/releases/tag/v2.7.4.post1. Update in venv - Use a AI to help figure out which version you need and how to install it.
+- Using these command lines in the start.bat to force enable for 50xx users. "set COMMANDLINE_ARGS=--force-enable-xformers --xformers-flash-attention".
 
 Planned:
 - Save loaded checkpoint on LoRA tab. 
