@@ -1,12 +1,16 @@
 # Personal Edits and Fixes:
-- Corrected slider descriptions, greyed out sliders for non-functional ones dependant on setting.
-- Performance optimizations and memory optimizations for merging checkpoint to checkpoint.
+- UI updated - Huge WIP.
+- Performance optimizations and memory optimizations.
 - LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA to checkpoint merges. 
-- Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving (same for LoRA to LoRA). 2 - 6 LoRAs can be merged at once now into the same checkpoint with individual weight adjustment.
+- Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving (same for LoRA to LoRA). 2 - 6+ LoRAs can be merged at once now into the same checkpoint with individual weight adjustment.
 - LoRA to LoRA merge now has checkboxes for selection and can now merge differant tensor sizes together. 
 - Fixed save with model_ema removed from Discard causing crash. Removing clip from excluded does allow the clip to be merged changing the output.
 - History and Preset Tab added.
 
+- SD 1.5 and FLUX to SDXL model merge capability added via switch. Highly suggest a very low ingest rate. Experiment with different merge modes. Some work better than others. SLERP and Add Dissimilarities to start.
+- May new Merge modes added. Everything up to SLERP should work fine. Use the mode switch if you plan to do cross model merging. I've yet to do proper testing with the rest. Please report any errors encountered - be careful of memory overflow errors.
+- Updated DARE and Train Differance and Smooth Mix (only A - B) with additional Smooth Mix Train Diff mixed mode for 3 model ingest.
+- 
 - ---------------------------------------------------------------------------------------------------------
 
 - Works now with Dev branch of Automatic1111 - needed for 50xx: This is not required for normal function: 
@@ -17,11 +21,17 @@
 -----------------------------------------------------------------------------------------------------------
 
 Planned:
+- Cleanup UI
 - Save loaded checkpoint on LoRA tab. 
 - Save loaded checkpoint FP32 support. 
-- Forge support - it probably will need a seperate branch.
+- Forge ( & Neo ) support - it probably will need a seperate branch - hopefully not.
+- Make it so Dissimular tensor sizes are possible to merge from Lora to Checkpoint. Lora to Lora tensor size mismatch already works - so you could just do that first and then ingest the resulting Lora into Checkpoint as things stand now.
 
-Feel free to use anything you see. Credit to all below for all their work.
+- Please report any errors with logs.
+
+Feel free to use anything you see. Many thanks and credit to all below for all their hard work.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 # Batteries Included - Advanced Model Merging for Stable Diffusion
 
