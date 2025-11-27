@@ -1,3 +1,5 @@
+TLDR: git clone https://github.com/Isaiah53John316/sdwebui-Amethyst-Merger.git
+
 # Personal Edits and Fixes:
 - UI updated - Huge WIP.
 - Performance optimizations and memory optimizations.
