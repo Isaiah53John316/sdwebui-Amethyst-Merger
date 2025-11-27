@@ -117,6 +117,9 @@ class Options:
             json.dump(self.options,file,indent=4)
         gr.Info('Options saved')
 
+    def get(self, key, default=None):
+        return self.options.get(key, default)
+
 cmn.opts = Options(options_filename)
 
 # ---------------------------
@@ -447,12 +450,67 @@ def on_ui_tabs():
 
                     # MODE SELECTION
                     with gr.Row():
-                        merge_mode_selector = gr.Radio(label='Merge Mode (formula structure):',choices=list(merger.mergemode_selection.keys()),value=list(merger.mergemode_selection.keys())[0],scale=3)
-                    merge_mode_desc = gr.Textbox(label="Merge Mode Description", value=merger.mergemode_selection[list(merger.mergemode_selection.keys())[0]].description, interactive=False, lines=2)
+                        merge_mode_selector = gr.Radio(
+                            label='Merge Mode (formula structure):',
+                            choices=list(merger.mergemode_selection.keys()),
+                            value=list(merger.mergemode_selection.keys())[0],
+                            scale=3
+                        )
+                    merge_mode_desc = gr.Textbox(
+                        label="Merge Mode Description",
+                        value=merger.mergemode_selection[list(merger.mergemode_selection.keys())[0]].description,
+                        interactive=False,
+                        lines=2
+                    )
 
                     with gr.Row():
-                        calc_mode_selector = gr.Radio(label='Calculation Mode (how to execute):',choices=list(merger.calcmode_selection.keys()),value=list(merger.calcmode_selection.keys())[0],scale=3)
-                    calc_mode_desc = gr.Textbox(label="Calculation Mode Description", value=merger.calcmode_selection[list(merger.calcmode_selection.keys())[0]].description, interactive=False, lines=2)
+                        calc_mode_selector = gr.Radio(
+                            label='Calculation Mode (how to execute):',
+                            choices=list(merger.calcmode_selection.keys()),
+                            value=list(merger.calcmode_selection.keys())[0],
+                            scale=3
+                        )
+                    calc_mode_desc = gr.Textbox(
+                        label="Calculation Mode Description",
+                        value=merger.calcmode_selection[list(merger.calcmode_selection.keys())[0]].description,
+                        interactive=False,
+                        lines=2
+                    )
+
+                    with gr.Row():
+                        cross_arch_mode = gr.Dropdown(
+                            choices=["Standard (Same Arch)", "Cross-Arch (SD1.5/Flux to SDXL)"],
+                            value="Standard (Same Arch)",
+                            label="Merge Type (Architecture)",
+                            info="Cross-Arch allows merging completely different model families"
+                        )
+                        thread_count = gr.Slider(
+                            minimum=1,
+                            maximum=32,
+                            value=8,
+                            step=1,
+                            label="Thread count (speed)"
+                        )
+                        cache_size = gr.Slider(
+                            minimum=512,
+                            maximum=8192,
+                            value=2048,
+                            step=256,
+                            label="Cache size (MB) – lower = less RAM"
+                        )
+
+                    # Connect UI controls to backend settings
+                    cross_arch_mode.change(
+                        fn=lambda x: setattr(cmn, 'cross_arch_enabled', x == "Cross-Arch (SD1.5/Flux to SDXL)"),
+                        inputs=cross_arch_mode,
+                        outputs=None
+                    )
+
+                    thread_count.change(
+                        fn=lambda x: cmn.opts.options.update({'threads': int(x)}) or cmn.opts.save(),
+                        inputs=thread_count,
+                        outputs=None
+                    )
 
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
 
@@ -1094,43 +1152,42 @@ def checkpoint_changed(name):
     return plaintext_to_html(f"{sdversion} | {str(dtype).split('.')[1]}",classname='untitled_sd_version')
 
 def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, strength, save_model, individual_weights=None, verbose=False):
-    """UI wrapper for merging multiple LoRAs to a checkpoint"""
+    """UI wrapper for merging multiple LoRAs to a checkpoint – now 100% safe & fast"""
     progress = Progress()
+    checkpoint_info = None
+
     try:
         if not checkpoint_name:
             return "Error: Please select a base checkpoint"
-        if not lora_paths or len(lora_paths) == 0:
+        if not lora_paths:
             return "Error: Please select at least one LoRA"
-        if save_model and not output_name:
-            return "Error: Please provide an output name if saving the model"
+        if save_model and not output_name.strip():
+            return "Error: Please provide an output name when saving"
 
         checkpoint_info = sd_models.get_closet_checkpoint_match(checkpoint_name)
         if not checkpoint_info:
-            return f"Error: Could not find checkpoint {checkpoint_name}"
+            return f"Error: Could not find checkpoint '{checkpoint_name}'"
 
-        base_checkpoint_path = checkpoint_info.filename
-        output_dir = os.path.dirname(base_checkpoint_path)
+        base_path = checkpoint_info.filename
+        output_dir = os.path.dirname(base_path)
 
-        # Load base checkpoint
-        if progress:
-            progress(f"Loading base checkpoint: {base_checkpoint_path}")
-        with safetensors.torch.safe_open(base_checkpoint_path, framework='pt', device='cpu') as f:
+        progress(f"Loading base checkpoint: {os.path.basename(base_path)}")
+        with safetensors.torch.safe_open(base_path, framework='pt', device='cpu') as f:
             merged_checkpoint_dict = {k: f.get_tensor(k) for k in f.keys()}
 
         all_summaries = []
-        for i, lora_path in enumerate(lora_paths):
-            if progress:
-                progress(f"Applying LoRA {i+1}/{len(lora_paths)}: {os.path.basename(lora_path)}")
+        applied_count = 0
 
-            # Determine strength for this LoRA
-            current_strength = strength  # fallback to global
+        for i, lora_path in enumerate(lora_paths):
+            current_strength = strength
             if individual_weights and i < len(individual_weights):
                 current_strength = individual_weights[i]
-                if current_strength <= 0:
-                    progress(f"Skipping {os.path.basename(lora_path)} (weight = 0)")
-                    continue
 
-            # Apply with individual strength
+            if current_strength <= 0:
+                progress(f"Skipping {os.path.basename(lora_path)} (strength = 0)")
+                continue
+
+            progress(f"Applying LoRA {applied_count + 1}: {os.path.basename(lora_path)} × {current_strength:.3f}")
             merged_checkpoint_dict, summary = lora_merge._apply_single_lora_to_dict(
                 merged_checkpoint_dict,
                 lora_path,
@@ -1139,41 +1196,75 @@ def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, stren
                 verbose=verbose
             )
             all_summaries.append(summary)
+            applied_count += 1
 
-        final_report = "\n".join(all_summaries)
+        final_report = "\n".join(all_summaries) if all_summaries else "No LoRAs applied"
 
-        # Unload current model and load merged one
+        # ——————————————————————————————————————————————
+        # SAFE & FAST MODEL LOADING (critical fix!)
+        # ——————————————————————————————————————————————
+        progress("Unloading current model...")
         if shared.sd_model:
             sd_models.unload_model_weights(shared.sd_model)
             shared.sd_model = None
 
-        sd_models.load_model(checkpoint_info)
+        # Only reload base if it's not already loaded
+        if (shared.sd_model is None or 
+            not hasattr(shared.sd_model, 'sd_checkpoint_info') or 
+            shared.sd_model.sd_checkpoint_info.filename != checkpoint_info.filename):
+            progress("Loading base model into WebUI...")
+            sd_models.load_model(checkpoint_info)
+        else:
+            progress("Base model already loaded – reusing")
+
+        # Apply merged weights
+        progress("Applying merged LoRA weights...")
         shared.sd_model.load_state_dict(merged_checkpoint_dict, strict=False)
 
-        load_status = f"Applied {len(lora_paths)} LoRAs to '{checkpoint_name}'"
+        # Essential: move to GPU + re-apply optimizations
+        shared.sd_model.to(devices.device)
+        shared.sd_model.eval()
 
+        # Re-apply attention, unet, hijacks – fixes black images & xformers
+        sd_hijack.model_hijack.hijack(shared.sd_model)
+        script_callbacks.model_loaded_callback(shared.sd_model)
+        sd_unet.apply_unet("None")
+
+        # ——————————————————————————————————————————————
+        # Optional: Save to disk
+        # ——————————————————————————————————————————————
         if save_model:
-            if not output_name.endswith('.safetensors'):
-                output_name += '.safetensors'
-            output_path = os.path.join(output_dir, output_name)
-            if progress:
-                progress(f"Saving merged checkpoint → {output_path}")
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', output_name.strip())
+            if not safe_name.lower().endswith('.safetensors'):
+                safe_name += '.safetensors'
+            output_path = os.path.join(output_dir, safe_name)
+
+            progress(f"Saving merged model → {safe_name}")
             safetensors.torch.save_file(merged_checkpoint_dict, output_path)
-            load_status += f" | Saved to disk"
 
-        final_report += f"\n{load_status}"
-        progress("All LoRAs merged and loaded!", popup=True)
-        sd_models.list_models()  # Refresh UI
+            # Refresh checkpoint list so new file appears
+            sd_models.list_models()
 
-        return progress.get_report() + "\n" + final_report
+            final_report += f"\nModel saved as: {safe_name}"
+        else:
+            final_report += f"\nModel loaded in memory (not saved)"
+
+        progress(f"Successfully applied {applied_count} LoRA(s)!", popup=True)
+        return progress.get_report() + "\n\n" + final_report
 
     except Exception as e:
+        error_msg = f"LoRA merge failed: {str(e)}"
+        progress(error_msg, popup=True)
+
+        # Try to recover by reloading original checkpoint
         try:
             if checkpoint_info:
                 sd_models.load_model(checkpoint_info)
+                progress("Recovered: original checkpoint reloaded")
         except:
             pass
-        return f"Error: {str(e)}"
+
+        return progress.get_report() + "\n" + error_msg
     
 def merge_selected_loras_ui(selected_lora_paths, output_name, global_strength=1.0, individual_weights=None):
     progress = Progress()

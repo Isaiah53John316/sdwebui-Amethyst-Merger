@@ -100,6 +100,9 @@ def id_checkpoint(name):
             if diffusion_model_input.shape[1] == 9:
                 return 'v2-inpainting',dtype
             return 'v2',dtype
+        
+        if any(k.startswith('model.diffusion_model.single_blocks.') or 'transformer_blocks' in k for k in keys[:50]):
+            return 'Flux', gettensor(list(keys)[0]).dtype
             
         
         return 'Unknown',gettensor(keys[0]).dtype
