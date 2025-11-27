@@ -1,5 +1,13 @@
 TLDR: git clone https://github.com/Isaiah53John316/sdwebui-Amethyst-Merger.git
 
+Use:
+- Weight Editor: This is actually very important now for special cross model merges using some algorithms like DARE. Consult AI referancing this repository. Normally you will not need to touch this.
+- Include/Keep/Discard - Defaults to dropping Clip and model_ema. Remove them from boxes if you want to keep.
+- Expand the Tab you want to use on the Lora page - Name the Checkpoint and check the box to save if not testing. Choose Lora name for saving Lora to Lora.
+- Make sure to use the correct corrosponding Merge Modes with compatible Calculation Modes and vice versa - the descriptions on each calculation mode should help with use.
+- Be sure to switch Merge Type to Cross-Arch if you intend to do SD 1.5 or Flux into SDXL.
+- Switch to CPU/float32 in Options if you want faster merge speeds in most cases. 
+
 # Personal Edits and Fixes:
 - UI updated - Huge WIP.
 - Performance optimizations and memory optimizations.
@@ -10,7 +18,7 @@ TLDR: git clone https://github.com/Isaiah53John316/sdwebui-Amethyst-Merger.git
 - History and Preset Tab added.
 
 - SD 1.5 and FLUX to SDXL model merge capability added via switch. Highly suggest a very low ingest rate. Experiment with different merge modes. Some work better than others. SLERP and Add Dissimilarities to start.
-- May new Merge modes added. Everything up to SLERP should work fine. Use the mode switch if you plan to do cross model merging. I've yet to do proper testing with the rest. Please report any errors encountered - be careful of memory overflow errors.
+- Many new Merge Modes added. Everything up to SLERP should work fine. Use the mode switch if you plan to do cross model merging. I've yet to do proper testing with the rest. Please report any errors encountered - be careful of memory overflow errors.
 - Updated DARE and Train Differance and Smooth Mix (only A - B) with additional Smooth Mix Train Diff mixed mode for 3 model ingest.
 - 
 - ---------------------------------------------------------------------------------------------------------
