@@ -649,90 +649,6 @@ def on_ui_tabs():
                     )
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
 
-                    # ===================================================================
-                    # AMETHYST KITCHEN-SINK WEIGHT PRESETS — FINAL 2025 EDITION
-                    # ===================================================================
-                    with gr.Accordion("Kitchen-Sink Weight Presets", open=True):
-                        with gr.Row():
-                            preset_dropdown = gr.Dropdown(
-                                label="Weight Preset",
-                                choices=[
-                                    "Custom (Manual)",
-                                    "50/50 UNet + Keep CLIP",
-                                    "UNet 50/50 + Noise Blend",
-                                    "Keep CLIP/T5 + Full UNet Merge",
-                                    "Full Kitchen Sink (All 50/50)",
-                                    "Primary Dominance (A=1.0, Others=0.0)",
-                                    "Secondary Dominance (B=1.0, Others=0.0)",
-                                ],
-                                value="Custom (Manual)",
-                                info="Quick presets for true kitchen-sink merging"
-                            )
-                            apply_preset = gr.Button(value="Apply Preset", variant="primary")
-
-                        gr.HTML("<small><b>Active when using Weight Editor or Block Weights</b></small>")
-
-                        # ------------------------------------------------------------------
-                        # Preset definitions
-                        # ------------------------------------------------------------------
-                        def apply_weight_preset(choice: str) -> str:
-                            presets = {
-                                "Custom (Manual)": "{}",
-
-                                "50/50 UNet + Keep CLIP": json.dumps({
-                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
-                                    "conditioner.*":           {"alpha": 1.0, "beta": 0.0},
-                                    "denoiser.*":              {"alpha": 0.7, "beta": 0.3},
-                                    "first_stage_model.*":     {"alpha": 0.6, "beta": 0.4}
-                                }, indent=2),
-
-                                "UNet 50/50 + Noise Blend": json.dumps({
-                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
-                                    "denoiser.*":              {"alpha": 0.9, "beta": 0.1},
-                                    "*":                       {"alpha": 0.5, "beta": 0.5}
-                                }, indent=2),
-
-                                "Keep CLIP/T5 + Full UNet Merge": json.dumps({
-                                    "conditioner.*":           {"alpha": 1.0, "beta": 0.0},
-                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
-                                    "first_stage_model.*":     {"alpha": 0.5, "beta": 0.5},
-                                    "denoiser.*":              {"alpha": 0.5, "beta": 0.5}
-                                }, indent=2),
-
-                                "Full Kitchen Sink (All 50/50)": json.dumps({
-                                    "*": {"alpha": 0.5, "beta": 0.5}
-                                }, indent=2),
-
-                                "Primary Dominance (A=1.0, Others=0.0)": json.dumps({
-                                    "*": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0}
-                                }, indent=2),
-
-                                "Secondary Dominance (B=1.0, Others=0.0)": json.dumps({
-                                    "*": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0}
-                                }, indent=2),
-                            }
-                            return presets.get(choice, "{}")
-
-                        # Hidden textbox — MUST exist before any event uses it
-                        preset_output = gr.Textbox(visible=False)
-
-                        # ------------------------------------------------------------------
-                        # SAFE EVENT WIRING — NO MORE UnboundLocalError
-                        # ------------------------------------------------------------------
-                        # 1. Fill the hidden textbox with the JSON preset
-                        apply_preset.click(
-                            fn=apply_weight_preset,
-                            inputs=preset_dropdown,
-                            outputs=preset_output
-                        )
-
-                        # 2. When hidden textbox changes → copy its content into the visible weight_editor
-                        preset_output.change(
-                            fn=lambda x: x,
-                            inputs=preset_output,
-                            outputs=weight_editor
-                        )
-
                     # MAIN SLIDERS - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
                     with gr.Row(equal_height=True):
                         alpha = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_a [α] (alpha)", info='model_a - model_b', value=0.5, elem_classes=['main_sliders'])
@@ -1102,21 +1018,6 @@ def on_ui_tabs():
                     # ===================================================================
                     # 2. NOW IT'S SAFE TO WIRE BUTTONS
                     # ===================================================================
-
-                    # Apply preset button → fills preset_output → then injects into weight_editor
-                    apply_preset.click(
-                        fn=apply_weight_preset,
-                        inputs=preset_dropdown,
-                        outputs=preset_output
-                    ).then(
-                        fn=lambda x: x,
-                        inputs=preset_output,
-                        outputs=weight_editor
-                    ).then(
-                        fn=lambda: "Preset applied — click Merge",
-                        outputs=validation_output
-                    )
-
                     # Validation on weight editor change
                     weight_editor.change(
                         fn=lambda we, ma, mb, mm: validate_merge_config(ma, mb, we, mm),
@@ -1217,6 +1118,86 @@ def on_ui_tabs():
                         fn=lambda: "Ready for next merge",
                         outputs=status
                     )
+
+                    # ===================================================================
+                    # AMETHYST KITCHEN-SINK WEIGHT PRESETS — FINAL 2025 EDITION
+                    # ===================================================================
+
+                with gr.Accordion("Kitchen-Sink Weight Presets", open=True):
+                        with gr.Row():
+                            preset_dropdown = gr.Dropdown(
+                                label="Weight Preset",
+                                choices=[
+                                    "Custom (Manual)",
+                                    "50/50 UNet + Keep CLIP",
+                                    "UNet 50/50 + Noise Blend",
+                                    "Keep CLIP/T5 + Full UNet Merge",
+                                    "Full Kitchen Sink (All 50/50)",
+                                    "Primary Dominance (A=1.0, Others=0.0)",
+                                    "Secondary Dominance (B=1.0, Others=0.0)",
+                                ],
+                                value="Custom (Manual)",
+                                info="Quick presets for true kitchen-sink merging"
+                            )
+                            apply_preset = gr.Button(value="Apply Preset", variant="primary")
+
+                        gr.HTML("<small><b>Active when using Weight Editor or Block Weights</b></small>")
+
+                        # ------------------------------------------------------------------
+                        # Preset definitions
+                        # ------------------------------------------------------------------
+                        def apply_weight_preset(choice: str) -> str:
+                            presets = {
+                                "Custom (Manual)": "{}",
+
+                                "50/50 UNet + Keep CLIP": json.dumps({
+                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
+                                    "conditioner.*":           {"alpha": 1.0, "beta": 0.0},
+                                    "denoiser.*":              {"alpha": 0.7, "beta": 0.3},
+                                    "first_stage_model.*":     {"alpha": 0.6, "beta": 0.4}
+                                }, indent=2),
+
+                                "UNet 50/50 + Noise Blend": json.dumps({
+                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
+                                    "denoiser.*":              {"alpha": 0.9, "beta": 0.1},
+                                    "*":                       {"alpha": 0.5, "beta": 0.5}
+                                }, indent=2),
+
+                                "Keep CLIP/T5 + Full UNet Merge": json.dumps({
+                                    "conditioner.*":           {"alpha": 1.0, "beta": 0.0},
+                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
+                                    "first_stage_model.*":     {"alpha": 0.5, "beta": 0.5},
+                                    "denoiser.*":              {"alpha": 0.5, "beta": 0.5}
+                                }, indent=2),
+
+                                "Full Kitchen Sink (All 50/50)": json.dumps({
+                                    "*": {"alpha": 0.5, "beta": 0.5}
+                                }, indent=2),
+
+                                "Primary Dominance (A=1.0, Others=0.0)": json.dumps({
+                                    "*": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0}
+                                }, indent=2),
+
+                                "Secondary Dominance (B=1.0, Others=0.0)": json.dumps({
+                                    "*": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0}
+                                }, indent=2),
+                            }
+                            return presets.get(choice, "{}")
+
+                                            # Apply preset button → fills preset_output → then injects into weight_editor
+                        apply_preset.click(
+                                fn=apply_weight_preset,
+                        inputs=preset_dropdown,
+                        outputs=preset_output
+                         ).then(
+                        fn=lambda x: x,
+                        inputs=preset_output,
+                        outputs=weight_editor
+                        ).then(
+                        fn=lambda: "Preset applied — click Merge",
+                        outputs=validation_output
+                        )
+
             # ================================================
             # PREVIEW TAB — SuperMerger-style "Merge & Gen"
             # ================================================
