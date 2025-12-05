@@ -14,21 +14,20 @@ class MergeMode:
     name = 'mergemode'
     description = 'description'
     input_models = 4
-    input_sliders = 3
+    input_sliders = 5 
 
     slid_a_info = '-'
-    slid_a_config = (-1, 2, 0.01) #minimum,maximum,step
-
+    slid_a_config = (-1, 2, 0.01)
     slid_b_info = '-'
     slid_b_config = (-1, 2, 0.01)
-
     slid_c_info = '-'
     slid_c_config = (-1, 2, 0.01)
-
     slid_d_info = '-'
     slid_d_config = (-1, 2, 0.01)
+    slid_e_info = '-' 
+    slid_e_config = (-1, 2, 0.01)
 
-    def create_recipe(self, key, model_a, model_b, model_c, model_d, seed=False, alpha=0, beta=0, gamma=0, delta=0) -> opr.Operation:
+    def create_recipe(self, key, model_a, model_b, model_c, model_d, seed=False, alpha=0, beta=0, gamma=0, delta=0, epsilon=0) -> opr.Operation:
         """Create the base operation tree structure"""
         raise NotImplementedError
 
@@ -39,7 +38,8 @@ class CalcMode:
     description = 'description'
     compatible_modes = ['all']  # Which merge modes this works with ('all' or list of mode names)
 
-    def modify_recipe(self, recipe, key, model_a, model_b, model_c, model_d, **kwargs) -> opr.Operation:
+    # NO self — this fork calls modify_recipe statically!
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, **kwargs) -> opr.Operation:
         """Modify the recipe created by a MergeMode. Default: return unchanged"""
         return recipe
 
@@ -195,13 +195,12 @@ MERGEMODES_LIST.append(QuadSum)
 # ============================================================================
 
 class Normal(CalcMode):
-    """Standard arithmetic - no modifications"""
     name = 'normal'
-    description = 'Standard calculation (no modifications)'
+    description = 'Standard calculation (no modifications) — pure merge'
     compatible_modes = ['all']
-    input_models = 4  # Supports all merge modes (max 4 models)
+    input_models = 4
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, **kwargs):
         return recipe
 
 CALCMODES_LIST.append(Normal)
@@ -209,32 +208,16 @@ CALCMODES_LIST.append(Normal)
 
 class TrainDifferenceCalc(CalcMode):
     name = 'trainDifference'
-    description = 'Treats difference as fine-tuning with adaptive scaling'
+    description = 'True task-arithmetic difference (B - C) → A — with zero-mean & norm preservation'
     compatible_modes = ['Add Difference', 'Triple Sum', 'Sum Twice']
     input_models = 3
+    slid_a_info = "Strength multiplier"
+    slid_a_config = (0.0, 2.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=1.0, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
-        diff = opr.TrainDiff(key, a, b, c)
-        diff.cache()
-        diffm = opr.Multiply(key, alpha, diff)
-        return opr.Add(key, a, diffm)
-
-CALCMODES_LIST.append(TrainDifferenceCalc)
-
-class TrainDifferenceCalc(CalcMode):
-    name = 'trainDifference'
-    description = 'True task-arithmetic difference (b - c) with zero-mean & norm preservation'
-    compatible_modes = ['Add Difference', 'Triple Sum', 'Sum Twice']
-    input_models = 3
-
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, **kwargs):
-        a = opr.LoadTensor(key, model_a)
-        b = opr.LoadTensor(key, model_b)
-        c = opr.LoadTensor(key, model_c)
-
         diff = opr.TrainDiff(key, a, b, c)
         diff.cache()
         diffm = opr.Multiply(key, alpha, diff)
@@ -244,12 +227,10 @@ CALCMODES_LIST.append(TrainDifferenceCalc)
 
 
 class ExtractCalc(CalcMode):
-    """Similarity-based feature extraction"""
     name = 'extract'
     description = 'Adds (dis)similar features between models using cosine similarity'
     compatible_modes = ['Add Difference']
-    input_models = 3  # Uses A, B, C
-
+    input_models = 3
     slid_a_info = 'model_b - model_c'
     slid_a_config = (0, 1, 0.01)
     slid_b_info = 'similarity - dissimilarity'
@@ -260,64 +241,54 @@ class ExtractCalc(CalcMode):
     slid_d_config = (-1, 4, 0.01)
 
     def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, delta=1, **kwargs):
-        a = opr.LoadTensor(key,model_a)
-        b = opr.LoadTensor(key,model_b)
-        c = opr.LoadTensor(key,model_c)
-
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
         extracted = opr.Extract(key, alpha, beta, gamma*15, a, b, c)
         extracted.cache()
-
         multiplied = opr.Multiply(key, delta, extracted)
-        res = opr.Add(key, a, multiplied)
-        return res
+        return opr.Add(key, a, multiplied)
 
 CALCMODES_LIST.append(ExtractCalc)
 
 
 class TensorCalc(CalcMode):
-    """Exchanges entire tensors by probability"""
     name = 'tensor'
     description = 'Swaps entire tensors from A or B based on probability (not weighted blend)'
     compatible_modes = ['Weight-Sum']
-    input_models = 2  # Uses A, B
-
+    input_models = 2
     slid_a_info = "probability of using model_b"
     slid_a_config = (0, 1, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, seed=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
-        res = opr.TensorExchange(key, alpha, seed, a, b)
-        return res
+        seed = cmn.last_merge_seed or 42
+        return opr.TensorExchange(key, alpha, seed, a, b)
 
 CALCMODES_LIST.append(TensorCalc)
 
 
 class SelfCalc(CalcMode):
-    """Multiply model weights by scalar"""
     name = 'self'
     description = 'Multiply model weights by scalar value (single model operation)'
-    compatible_modes = ['Weight-Sum']  # Works as modification of WeightSum with one model
-    input_models = 2  # Compatible with 2-model mode, but only uses A (loads B but ignores)
-
+    compatible_modes = ['Weight-Sum']
+    input_models = 2  # Compatible with 2-model UI, but only uses A
     slid_a_info = "weight multiplier"
     slid_a_config = (0, 2, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=1.0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=1.0, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
-        res = opr.Multiply(key, alpha, a)
-        return res
+        return opr.Multiply(key, alpha, a)
 
 CALCMODES_LIST.append(SelfCalc)
 
 
 class InterpDifferenceCalc(CalcMode):
-    """Comparative interpolation based on value differences"""
     name = 'Comparative Interp'
     description = 'Interpolates between values depending on their difference relative to other values'
     compatible_modes = ['Weight-Sum']
-    input_models = 2  # Uses A, B
-
+    input_models = 2
     slid_a_info = "concave - convex"
     slid_a_config = (0, 1, 0.01)
     slid_b_info = "similarity - difference"
@@ -325,24 +296,25 @@ class InterpDifferenceCalc(CalcMode):
     slid_c_info = "binomial - linear"
     slid_c_config = (0, 1, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, seed=0, **kwargs):
-        a = opr.LoadTensor(key,model_a)
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
         # Skip embeddings
-        if key.startswith('cond_stage_model.transformer.text_model.embeddings') or key.startswith('conditioner.embedders.0.transformer.text_model.embeddings') or key.startswith('conditioner.embedders.1.model.token_embedding') or key.startswith('conditioner.embedders.1.model.positional_embedding'):
+        if key.startswith('cond_stage_model.transformer.text_model.embeddings') or \
+           key.startswith('conditioner.embedders.0.transformer.text_model.embeddings') or \
+           key.startswith('conditioner.embedders.1.model.token_embedding') or \
+           key.startswith('conditioner.embedders.1.model.positional_embedding'):
             return a
-        b = opr.LoadTensor(key,model_b)
-        return opr.InterpolateDifference(key, alpha, beta, gamma, seed, a ,b)
+        b = opr.LoadTensor(key, model_b)
+        return opr.InterpolateDifference(key, alpha, beta, gamma, cmn.last_merge_seed or 42, a, b)
 
 CALCMODES_LIST.append(InterpDifferenceCalc)
 
 
 class ManEnhInterpDifferenceCalc(CalcMode):
-    """Enhanced interpolation with manual threshold control"""
     name = 'Enhanced Man Interp'
     description = 'Enhanced interpolation with manual threshold control'
     compatible_modes = ['Weight-Sum']
-    input_models = 2  # Uses A, B
-
+    input_models = 2
     slid_a_info = "interpolation strength"
     slid_a_config = (0, 1, 0.001)
     slid_b_info = "lower mean threshold"
@@ -352,23 +324,21 @@ class ManEnhInterpDifferenceCalc(CalcMode):
     slid_d_info = "smoothness factor"
     slid_d_config = (0, 1, 0.001)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, delta=0, seed=0, **kwargs):
-        a = opr.LoadTensor(key,model_a)
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
         if key.startswith('cond_stage_model.transformer.text_model.embeddings'):
             return a
-        b = opr.LoadTensor(key,model_b)
-        return opr.ManualEnhancedInterpolateDifference(key, alpha, beta, gamma, delta, seed, a ,b)
+        b = opr.LoadTensor(key, model_b)
+        return opr.ManualEnhancedInterpolateDifference(key, alpha, beta, gamma, delta, cmn.last_merge_seed or 42, a, b)
 
 CALCMODES_LIST.append(ManEnhInterpDifferenceCalc)
 
 
 class AutoEnhInterpDifferenceCalc(CalcMode):
-    """Enhanced interpolation with automatic threshold calculation"""
     name = 'Enhanced Auto Interp'
     description = 'Interpolates with automatic threshold calculation'
     compatible_modes = ['Weight-Sum']
-    input_models = 2  # Uses A, B
-
+    input_models = 2
     slid_a_info = "interpolation strength"
     slid_a_config = (0, 1, 0.001)
     slid_b_info = "threshold adjustment factor"
@@ -376,29 +346,27 @@ class AutoEnhInterpDifferenceCalc(CalcMode):
     slid_c_info = "smoothness factor"
     slid_c_config = (0, 1, 0.001)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, seed=0, **kwargs):
-        a = opr.LoadTensor(key,model_a)
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
         if key.startswith('cond_stage_model.transformer.text_model.embeddings'):
             return a
-        b = opr.LoadTensor(key,model_b)
-        return opr.AutoEnhancedInterpolateDifference(key, alpha, beta, gamma, seed, a ,b)
+        b = opr.LoadTensor(key, model_b)
+        return opr.AutoEnhancedInterpolateDifference(key, alpha, beta, gamma, cmn.last_merge_seed or 42, a, b)
 
 CALCMODES_LIST.append(AutoEnhInterpDifferenceCalc)
 
 
 class DARECalc(CalcMode):
     name = 'DARE (2025)'
-    description = 'Dropout-Aware REweighting — current SOTA for interference-free merges'
+    description = 'State-of-the-art: Dropout + Rescale (2025 paper)'
     compatible_modes = ['Weight-Sum', 'Add Difference']
-    input_models = 2
-
-    slid_a_info = "Density (keep %) — 0.10–0.25"
+    input_models = 3
+    slid_a_info = "Density (keep %) – try 0.10–0.25"
     slid_a_config = (0.01, 0.5, 0.01)
-
-    slid_b_info = "Dropout probability — 0.2–0.5"
+    slid_b_info = "Dropout probability – try 0.2–0.5"
     slid_b_config = (0.0, 0.7, 0.05)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.15, beta=0.3, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.15, beta=0.3, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         density = alpha
@@ -409,13 +377,62 @@ class DARECalc(CalcMode):
 CALCMODES_LIST.append(DARECalc)
 
 
+class DARE3CalcAlt(CalcMode):
+    name = 'DARE (3-model) — 2025 SOTA Gamma'
+    description = 'True 3-way DARE - WS Add Diff'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+    slid_a_info = "Density — try 0.15–0.30 (higher = stronger fusion)"
+    slid_a_config = (0.01, 0.50, 0.01)
+    slid_b_info = "Dropout — 0.2–0.5 (adds natural variance)"
+    slid_b_config = (0.0, 0.8, 0.01)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.22, beta=0.3, gamma=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+        seed = cmn.last_merge_seed or 42
+        return opr.DARE3(key, density=alpha, dropout_p=beta, seed=seed, a=a, b=b, c=c)
+
+CALCMODES_LIST.append(DARE3CalcAlt)
+
+
+class DARE3Calc(CalcMode):
+    name = 'DARE (3-model)'
+    description = 'True 3-model DARE — current SOTA for triple fusions (A + DARE(B-A) + DARE(C-A))'
+    compatible_modes = ['Weight-Sum']
+    input_models = 3
+    slid_a_info = "Density for Model B (0.10–0.30)"
+    slid_a_config = (0.01, 0.5, 0.01)
+    slid_b_info = "Dropout for Model B (0.2–0.5)"
+    slid_b_config = (0.0, 0.7, 0.05)
+    slid_c_info = "Density for Model C (0.10–0.30)"
+    slid_c_config = (0.01, 0.5, 0.01)
+    slid_d_info = "Dropout for Model C (0.2–0.5)"
+    slid_d_config = (0.0, 0.7, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.18, beta=0.35, gamma=0.15, delta=0.40, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        seed = cmn.last_merge_seed or 42
+        intermediate = opr.DARE(key, density=alpha, dropout_p=beta, seed=seed, a=a, b=b)
+        result = opr.DARE(key, density=gamma, dropout_p=delta, seed=seed + 1, a=intermediate, b=c)
+        return result
+
+CALCMODES_LIST.append(DARE3Calc)
+
+
 class SmoothMixCalc(CalcMode):
     name = 'Smooth Mix (legacy)'
     description = 'Old beloved smooth mixing behavior (b - a instead of b - c)'
     compatible_modes = ['Add Difference']
     input_models = 3
+    slid_a_info = "Strength"
+    slid_a_config = (0.0, 2.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         diff = opr.Sub(key, b, a)
@@ -428,33 +445,30 @@ CALCMODES_LIST.append(SmoothMixCalc)
 
 class SmoothTrainDiffCalc(CalcMode):
     name = 'Smooth TrainDifference (3-model)'
-    description = 'True (B - C) difference, smoothed, added to A — the holy grail'
+    description = 'True (B - C) difference, smoothed, added to A — holy grail'
     compatible_modes = ['Add Difference']
     input_models = 3
-
     slid_a_info = "Strength multiplier"
     slid_a_config = (0.0, 2.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=1.0, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=1.0, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
-
-        diff = opr.Sub(key, b, c)           # True difference: B - C
-        diff = opr.Smooth(key, diff)        # Apply the beloved smoothing
+        diff = opr.Sub(key, b, c)
+        diff = opr.Smooth(key, diff)
         diff.cache()
         diffm = opr.Multiply(key, alpha, diff)
         return opr.Add(key, a, diffm)
 
 CALCMODES_LIST.append(SmoothTrainDiffCalc)
 
+
 class AddDissimilarityCalc(CalcMode):
-    """Add dissimilar features between models"""
     name = 'Add Dissimilarities'
     description = 'Adds dissimilar features between model_b and model_c to model_a'
     compatible_modes = ['Add Difference']
     input_models = 3
-
     slid_a_info = 'model_b - model_c'
     slid_a_config = (0, 1, 0.01)
     slid_b_info = 'addition multiplier'
@@ -462,15 +476,12 @@ class AddDissimilarityCalc(CalcMode):
     slid_c_info = 'similarity bias'
     slid_c_config = (0, 2, 0.01)
 
-    # ← NO self! This fork calls statically!
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, delta=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
-
         extracted = opr.Similarities(key, alpha, 1, gamma*15, b, c)
         extracted.cache()
-
         multiplied = opr.Multiply(key, beta, extracted)
         return opr.Add(key, a, multiplied)
 
@@ -485,7 +496,7 @@ class TIESCalc(CalcMode):
     slid_a_info = "Density (keep %) – try 0.10–0.25"
     slid_a_config = (0.01, 0.5, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         density = alpha
@@ -498,21 +509,36 @@ CALCMODES_LIST.append(TIESCalc)
 class SLERPCalc(CalcMode):
     name = 'SLERP (Spherical)'
     description = 'True spherical linear interpolation — best for cross-family merges'
-    compatible_modes = ['Weight-Sum', 'Add Difference']  # works best with Weight-Sum
+    compatible_modes = ['Weight-Sum', 'Add Difference']
     input_models = 2
-
     slid_a_info = "Blend ratio (0 = Model A, 1 = Model B)"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    # NO self — this fork calls statically!
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
-
         return opr.SLERP(key, alpha=alpha, a=a, b=b)
 
 CALCMODES_LIST.append(SLERPCalc)
 
+
+class SLERP3Calc(CalcMode):
+    name = 'SLERP (3-model Spherical)'
+    description = 'True 3-point spherical interpolation — perfect for triple fusions'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+    slid_a_info = "Weight for Model B (0-1)"
+    slid_a_config = (0.0, 1.0, 0.01)
+    slid_b_info = "Weight for Model C (0-1, total B+C ≤1)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0.3, gamma=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+        return opr.SLERP3(key, alpha, beta, a, b, c)
+
+CALCMODES_LIST.append(SLERP3Calc)
 
 class ReBasinCalc(CalcMode):
     name = 'Git Re-Basin'
@@ -522,7 +548,7 @@ class ReBasinCalc(CalcMode):
     slid_a_info = "Merge ratio"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         return opr.ReBasin(key, alpha, a, b)
@@ -538,7 +564,7 @@ class DeMeCalc(CalcMode):
     slid_a_info = "Decouple strength"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         return opr.DeMe(key, alpha, a, b)
@@ -554,7 +580,7 @@ class BlockWeightedCalc(CalcMode):
     slid_a_info = "Global alpha"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         return opr.BlockWeighted(key, [alpha] * 12, a, b)
@@ -570,7 +596,7 @@ class ToMeCalc(CalcMode):
     slid_a_info = "Merge ratio (0.4 = 60% speedup)"
     slid_a_config = (0.0, 0.8, 0.05)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.6, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.6, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         return opr.ToMe(key, alpha, a)
 
@@ -585,9 +611,27 @@ class AttentionMergeCalc(CalcMode):
     slid_a_info = "Attention alpha"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.7, beta=0, **kwargs):
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.7, beta=0, gamma=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         return opr.AttentionMerge(key, alpha, a, b)
 
 CALCMODES_LIST.append(AttentionMergeCalc)
+
+class SVDDeNoiseCalc(CalcMode):
+    name = 'SVD DeNoise (Expert)'
+    description = 'Nuclear-grade interference removal via SVD — slow but god-tier'
+    compatible_modes = ['Weight-Sum']
+    input_models = 2
+    slid_a_info = "Singular value threshold (0.01–0.1)"
+    slid_a_config = (0.001, 0.2, 0.001)
+    slid_b_info = "Keep top % of values (0.1–0.5)"
+    slid_b_config = (0.05, 0.5, 0.01)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.02, beta=0.2, gamma=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        seed = cmn.last_merge_seed or 42
+        return opr.SingularValueDeOperator(key, alpha, beta, seed, a, b)
+
+CALCMODES_LIST.append(SVDDeNoiseCalc)

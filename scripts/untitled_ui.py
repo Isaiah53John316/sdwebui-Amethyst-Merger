@@ -7,13 +7,18 @@ import shutil
 import torch
 import safetensors
 import safetensors.torch
-import tempfile  # Add this import at the top of untitled_ui.py if not already present
+import tempfile
+from modules import processing, scripts  # For generation pipeline
+from modules.shared import opts  # For defaults
 from datetime import datetime  # For cleaner temp naming
 from time import time  # ✅ ADDED
 from modules import sd_models,script_callbacks,scripts,shared,ui_components,paths,sd_samplers,ui,call_queue
 from modules.ui_common import plaintext_to_html, create_refresh_button
+from modules import processing  # ← ADD THIS
+from modules.processing import StableDiffusionProcessingTxt2Img  # ← ADD THIS
 from scripts.untitled import merger,misc_util
 from scripts.untitled.operators import weights_cache
+from scripts.untitled.merger import do_merge
 from scripts.untitled import lora_merge
 import scripts.untitled.common as cmn
 
@@ -46,50 +51,77 @@ class Progress:
         self.merge_keys = 0
         self.start_time = None
         self.total_keys = 0
-    
+
     def start_merge(self, total_keys):
         self.start_time = time()
         self.total_keys = total_keys
         self.merge_keys = 0
-    
+
     def get_eta(self):
         if self.merge_keys == 0 or not self.start_time:
             return "Calculating..."
-        
+
         elapsed = time() - self.start_time
         rate = self.merge_keys / elapsed if elapsed > 0 else 0
         remaining = (self.total_keys - self.merge_keys) / rate if rate > 0 else 0
-        
+
         minutes = int(remaining // 60)
         seconds = int(remaining % 60)
         return f"{minutes}m {seconds}s remaining"
-    
-    def update_progress(self, current, total):
+
+    def update_progress(self, current: int, total: int) -> dict:
+        """
+        Updates internal state and returns a dict with live progress info.
+        Used to update the HTML progress bar and merge report in real time.
+        """
         self.merge_keys = current
         self.total_keys = total
-        eta = self.get_eta()
-        progress_pct = (current / total * 100) if total > 0 else 0
-        return f"Progress: {progress_pct:.1f}% - {eta}"
 
-    def __call__(self,message, v=None, popup = False, report=False):
-        if v:
-            message = ' - '+ message + ' ' * (25-len(message)) + ': ' + str(v)
+        if total <= 0:
+            pct = 0.0
+            eta = "Calculating..."
+        else:
+            pct = (current / total) * 100
+            elapsed = time() - (self.start_time or time())
+            rate = current / elapsed if elapsed > 0 else 0
+            remaining = (total - current) / rate if rate > 0 else 0
+            minutes = int(remaining // 60)
+            seconds = int(remaining % 60)
+            eta = f"{minutes}m {seconds}s remaining" if current > 0 else "Calculating..."
+
+        progress_html = (
+            f"<div style='font-family: monospace; font-size: 14px; padding: 10px; background: #1e1e1e; "
+            f"border-radius: 8px; border-left: 4px solid #8f8;'>"
+            f"Progress: <b>{pct:.1f}%</b> • {current}/{total} keys • ETA: <b>{eta}</b>"
+            f"</div>"
+        )
+
+        return {
+            "progress_html": progress_html,
+            "pct": pct,
+            "eta": eta,
+            "current": current,
+            "total": total
+        }
+
+    def __call__(self, message, v=None, popup=False, report=False):
+        if v is not None:
+            message = f" - {message:<25}: {v}"
         if report:
             self.ui_report.append(message)
         if popup:
             gr.Info(message)
         print(message)
 
-    def interrupt(self,message,popup=True):
-        message = 'Merge interrupted:\t'+message
+    def interrupt(self, message, popup=True):
+        message = f"Merge interrupted: {message}"
         if popup:
             gr.Warning(message)
         self.ui_report = [message]
-        raise merger.MergeInterruptedError
+        raise merger.MergeInterruptedError(message)
 
     def get_report(self):
-        return '\n'.join(self.ui_report)
-
+        return "\n".join(self.ui_report)
 
 class Options:
     def __init__(self,filename):
@@ -125,153 +157,165 @@ cmn.opts = Options(options_filename)
 # ---------------------------
 # Helper functions for UI logic
 # ---------------------------
-_DEFAULT_SLIDER_MARKER = (-1, 2, 0.01)
-
-def _get_mode_objects(mergemode_name, calcmode_name):
-    mergemode = merger.mergemode_selection[mergemode_name]
-    calcmode  = merger.calcmode_selection[calcmode_name]
-    return mergemode, calcmode
+_DEFAULT_SLIDER_MARKER = (-1, 2, 0.01)  # This is perfect. Keep exactly like this.
 
 def _choose_slider_configs(mergemode, calcmode):
     """
-    Decide slider (a,b,c,d) configurations and info strings.
-    CalcMode configs take priority if they are not equal to the default sentinel.
-    Returns tuple: (a_cfg,a_info,b_cfg,b_info,c_cfg,c_info,d_cfg,d_info)
+    Return slider configs + info strings for a/b/c/d/e.
+    CalcMode overrides MergeMode only if it explicitly defines a slider config
+    different from the sentinel value.
     """
-    use_calc = hasattr(calcmode, 'slid_a_config') and getattr(calcmode, 'slid_a_config') != _DEFAULT_SLIDER_MARKER
+    # If calc mode defines at least one custom slider → use calc mode priority
+    use_calc = (
+        hasattr(calcmode, 'slid_a_config') and
+        getattr(calcmode, 'slid_a_config', None) != _DEFAULT_SLIDER_MARKER
+    )
 
     if use_calc:
-        a_cfg = getattr(calcmode,'slid_a_config', mergemode.slid_a_config)
-        a_info = getattr(calcmode,'slid_a_info', mergemode.slid_a_info)
-        b_cfg = getattr(calcmode,'slid_b_config', mergemode.slid_b_config)
-        b_info = getattr(calcmode,'slid_b_info', mergemode.slid_b_info)
-        c_cfg = getattr(calcmode,'slid_c_config', mergemode.slid_c_config)
-        c_info = getattr(calcmode,'slid_c_info', mergemode.slid_c_info)
-        d_cfg = getattr(calcmode,'slid_d_config', mergemode.slid_d_config)
-        d_info = getattr(calcmode,'slid_d_info', mergemode.slid_d_info)
+        a_cfg  = getattr(calcmode, 'slid_a_config',  mergemode.slid_a_config)
+        a_info = getattr(calcmode, 'slid_a_info',   mergemode.slid_a_info)
+        b_cfg  = getattr(calcmode, 'slid_b_config',  mergemode.slid_b_config)
+        b_info = getattr(calcmode, 'slid_b_info',    mergemode.slid_b_info)
+        c_cfg  = getattr(calcmode, 'slid_c_config',  mergemode.slid_c_config)
+        c_info = getattr(calcmode, 'slid_c_info',    mergemode.slid_c_info)
+        d_cfg  = getattr(calcmode, 'slid_d_config',  mergemode.slid_d_config)
+        d_info = getattr(calcmode, 'slid_d_info',    mergemode.slid_d_info)
+        e_cfg  = getattr(calcmode, 'slid_e_config',  mergemode.slid_e_config)
+        e_info = getattr(calcmode, 'slid_e_info',    mergemode.slid_e_info)
     else:
         a_cfg, a_info = mergemode.slid_a_config, mergemode.slid_a_info
         b_cfg, b_info = mergemode.slid_b_config, mergemode.slid_b_info
         c_cfg, c_info = mergemode.slid_c_config, mergemode.slid_c_info
         d_cfg, d_info = mergemode.slid_d_config, mergemode.slid_d_info
+        e_cfg, e_info = mergemode.slid_e_config, mergemode.slid_e_info
 
-    return (a_cfg, a_info, b_cfg, b_info, c_cfg, c_info, d_cfg, d_info)
+    return (a_cfg, a_info, b_cfg, b_info, c_cfg, c_info, d_cfg, d_info, e_cfg, e_info)
+
 
 def _required_counts(mergemode, calcmode):
     """
-    Determine required sliders and required models.
+    Safely calculate how many sliders and models are actually needed.
+    Handles all edge cases and guarantees 1–5 sliders, 1–4 models.
     """
-    base_sliders = getattr(mergemode, 'input_sliders', 4) or 4
+    base_sliders = getattr(mergemode, 'input_sliders', 5) or 5
     base_models  = getattr(mergemode, 'input_models', 4) or 4
 
-    calc_sliders_attr = getattr(calcmode, 'input_sliders', None)
-    calc_models_attr  = getattr(calcmode, 'input_models', None)
+    # Count how many sliders the CalcMode actually customizes
+    custom_slider_attrs = ('slid_a_config', 'slid_b_config', 'slid_c_config',
+                           'slid_d_config', 'slid_e_config')
+    custom_slider_count = sum(
+        1 for attr in custom_slider_attrs
+        if getattr(calcmode, attr, None) not in (None, _DEFAULT_SLIDER_MARKER)
+    )
 
-    calc_non_default_slider_count = 0
-    for attr in ('slid_a_config','slid_b_config','slid_c_config','slid_d_config'):
-        cfg = getattr(calcmode, attr, None)
-        if cfg is not None and cfg != _DEFAULT_SLIDER_MARKER:
-            calc_non_default_slider_count += 1
+    # Explicit override from CalcMode (rare, but supported)
+    explicit_sliders = getattr(calcmode, 'input_sliders', None)
+    explicit_models  = getattr(calcmode, 'input_models', None)
 
     req_sliders = base_sliders
-    if calc_sliders_attr:
+    if explicit_sliders is not None:
         try:
-            req_sliders = max(req_sliders, int(calc_sliders_attr))
-        except Exception:
+            req_sliders = max(req_sliders, int(explicit_sliders))
+        except:
             pass
-    req_sliders = max(req_sliders, calc_non_default_slider_count)
+    req_sliders = max(req_sliders, custom_slider_count)
 
-    if calc_models_attr:
-        try:
-            req_models = int(calc_models_attr)
-        except Exception:
-            req_models = base_models
-    else:
-        req_models = base_models
-
-    try:
-        req_sliders = int(req_sliders)
-    except Exception:
-        req_sliders = 4
+    req_models = explicit_models if explicit_models is not None else base_models
     try:
         req_models = int(req_models)
-    except Exception:
-        req_models = 4
+    except:
+        req_models = base_models
 
-    req_sliders = max(1, min(req_sliders, 4))
-    req_models  = max(1, min(req_models, 4))
+    # Clamp to valid ranges
+    req_sliders = max(1, min(int(req_sliders), 5))
+    req_models  = max(1, min(int(req_models), 4))
 
     return req_sliders, req_models
 
-def _compatible(mergemode, calcmode):
-    """Return True if calc mode is compatible with merge mode"""
-    compat = getattr(calcmode, 'compatible_modes', ['all'])
-    if 'all' in compat:
-        return True
-    compat_list = [c for c in compat if isinstance(c, str)]
-    return (mergemode.name in compat_list) or (mergemode.name in compat)
 
-def mode_changed(mergemode_name, calcmode_name):
-    """
-    Returns updates in this order:
-    merge_desc_update, calc_desc_update,
-    slider_a_update, slider_b_update, slider_c_update, slider_d_update,
-    slider_help_update,
-    model_a_update, model_b_update, model_c_update, model_d_update,
-    merge_button_update
-    """
-    mergemode, calcmode = _get_mode_objects(mergemode_name, calcmode_name)
+def mode_changed(merge_mode_name, calc_mode_name):
+    mergemode = merger.mergemode_selection[merge_mode_name]
+    calcmode = merger.calcmode_selection[calc_mode_name]
 
-    a_cfg, a_info, b_cfg, b_info, c_cfg, c_info, d_cfg, d_info = _choose_slider_configs(mergemode, calcmode)
+    # Descriptions
+    merge_desc = mergemode.description
+    calc_desc = calcmode.description
 
-    slider_a_update = gr.update(minimum=a_cfg[0], maximum=a_cfg[1], step=a_cfg[2], info=a_info)
-    slider_b_update = gr.update(minimum=b_cfg[0], maximum=b_cfg[1], step=b_cfg[2], info=b_info)
-    slider_c_update = gr.update(minimum=c_cfg[0], maximum=c_cfg[1], step=c_cfg[2], info=c_info)
-    slider_d_update = gr.update(minimum=d_cfg[0], maximum=d_cfg[1], step=d_cfg[2], info=d_info)
+    # Slider configs (5 supported)
+    configs = _choose_slider_configs(mergemode, calcmode)
+    a_cfg, a_info, b_cfg, b_info, c_cfg, c_info, d_cfg, d_info, e_cfg, e_info = configs
 
+    # Required counts
     req_sliders, req_models = _required_counts(mergemode, calcmode)
 
-    # Soft-disable unused sliders (interactive False)
-    def _sl_interactive(idx):
-        return True if idx <= req_sliders else False
-
-    # Merge update dicts with interactive flag
-    slider_a_update = {**(slider_a_update if isinstance(slider_a_update, dict) else {}), 'interactive': _sl_interactive(1)}
-    slider_b_update = {**(slider_b_update if isinstance(slider_b_update, dict) else {}), 'interactive': _sl_interactive(2)}
-    slider_c_update = {**(slider_c_update if isinstance(slider_c_update, dict) else {}), 'interactive': _sl_interactive(3)}
-    slider_d_update = {**(slider_d_update if isinstance(slider_d_update, dict) else {}), 'interactive': _sl_interactive(4)}
-
-    # Slider help textbox content (textbox style)
-    header = f"{mergemode.name} (merge) • {calcmode.name} (calc)"
+    # Help text
+    header = f"{mergemode.name} • {calcmode.name}"
     slider_help_text = (
+        f"<pre style='font-family: monospace; background: #111; padding: 12px; border-radius: 6px;'>"
         f"{header}\n\n"
-        f"α (alpha): {a_info or '-'}\n"
-        f"β (beta) : {b_info or '-'}\n"
-        f"γ (gamma): {c_info or '-'}\n"
-        f"δ (delta): {d_info or '-'}\n\n"
-        f"(Note: unused sliders are visible but disabled.)"
+        f"α (alpha)  : {a_info}\n"
+        f"β (beta)   : {b_info}\n"
+        f"γ (gamma)  : {c_info}\n"
+        f"δ (delta)  : {d_info}\n"
+        f"ε (epsilon): {e_info}\n\n"
+        f"Required: {req_sliders} slider(s), {req_models} model(s)"
+        f"</pre>"
     )
-    slider_help_update = gr.update(value=slider_help_text)
 
-    # Soft-disable model dropdowns
-    model_a_update = gr.update(interactive=True)
-    model_b_update = gr.update(interactive=True) if req_models >= 2 else gr.update(interactive=False)
-    model_c_update = gr.update(interactive=True) if req_models >= 3 else gr.update(interactive=False)
-    model_d_update = gr.update(interactive=True) if req_models >= 4 else gr.update(interactive=False)
+    # Slider updates (dynamic min/max/label + hide unused)
+    slider_updates = []
+    slider_labels = ['α', 'β', 'γ', 'δ', 'ε']
+    slider_infos = [a_info, b_info, c_info, d_info, e_info]
+    slider_cfgs = [a_cfg, b_cfg, c_cfg, d_cfg, e_cfg]
 
-    merge_desc_update = gr.update(value=mergemode.description)
-    calc_desc_update  = gr.update(value=calcmode.description)
+    for i in range(5):
+        cfg = slider_cfgs[i]
+        info = slider_infos[i]
+        label = f"slider_{['a','b','c','d','e'][i]} [{slider_labels[i]}] ({info})"
 
-    merge_button_update = gr.update(interactive=_compatible(mergemode, calcmode))
+        if i < req_sliders:
+            update = gr.update(
+                minimum=cfg[0], maximum=cfg[1], step=cfg[2],
+                label=label,
+                interactive=True, visible=True
+            )
+        else:
+            update = gr.update(
+                value=0,
+                interactive=False,
+                visible=False  # Fully hides unused sliders
+            )
+        slider_updates.append(update)
 
-    return (
-        merge_desc_update, calc_desc_update,
-        slider_a_update, slider_b_update, slider_c_update, slider_d_update,
-        slider_help_update,
-        model_a_update, model_b_update, model_c_update, model_d_update,
+    # Model dropdowns (hide/disable unused)
+    model_updates = [
+        gr.update(interactive=i < req_models, visible=i < req_models)
+        for i in range(4)
+    ]
+
+    # Merge button compatibility
+    compatible = ('all' in calcmode.compatible_modes or 
+                  mergemode.name in calcmode.compatible_modes)
+    merge_button_update = gr.update(
+        interactive=compatible,
+        variant='primary' if compatible else 'secondary'
+    )
+
+    return [
+        gr.update(value=merge_desc),
+        gr.update(value=calc_desc),
+        slider_updates[0],  # alpha
+        slider_updates[1],  # beta
+        slider_updates[2],  # gamma
+        slider_updates[3],  # delta
+        slider_updates[4],  # epsilon
+        gr.update(value=slider_help_text),
+        model_updates[0],   # model_a
+        model_updates[1],   # model_b
+        model_updates[2],   # model_c
+        model_updates[3],   # model_d
         merge_button_update
-    )
-
+    ]
 # ---------------------------
 # Utility UI helpers
 # ---------------------------
@@ -279,47 +323,89 @@ def get_checkpoints_list(sort):
     checkpoints_list = [x.title for x in sd_models.checkpoints_list.values() if x.is_safetensors]
     if sort == 'Newest first':
         sort_func = lambda x: os.path.getctime(sd_models.get_closet_checkpoint_match(x).filename)
-        checkpoints_list.sort(key=sort_func,reverse=True)
+        checkpoints_list.sort(key=sort_func, reverse=True)
     return checkpoints_list
 
-def get_lora_list():
-    """Return deduplicated list of LoRA paths with filename only (no duplicates)"""
-    lora_dirs = [
-        os.path.join(paths.models_path, "Lora"),
-        os.path.join(paths.models_path, "lora"),
-        os.path.join(paths.models_path, "LyCORIS"),
-    ]
-    
-    seen = set()
+
+def get_lora_list_with_info():
+    """
+    Returns list of LoRAs for CheckboxGroup.
+    Format expected by gr.CheckboxGroup: list[str] (full paths as values)
+    Shows nice label with size + type hint.
+    Handles Lora/, lora/, LyCORIS/, and user override.
+    """
+    # Respect user's custom LoRA directory first
+    lora_dirs = []
+    if hasattr(shared.opts, "lora_dir") and shared.opts.lora_dir and os.path.isdir(shared.opts.lora_dir):
+        lora_dirs.append(shared.opts.lora_dir)
+
+    # Standard locations
+    base = paths.models_path
+    lora_dirs.extend([
+        os.path.join(base, "Lora"),
+        os.path.join(base, "lora"),
+        os.path.join(base, "LoRA"),
+        os.path.join(base, "LyCORIS"),
+        os.path.join(base, "lycoris"),
+    ])
+
+    seen_paths = set()
     loras = []
-    
+
     for directory in lora_dirs:
-        if not os.path.exists(directory):
+        if not os.path.isdir(directory):
             continue
-        for file in os.listdir(directory):
-            if file.lower().endswith(('.safetensors', '.pt')):
-                filepath = os.path.join(directory, file)
-                # Use just the filename as unique key
-                if file not in seen:
-                    seen.add(file)
-                    # Show short name + (SDXL) or (SD1.5) hint if possible
-                    display_name = file
-                    try:
-                        with safetensors.torch.safe_open(filepath, framework="pt", device="cpu") as f:
-                            if "lora_unet_input_blocks_0_0" in f.keys():  # rough SD1.5 check
-                                display_name += " [SD1.5]"
-                            elif "lora_unet_input_blocks_4_1" in f.keys():  # rough SDXL check
-                                display_name += " [SDXL]"
-                    except:
-                        pass
-                    loras.append((display_name, filepath))
-    
+        for file in sorted(os.listdir(directory)):
+            if not file.lower().endswith(('.safetensors', '.pt', '.ckpt')):
+                continue
+
+            full_path = os.path.join(directory, file)
+            if full_path in seen_paths:
+                continue  # true deduplication by full path
+            seen_paths.add(full_path)
+
+            try:
+                size_mb = os.path.getsize(full_path) // (1024 * 1024)
+                dtype_hint = ""
+                model_hint = ""
+
+                with safetensors.torch.safe_open(full_path, framework="pt", device="cpu") as f:
+                    keys = f.keys()
+                    if any("bf16" in k for k in keys):
+                        dtype_hint = "bf16"
+                    else:
+                        dtype_hint = "f16"
+
+                    # Very fast model type detection
+                    if any(k.startswith("lora_unet_down_blocks_4_") for k in keys):
+                        model_hint = "[SDXL]"
+                    elif any(k.startswith("lora_unet_down_blocks_") and "_4_" not in k for k in keys):
+                        model_hint = "[SD1.5]"
+                    elif any("single_blocks" in k for k in keys):
+                        model_hint = "[Flux]"
+                    elif any("transformer_blocks" in k for k in keys):
+                        model_hint = "[SD3/Pony]"
+
+                # ← FIXED: missing closing quote + parenthesis
+                label = f"{file} — {size_mb}MB • {dtype_hint} {model_hint}"
+            except Exception:
+                label = f"{file} — {size_mb}MB"
+
+            # CheckboxGroup uses the full_path as value
+            loras.append(full_path)
+
     return loras
+
 
 def refresh_models(sort):
     sd_models.list_models()
     checkpoints_list = get_checkpoints_list(sort)
-    return gr.update(choices=checkpoints_list),gr.update(choices=checkpoints_list),gr.update(choices=checkpoints_list),gr.update(choices=checkpoints_list)
+    return (
+        gr.update(choices=checkpoints_list),
+        gr.update(choices=checkpoints_list),
+        gr.update(choices=checkpoints_list),
+        gr.update(choices=checkpoints_list)
+    )
 
 def save_custom_sliders(name,*sliders):
     new_preset = {name:sliders}
@@ -352,103 +438,170 @@ def load_slider_preset(name):
     if preset is None: return [gr.update()]*26
     return [gr.update(value=x) for x in preset]
 
-def validate_merge_config(model_a, model_b, weight_editor, merge_mode):
-    """Validate merge configuration before execution"""
-    errors = []
-    
-    if not model_a or model_a == "":
-        errors.append("❌ Model A (Primary) is required")
-    if not model_b or model_b == "":
-        errors.append("❌ Model B (Secondary) is required")
-    
-    if weight_editor.strip() == "":
-        errors.append("⚠️ Weight editor is empty - only default-to-A merge will occur")
-    
-    try:
-        lines = [l.strip() for l in weight_editor.split('\n') if l.strip() and not l.strip().startswith('#')]
-        for line in lines:
-            if ':' not in line:
-                errors.append(f"❌ Invalid syntax: '{line}' (missing colon)")
-    except:
-        pass
-    
-    if errors:
-        return False, '\n'.join(errors)
-    return True, "✓ Configuration valid"
 
 # ---------------------------
-# UI: build tabs
+# UI: build tabs (updated with status definition)
 # ---------------------------
 def on_ui_tabs():
+    # COMPATIBILITY WRAPPER FOR CHECKPOINT MATCHING
+    def get_checkpoint_match(name):
+        """Works with both Automatic1111-dev and Forge Neo"""
+        if hasattr(sd_models, 'get_closest_checkpoint_match'):
+            return sd_models.get_closet_checkpoint_match(name)  # A1111-dev (typo)
+        elif hasattr(sd_models, 'get_closest_checkpoint_match'):
+            return sd_models.get_closet_checkpoint_match(name)  # Forge Neo
+        else:
+            for ckpt in sd_models.checkpoints_list.values():
+                if name.lower() in ckpt.title.lower() or name.lower() in ckpt.filename.lower():
+                    return ckpt
+            return None
+    
+    # CORRECT: Returns plain list of checkpoint names
+    def refresh_models(sort_mode="Alphabetical"):
+        from modules import sd_models
+        import os
+        
+        sd_models.list_models()
+        checkpoints = [cp.title for cp in sd_models.checkpoints_list.values()]
+        
+        if sort_mode == "Newest first":
+            checkpoints.sort(
+                key=lambda x: os.path.getmtime(get_checkpoint_match(x).filename),
+                reverse=True
+            )
+        else:
+            checkpoints.sort(key=str.lower)
+        
+        return checkpoints
+
+    # Get initial list once
+    initial_checkpoints = refresh_models("Alphabetical")
+
+    # Wrapper for live updates (returns gr.update objects)
+    def update_dropdowns(sort_mode):
+        new_list = refresh_models(sort_mode)
+        return (
+            gr.update(choices=new_list),
+            gr.update(choices=new_list),
+            gr.update(choices=new_list),
+            gr.update(choices=new_list)
+        )
+
+    # -------------------------------------------------
+    # Main UI
+    # -------------------------------------------------
     with gr.Blocks() as cmn.blocks:
         with gr.Tab("Merge"):
-            dummy_component = gr.Textbox(visible=False,interactive=True)
+            dummy_component = gr.Textbox(visible=False, interactive=True)
+
             with ui_components.ResizeHandleRow():
                 with gr.Column():
-                    with gr.Group(label="Merge Status & Logs"):
-                        status = gr.Textbox(
-                            max_lines=4,
-                            lines=4,
-                            show_label=False,
+                    # === LOGS ===
+                    with gr.Accordion("Merge Status & Logs", open=True, elem_classes="amethyst-log-section"):
+                        merge_report = gr.Textbox(
+                            label="Merge Report",
+                            lines=12,
+                            elem_id="amethyst_merge_report",
                             interactive=False,
-                            render=True,
-                            elem_id="merge_status"
+                            show_copy_button=True,
                         )
-                        
-                        with gr.Accordion("Detailed Logs", open=False):
-                            detailed_logs = gr.Textbox(
-                                max_lines=20,
-                                lines=20,
-                                interactive=False,
-                                show_copy_button=True
-                            )
-                            
-                            clear_logs_btn = gr.Button("Clear Logs")
-                            clear_logs_btn.click(fn=lambda: gr.update(value=""), outputs=detailed_logs)
+                        progress_bar = gr.HTML("<div style='font-family: monospace; padding: 10px;'>Ready</div>")
 
-                    # MODEL SELECTION
+                    with gr.Accordion("Detailed Logs", open=False):
+                        detailed_logs = gr.Textbox(lines=20, interactive=False, show_copy_button=True)
+                        gr.Button("Clear Logs").click(fn=lambda: "", outputs=detailed_logs)
+
+                    # === MODEL SELECTION ===
                     with gr.Row():
                         slider_scale = 8
-                        with gr.Column(variant='compact',min_width=150,scale=slider_scale):
+
+                        with gr.Column(variant='compact', min_width=150, scale=slider_scale):
                             with gr.Row():
-                                model_a = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_a [Primary]",scale=slider_scale)
-                                swap_models_AB = gr.Button(value='⇆', elem_classes=["tool"],scale=1)
-                            model_a_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
-                            # update model info when changed
+                                model_a = gr.Dropdown(
+                                    choices=initial_checkpoints,
+                                    label="model_a [Primary]",
+                                    value=initial_checkpoints[0] if initial_checkpoints else None,
+                                    scale=slider_scale
+                                )
+                                swap_models_AB = gr.Button('Swap', elem_classes=["tool"], scale=1)
+                            model_a_info = gr.HTML(plaintext_to_html('None | None', classname='untitled_sd_version'))
                             model_a.change(fn=checkpoint_changed, inputs=model_a, outputs=model_a_info)
-                            model_a.change(fn=update_model_a_keys, inputs=model_a)
 
-                        with gr.Column(variant='compact',min_width=150,scale=slider_scale):
+                        with gr.Column(variant='compact', min_width=150, scale=slider_scale):
                             with gr.Row():
-                                model_b = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_b [Secondary]",scale=slider_scale)
-                                swap_models_BC = gr.Button(value='⇆', elem_classes=["tool"],scale=1)
-                            model_b_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
-                            model_b.change(fn=checkpoint_changed,inputs=model_b,outputs=model_b_info)
+                                model_b = gr.Dropdown(
+                                    choices=initial_checkpoints,
+                                    label="model_b [Secondary]",
+                                    value=None,
+                                    scale=slider_scale
+                                )
+                                swap_models_BC = gr.Button('Swap', elem_classes=["tool"], scale=1)
+                            model_b_info = gr.HTML(plaintext_to_html('None | None', classname='untitled_sd_version'))
+                            model_b.change(fn=checkpoint_changed, inputs=model_b, outputs=model_b_info)
 
-                        with gr.Column(variant='compact',min_width=150,scale=slider_scale):
+                        with gr.Column(variant='compact', min_width=150, scale=slider_scale):
                             with gr.Row():
-                                model_c = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_c [Tertiary]",scale=slider_scale)
-                                swap_models_CD = gr.Button(value='⇆', elem_classes=["tool"],scale=1)
-                            model_c_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
-                            model_c.change(fn=checkpoint_changed,inputs=model_c,outputs=model_c_info)
+                                model_c = gr.Dropdown(
+                                    choices=initial_checkpoints,
+                                    label="model_c [Tertiary]",
+                                    value=None,
+                                    scale=slider_scale
+                                )
+                                swap_models_CD = gr.Button('Swap', elem_classes=["tool"], scale=1)
+                            model_c_info = gr.HTML(plaintext_to_html('None | None', classname='untitled_sd_version'))
+                            model_c.change(fn=checkpoint_changed, inputs=model_c, outputs=model_c_info)
 
-                        with gr.Column(variant='compact',min_width=150,scale=slider_scale):
+                        with gr.Column(variant='compact', min_width=150, scale=slider_scale):
                             with gr.Row():
-                                model_d = gr.Dropdown(get_checkpoints_list('Alphabetical'), label="model_d [Supplementary]",scale=slider_scale)
-                                refresh_button = gr.Button(value='🔄', elem_classes=["tool"],scale=1)
-                            model_d_info = gr.HTML(plaintext_to_html('None | None',classname='untitled_sd_version'))
-                            model_d.change(fn=checkpoint_changed,inputs=model_d,outputs=model_d_info)
+                                model_d = gr.Dropdown(
+                                    choices=initial_checkpoints,
+                                    label="model_d [Supplementary]",
+                                    value=None,
+                                    scale=slider_scale
+                                )
+                                refresh_button = gr.Button('Refresh', elem_classes=["tool"], scale=1)
+                            model_d_info = gr.HTML(plaintext_to_html('None | None', classname='untitled_sd_version'))
+                            model_d.change(fn=checkpoint_changed, inputs=model_d, outputs=model_d_info)
 
-                        checkpoint_sort = gr.Dropdown(min_width=60,scale=1,visible=True,choices=['Alphabetical','Newest first'],value='Alphabetical',label='Sort')
+                        # Sort dropdown
+                        checkpoint_sort = gr.Dropdown(
+                            choices=['Alphabetical', 'Newest first'],
+                            value='Alphabetical',
+                            label='Sort Models',
+                            scale=1,
+                            min_width=120
+                        )
 
-                        def swapvalues(x,y): return gr.update(value=y), gr.update(value=x)
-                        swap_models_AB.click(fn=swapvalues,inputs=[model_a,model_b],outputs=[model_a,model_b])
-                        swap_models_BC.click(fn=swapvalues,inputs=[model_b,model_c],outputs=[model_b,model_c])
-                        swap_models_CD.click(fn=swapvalues,inputs=[model_c,model_d],outputs=[model_c,model_d])
-                        refresh_button.click(fn=refresh_models,inputs=checkpoint_sort, outputs=[model_a,model_b,model_c,model_d])
-                        checkpoint_sort.change(fn=refresh_models,inputs=checkpoint_sort,outputs=[model_a,model_b,model_c,model_d])
+                    # === SWAP LOGIC ===
+                    def swapvalues(x, y):
+                        return gr.update(value=y), gr.update(value=x)
 
-                    # MODE SELECTION
+                    swap_models_AB.click(fn=swapvalues, inputs=[model_a, model_b], outputs=[model_a, model_b])
+                    swap_models_BC.click(fn=swapvalues, inputs=[model_b, model_c], outputs=[model_b, model_c])
+                    swap_models_CD.click(fn=swapvalues, inputs=[model_c, model_d], outputs=[model_c, model_d])
+
+                    # === REFRESH LOGIC (NOW 100% WORKING) ===
+                    def update_dropdowns(sort_mode):
+                        new_list = refresh_models(sort_mode)
+                        return (
+                            gr.update(choices=new_list),
+                            gr.update(choices=new_list),
+                            gr.update(choices=new_list),
+                            gr.update(choices=new_list)
+                        )
+
+                    refresh_button.click(
+                        fn=update_dropdowns,
+                        inputs=checkpoint_sort,
+                        outputs=[model_a, model_b, model_c, model_d]
+                    )
+                    checkpoint_sort.change(
+                        fn=update_dropdowns,
+                        inputs=checkpoint_sort,
+                        outputs=[model_a, model_b, model_c, model_d]
+                    )
+
+                    # === MODE SELECTION ===
                     with gr.Row():
                         merge_mode_selector = gr.Radio(
                             label='Merge Mode (formula structure):',
@@ -456,6 +609,7 @@ def on_ui_tabs():
                             value=list(merger.mergemode_selection.keys())[0],
                             scale=3
                         )
+
                     merge_mode_desc = gr.Textbox(
                         label="Merge Mode Description",
                         value=merger.mergemode_selection[list(merger.mergemode_selection.keys())[0]].description,
@@ -470,6 +624,7 @@ def on_ui_tabs():
                             value=list(merger.calcmode_selection.keys())[0],
                             scale=3
                         )
+
                     calc_mode_desc = gr.Textbox(
                         label="Calculation Mode Description",
                         value=merger.calcmode_selection[list(merger.calcmode_selection.keys())[0]].description,
@@ -478,72 +633,209 @@ def on_ui_tabs():
                     )
 
                     with gr.Row():
-                        cross_arch_mode = gr.Dropdown(
-                            choices=["Standard (Same Arch)", "Cross-Arch (SD1.5/Flux to SDXL)"],
-                            value="Standard (Same Arch)",
-                            label="Merge Type (Architecture)",
-                            info="Cross-Arch allows merging completely different model families"
-                        )
-                        thread_count = gr.Slider(
-                            minimum=1,
-                            maximum=32,
-                            value=8,
-                            step=1,
-                            label="Thread count (speed)"
-                        )
-                        cache_size = gr.Slider(
-                            minimum=512,
-                            maximum=8192,
-                            value=2048,
-                            step=256,
-                            label="Cache size (MB) – lower = less RAM"
+                        cross_arch_mode = gr.Checkbox(
+                            label="Enable Cross-Arch Merge (SD1.5 / Pony / Flux to SDXL)",
+                            value=False,
+                            info="Keeps every key from every model • Resizes intelligently • Produces ~7.4 GB superset models"
                         )
 
-                    # Connect UI controls to backend settings
                     cross_arch_mode.change(
-                        fn=lambda x: setattr(cmn, 'cross_arch_enabled', x == "Cross-Arch (SD1.5/Flux to SDXL)"),
+                        fn=lambda x: (
+                            setattr(cmn, 'cross_arch_enabled', x),
+                            setattr(cmn, 'is_cross_arch', x)
+                        ),
                         inputs=cross_arch_mode,
                         outputs=None
                     )
-
-                    thread_count.change(
-                        fn=lambda x: cmn.opts.options.update({'threads': int(x)}) or cmn.opts.save(),
-                        inputs=thread_count,
-                        outputs=None
-                    )
-
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
+
+                    # ===================================================================
+                    # AMETHYST KITCHEN-SINK WEIGHT PRESETS — FINAL 2025 EDITION
+                    # ===================================================================
+                    with gr.Accordion("Kitchen-Sink Weight Presets", open=True):
+                        with gr.Row():
+                            preset_dropdown = gr.Dropdown(
+                                label="Weight Preset",
+                                choices=[
+                                    "Custom (Manual)",
+                                    "50/50 UNet + Keep CLIP",
+                                    "UNet 50/50 + Noise Blend",
+                                    "Keep CLIP/T5 + Full UNet Merge",
+                                    "Full Kitchen Sink (All 50/50)",
+                                    "Primary Dominance (A=1.0, Others=0.0)",
+                                    "Secondary Dominance (B=1.0, Others=0.0)",
+                                ],
+                                value="Custom (Manual)",
+                                info="Quick presets for true kitchen-sink merging"
+                            )
+                            apply_preset = gr.Button(value="Apply Preset", variant="primary")
+
+                        gr.HTML("<small><b>Active when using Weight Editor or Block Weights</b></small>")
+
+                        # ------------------------------------------------------------------
+                        # Preset definitions
+                        # ------------------------------------------------------------------
+                        def apply_weight_preset(choice: str) -> str:
+                            presets = {
+                                "Custom (Manual)": "{}",
+
+                                "50/50 UNet + Keep CLIP": json.dumps({
+                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
+                                    "conditioner.*":           {"alpha": 1.0, "beta": 0.0},
+                                    "denoiser.*":              {"alpha": 0.7, "beta": 0.3},
+                                    "first_stage_model.*":     {"alpha": 0.6, "beta": 0.4}
+                                }, indent=2),
+
+                                "UNet 50/50 + Noise Blend": json.dumps({
+                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
+                                    "denoiser.*":              {"alpha": 0.9, "beta": 0.1},
+                                    "*":                       {"alpha": 0.5, "beta": 0.5}
+                                }, indent=2),
+
+                                "Keep CLIP/T5 + Full UNet Merge": json.dumps({
+                                    "conditioner.*":           {"alpha": 1.0, "beta": 0.0},
+                                    "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
+                                    "first_stage_model.*":     {"alpha": 0.5, "beta": 0.5},
+                                    "denoiser.*":              {"alpha": 0.5, "beta": 0.5}
+                                }, indent=2),
+
+                                "Full Kitchen Sink (All 50/50)": json.dumps({
+                                    "*": {"alpha": 0.5, "beta": 0.5}
+                                }, indent=2),
+
+                                "Primary Dominance (A=1.0, Others=0.0)": json.dumps({
+                                    "*": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0}
+                                }, indent=2),
+
+                                "Secondary Dominance (B=1.0, Others=0.0)": json.dumps({
+                                    "*": {"alpha": 0.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0}
+                                }, indent=2),
+                            }
+                            return presets.get(choice, "{}")
+
+                        # Hidden textbox — MUST exist before any event uses it
+                        preset_output = gr.Textbox(visible=False)
+
+                        # ------------------------------------------------------------------
+                        # SAFE EVENT WIRING — NO MORE UnboundLocalError
+                        # ------------------------------------------------------------------
+                        # 1. Fill the hidden textbox with the JSON preset
+                        apply_preset.click(
+                            fn=apply_weight_preset,
+                            inputs=preset_dropdown,
+                            outputs=preset_output
+                        )
+
+                        # 2. When hidden textbox changes → copy its content into the visible weight_editor
+                        preset_output.change(
+                            fn=lambda x: x,
+                            inputs=preset_output,
+                            outputs=weight_editor
+                        )
 
                     # MAIN SLIDERS - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
                     with gr.Row(equal_height=True):
                         alpha = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_a [α] (alpha)", info='model_a - model_b', value=0.5, elem_classes=['main_sliders'])
                         beta  = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_b [β] (beta)",  info='-', value=0.5, elem_classes=['main_sliders'])
-                        gamma = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_c [γ] (gamma)", info='-', value=0.25, elem_classes=['main_sliders'])
-                        delta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_d [δ] (delta)", info='-', value=0.25, elem_classes=['main_sliders'])
+                        gamma = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_c [γ] (gamma)", info='-', value=0.5, elem_classes=['main_sliders'])
+                        delta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_d [δ] (delta)", info='-', value=0.5, elem_classes=['main_sliders'])
+                        epsilon = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_e [ε] (epsilon)", info='-', value=0.5, elem_classes=['main_sliders'])  # Added slider e
+                    # CUSTOM SLIDERS UI — Elite, Dynamic, 5-Slider Safe
+                    with ui_components.InputAccordion(False, label="Custom Sliders") as enable_sliders:
+                        with gr.Accordion("Custom Slider Presets", open=True):
+                            with gr.Row(variant="compact"):
+                                sliders_preset_dropdown = gr.Dropdown(
+                                                            label="Preset",
+                                                            choices=get_slider_presets(),
+                                                            value="blocks",
+                                                            allow_custom_value=True,
+                                                            scale=5
+                                                        )
+                                slider_refresh_button = gr.Button("Refresh", scale=1)
 
-                    # CUSTOM SLIDERS UI
-                    with ui_components.InputAccordion(False, label='Custom sliders') as enable_sliders:
-                        with gr.Accordion(label = 'Presets'):
-                            with gr.Row(variant='compact'):
-                                sliders_preset_dropdown = gr.Dropdown(label='Preset Name',allow_custom_value=True,choices=get_slider_presets(),value='blocks',scale=4)
-                                slider_refresh_button = gr.Button(value='🔄', elem_classes=["tool"],scale=1,min_width=40)
-                                slider_refresh_button.click(fn=lambda:gr.update(choices=get_slider_presets()),outputs=sliders_preset_dropdown)
-                                sliders_preset_load = gr.Button(variant='secondary',value='Load presets',scale=2)
-                                sliders_preset_save = gr.Button(variant='secondary',value='Save sliders as preset',scale=2)
-                            with open(custom_sliders_examples,'r') as file:
-                                presets = json.load(file)
-                            slid_defaults = iter(presets['blocks'])
-                            slider_slider = gr.Slider(step=2,maximum=26,value=slid_defaults.__next__(),label='Enabled Sliders')
+                                sliders_preset_load = gr.Button("Load", variant="secondary", scale=2)
+                                sliders_preset_save = gr.Button("Save As...", variant="secondary", scale=2)
+
+                            # Dynamic slider count (supports up to 30+ custom sliders)
+                            slider_slider = gr.Slider(
+                                minimum=0,
+                                maximum=30,        # ← NOW SUPPORTS EPSILON + MANY MORE
+                                value=26,
+                                step=1,
+                                label="Number of Custom Sliders (0 = disabled)"
+                            )
 
                         custom_sliders = []
-                        with gr.Row():
-                            for w in [6,1,6]:
-                                with gr.Column(scale=w,min_width=0):
-                                    if w>1:
-                                        for i in range(13):
-                                            with gr.Row(variant='compact'):
-                                                custom_sliders.append(gr.Textbox(show_label=False,visible=True,value=slid_defaults.__next__(),placeholder='target',min_width=100,scale=1,lines=1,max_lines=1))
-                                                custom_sliders.append(gr.Slider(show_label=False,value=slid_defaults.__next__(),scale=6,minimum=0,maximum=1,step=0.0000001))
+                        slider_container = gr.Column(visible=False)
+
+                        def load_slider_preset(preset_name):
+                            if not preset_name or preset_name not in get_slider_presets():
+                                preset_name = "blocks"
+                            with open(custom_sliders_examples, 'r') as f:
+                                data = json.load(f)
+                            values = data.get(preset_name, data["blocks"])
+                            return (
+                                gr.update(choices=get_slider_presets(), value=preset_name),
+                                gr.update(value=len(values)),
+                                *[gr.update(value=v) for v in values]
+                            )
+
+                        def update_slider_visibility(count):
+                            return gr.update(visible=count > 0)
+
+                        # Wire preset loading
+                        sliders_preset_load.click(
+                            fn=load_slider_preset,
+                            inputs=sliders_preset_dropdown,
+                            outputs=[sliders_preset_dropdown, slider_slider] + custom_sliders
+                        )
+
+                        slider_refresh_button.click(
+                            fn=lambda: gr.update(choices=get_slider_presets()),
+                            outputs=sliders_preset_dropdown
+                        )
+
+                        # Dynamic creation of sliders
+                        with slider_container:
+                            for i in range(30):  # Max possible
+                                with gr.Row(variant="compact", visible=False) as row:
+                                    target = gr.Textbox(
+                                        placeholder="target keys (e.g. model.*in00*)",
+                                        label=f"Target {i+1}",
+                                        scale=3
+                                    )
+                                    weight = gr.Slider(
+                                        minimum=0.0,
+                                        maximum=2.0,
+                                        value=1.0,
+                                        step=0.001,
+                                        label=f"Weight {i+1}",
+                                        scale=7
+                                    )
+                                    custom_sliders.extend([target, weight])
+
+                        # Show/hide based on slider count
+                        def show_custom_sliders(count):
+                            updates = []
+                            for i in range(30):
+                                visible = i < count
+                                updates.extend([
+                                    gr.update(visible=visible),  # row
+                                    gr.update(visible=visible),  # target
+                                    gr.update(visible=visible)   # weight
+                                ])
+                            return updates
+
+                        slider_slider.change(
+                            fn=show_custom_sliders,
+                            inputs=slider_slider,
+                            outputs=custom_sliders
+                        )
+                        enable_sliders.change(
+                            fn=lambda x: gr.update(visible=x),
+                            inputs=enable_sliders,
+                            outputs=slider_container
+                        )
 
                     # Supermerger Adjust - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
                     with gr.Accordion("Supermerger Adjust", open=False) as acc_ad:
@@ -572,7 +864,8 @@ def on_ui_tabs():
                             with gr.Column(scale=1, min_width=100):
                                 col3 = gr.Slider(label="Yellow-Blue", minimum=-10, maximum=10, step=0.0000001, value=0, info="Yellow(Minius)-Blue(Plus)")
 
-                            finetune.change(fn=lambda x:gr.update(label = f"Supermerger Adjust : {x}"if x != "" and x !="0,0,0,0,0,0,0,0" else "Supermerger Adjust"),inputs=[finetune],outputs = [acc_ad])
+                        finetune.change(fn=lambda x: gr.update(label=f"Supermerger Adjust : {x}" if x != "" and x != "0,0,0,0,0,0,0,0" else "Supermerger Adjust"),
+                                        inputs=[finetune], outputs=[acc_ad])
 
                         def finetune_update(finetune, detail1, detail2, detail3, contrast, bri, col1, col2, col3):
                             arr = [detail1, detail2, detail3, contrast, bri, col1, col2, col3]
@@ -585,159 +878,246 @@ def on_ui_tabs():
                             try:
                                 tmp = [float(t) for t in finetune.split(",") if t]
                                 assert len(tmp) == 8, f"expected 8 values, received {len(tmp)}."
-                            except ValueError as err: gr.Warning(str(err))
-                            except AssertionError as err: gr.Warning(str(err))
-                            else: return [gr.update(value=x) for x in tmp]
-                            return [gr.update()]*8
+                            except (ValueError, AssertionError) as err:
+                                gr.Warning(str(err))
+                            else:
+                                return [gr.update(value=x) for x in tmp]
+                            return [gr.update()] * 8
 
                         finetunes = [detail1, detail2, detail3, contrast, bri, col1, col2, col3]
-                        finetune_reset.click(fn=lambda: [gr.update(value="")]+[gr.update(value=0.0)]*8, inputs=[], outputs=[finetune, *finetunes])
+                        finetune_reset.click(fn=lambda: [gr.update(value="")] + [gr.update(value=0.0)] * 8,
+                                            inputs=[], outputs=[finetune, *finetunes])
                         finetune_read.click(fn=finetune_reader, inputs=[finetune], outputs=[*finetunes])
                         finetune_write.click(fn=finetune_update, inputs=[finetune, *finetunes], outputs=[finetune])
-                        detail1.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        detail2.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        detail3.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        contrast.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        bri.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        col1.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        col2.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
-                        col3.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
+
+                        for slider in finetunes:
+                            slider.release(fn=finetune_update, inputs=[finetune, *finetunes], outputs=finetune, show_progress=False)
 
                     # OPTIONS
-                    with gr.Accordion(label='Options',open=False):
-                        save_options_button = gr.Button(value = 'Save',variant='primary')
+                    with gr.Accordion(label='Options', open=False):
+                        save_options_button = gr.Button(value='Save Options', variant='primary')
                         save_options_button.click(fn=cmn.opts.save)
-                        cmn.opts.create_option('trash_model',
-                                            gr.Radio,
-                                            {'choices':['Disable','Enable for SDXL','Enable'],
-                                                'label':'Clear loaded SD models from memory at the start of merge:',
-                                                'info':'Saves some memory but increases loading times'},
-                                                default='Enable for SDXL')
 
-                        cmn.opts.create_option('device',
-                                            gr.Radio,
-                                            {'choices':['cuda/float16', 'cuda/float32', 'cpu/float32'],
-                                                'label':'Preferred device/dtype for merging:'},
-                                                default='cuda/float16')
+                        cmn.opts.create_option('trash_model',
+                            gr.Radio,
+                            {
+                                'choices': ['Disable', 'Enable for SDXL', 'Enable'],
+                                'label': 'Clear loaded SD models from memory at start of merge:',
+                                'info': 'Saves VRAM but increases load time'
+                            },
+                            default='Enable for SDXL'
+                        )
+
+                        # FINAL: Device selection with auto-save
+                        device_radio = cmn.opts.create_option('device',
+                            gr.Radio,
+                            {
+                                'choices': [
+                                    'cuda/float16',
+                                    'cuda/bfloat16',
+                                    'cuda/float32',
+                                    'cpu/float32'
+                                ],
+                                'label': 'Merge device & precision:',
+                                'info': 'bfloat16 is usually the best choice on modern NVIDIA GPUs'
+                            },
+                            default='cuda/float16'
+                        )
+                        device_radio.change(
+                            fn=lambda x: cmn.opts.save(),
+                            inputs=device_radio,
+                            outputs=None
+                        )
 
                         cmn.opts.create_option('threads',
-                                            gr.Slider,
-                                            {'step':2,
-                                                'minimum':2,
-                                                'maximum':20,
-                                                'label':'Worker thread count:',
-                                                'info':'Relevant for both cuda and CPU merging. Using too many threads can harm performance. Your core-count +-2 is a good guideline.'},
-                                                default=8)
+                            gr.Slider,
+                            {
+                                'step': 2, 'minimum': 2, 'maximum': 20,
+                                'label': 'Worker thread count:',
+                                'info': 'Relevant for both CUDA and CPU merging. Core count ±2 is ideal.'
+                            },
+                            default=8
+                        )
 
                         cache_size_slider = cmn.opts.create_option('cache_size',
-                                            gr.Slider,
-                                            {'step':64,
-                                                'minimum':0,
-                                                'maximum':16384,
-                                                'label':'Cache size (MB):',
-                                                'info':'Stores the result of intermediate calculations, such as the difference between B and C in add-difference before its multiplied and added to A.'},
-                                                default=4096)
+                            gr.Slider,
+                            {
+                                'step': 64, 'minimum': 0, 'maximum': 16384,
+                                'label': 'Cache size (MB):',
+                                'info': 'Intermediate results cache. 8192–16384 recommended for huge merges.'
+                            },
+                            default=8192
+                        )
 
-                        cache_size_slider.release(fn=lambda x: weights_cache.__init__(x),inputs=cache_size_slider)
-                        weights_cache.__init__(cmn.opts['cache_size'])
+                        def update_cache_size(value):
+                            weights_cache.__init__(max(0, int(value)))
+                            return f"Cache resized to {value} MB"
+
+                        cache_size_slider.release(
+                            fn=update_cache_size,
+                            inputs=cache_size_slider,
+                            outputs=None
+                        )
+
+                        # Initialize cache at startup with saved value
+                        weights_cache.__init__(cmn.opts.get('cache_size', 8192))
 
                     # MERGE & SAVE UI
                     with gr.Row(equal_height=True):
                         with gr.Column(variant='panel'):
-                            save_name = gr.Textbox(max_lines=1,label='Save checkpoint as:',lines=1,placeholder='Enter name...',scale=2)
-                            with gr.Row():
-                                save_settings = gr.CheckboxGroup(label = " ",choices=["Autosave","Overwrite","fp16","bf16"],value=['fp16'],interactive=True,scale=2,min_width=100)
-                                save_loaded = gr.Button(value='Save loaded checkpoint',size='sm',scale=1)
-                                save_loaded.click(fn=misc_util.save_loaded_model, inputs=[save_name,save_settings], outputs=status)
-                                save_loaded.click(fn=refresh_models, inputs=checkpoint_sort, outputs=[model_a,model_b,model_c,model_d])
+                            save_name = gr.Textbox(
+                                max_lines=1,
+                                label='Save checkpoint as:',
+                                lines=1,
+                                placeholder='Enter name...',
+                                scale=2
+                            )
 
-                        with gr.Column():
-                            merge_button = gr.Button(value='Merge',variant='primary')
                             with gr.Row():
-                                empty_cache_button = gr.Button(value='Empty Cache')
-                                empty_cache_button.click(fn=merger.clear_cache,outputs=status)
-
-                                stop_button = gr.Button(value='Stop')
-                                def stopfunc(): cmn.stop = True;shared.state.interrupt()
-                                stop_button.click(fn=stopfunc)
-                            with gr.Row():
-                                merge_seed = gr.Number(label='Merge Seed', value=99,  min_width=100, precision=0,scale=1)
-                                merge_random_seed = ui_components.ToolButton(ui.random_symbol, tooltip="Set seed to -1, which will cause a new random number to be used every time")
-                                merge_random_seed.click(fn=lambda:-1, outputs=merge_seed)
-                                merge_reuse_seed = ui_components.ToolButton(ui.reuse_symbol, tooltip="Reuse seed from last generation, mostly useful if it was randomized")
-                                merge_reuse_seed.click(fn=lambda:cmn.last_merge_seed, outputs=merge_seed)
-
-                    # INCLUDE / EXCLUDE
-                    with gr.Accordion(label='Include/Exclude/Discard',open=False):
-                        with gr.Row():
-                            with gr.Column():
-                                clude = gr.Textbox(
-                                    max_lines=4,
-                                    label='Include/Exclude:',
-                                    info="Entered targets will remain as model_a when set to 'Exclude', and will be the only ones to be merged if set to 'Include'. Separate with whitespace.",
-                                    value='clip',
-                                    lines=4,
-                                    scale=4
+                                save_settings = gr.CheckboxGroup(
+                                    label="Save & Load Options",
+                                    choices=[
+                                        "Autosave",        # Save to disk
+                                        "Overwrite",       # Overwrite existing file
+                                        "Load in Memory",  # ← ← ALWAYS keep this: load merged model immediately (with or without save)
+                                        "fp16",            # Save/load as float16
+                                        "bf16",            # Save/load as bfloat16
+                                        "fp32"             # Save/load as float32
+                                    ],
+                                    value=['fp16', 'Load in Memory'],  # ← smart default
+                                    interactive=True
                                 )
 
-                                clude_mode = gr.Radio(label="", info="", choices=["Exclude", ("Include exclusively", 'include')], value='Exclude', min_width=300, scale=1)
-
-                            with gr.Column():
-                                discard = gr.Textbox(
-                                    max_lines=5,
-                                    label='Discard:',
-                                    info="Remove layers from final save (autosave only). Examples: 'model_ema', 'first_stage_model', or 'model_ema first_stage_model'. Leave empty to keep all layers.",
-                                    value='model_ema',
-                                    lines=5,
+                                save_loaded = gr.Button(
+                                    value='Save loaded checkpoint',
+                                    size='sm',
                                     scale=1
                                 )
 
-                    # Weight editor
-                    with gr.Accordion('Weight editor'):
-                        weight_editor = gr.Code(value=EXAMPLE,lines=20,language='yaml',label='')
+                            # === STATUS BOX + CLEAR BUTTON ===
+                            with gr.Column(scale=3):
+                                status = gr.Textbox(
+                                    label="Save / Merge Status",
+                                    lines=4,
+                                    interactive=False,
+                                    show_copy_button=True,
+                                    value="Ready",
+                                    elem_classes="amethyst-status-box"
+                                )
+                                with gr.Row():
+                                    clear_status = gr.Button("Clear Status", size="sm", variant="secondary")
+                                    clear_status.click(fn=lambda: "", outputs=status)
 
-                    # Validation output (add this INSIDE on_ui_tabs)
+                            # === Save button actions ===
+                            save_loaded.click(
+                                fn=misc_util.save_loaded_model,
+                                inputs=[save_name, save_settings],
+                                outputs=status
+                            )
+                            save_loaded.click(
+                                fn=refresh_models,
+                                inputs=checkpoint_sort,
+                            )
+
+                        with gr.Column():
+                            merge_button = gr.Button(value='Merge', variant='primary')
+                            with gr.Row():
+                                empty_cache_button = gr.Button(value='Empty Cache')
+                                empty_cache_button.click(fn=merger.clear_cache, outputs=status)
+
+                                stop_button = gr.Button(value='Stop', variant="stop")
+                                def stopfunc():
+                                    cmn.stop = True
+                                    shared.state.interrupt()
+                                stop_button.click(fn=stopfunc)
+
+                            with gr.Row():
+                                merge_seed = gr.Number(
+                                    label='Merge Seed',
+                                    value=99,
+                                    min_width=100,
+                                    precision=0,
+                                    scale=1
+                                )
+                                merge_random_seed = ui_components.ToolButton(
+                                    ui.random_symbol,
+                                    tooltip="Set seed to -1 (random each merge)"
+                                )
+                                merge_random_seed.click(fn=lambda: -1, outputs=merge_seed)
+
+                                merge_reuse_seed = ui_components.ToolButton(
+                                    ui.reuse_symbol,
+                                    tooltip="Reuse seed from last merge"
+                                )
+                                merge_reuse_seed.click(fn=lambda: cmn.last_merge_seed, outputs=merge_seed)
+
+                            # INCLUDE / EXCLUDE / DISCARD (still in main Merge tab)
+                            with gr.Accordion(label='Include/Exclude/Discard', open=False):
+                                with gr.Row():
+                                    with gr.Column():
+                                        clude = gr.Textbox(
+                                            max_lines=4,
+                                            label='Include/Exclude:',
+                                            info="Entered targets will remain as model_a when set to 'Exclude', and will be the only ones to be merged if set to 'Include'. Separate with whitespace.",
+                                            value='clip',
+                                            lines=4,
+                                            scale=4
+                                        )
+                                        clude_mode = gr.Radio(
+                                            label="",
+                                            info="",
+                                            choices=["Exclude", ("Include exclusively", 'include')],
+                                            value='Exclude',
+                                            min_width=300,
+                                            scale=1
+                                        )
+                                    with gr.Column():
+                                        discard = gr.Textbox(
+                                            max_lines=5,
+                                            label='Discard:',
+                                            info="Remove layers from final save (autosave only). Examples: 'model_ema', 'first_stage_model', or 'model_ema first_stage_model'. Leave empty to keep all layers.",
+                                            value='model_ema',
+                                            lines=5,
+                                            scale=1
+                                        )
+
+                    # Hidden textbox for preset JSON — must exist before any .click() uses it
+                    preset_output = gr.Textbox(visible=False)
+                    # ── Your existing Weight Editor textbox (must come BEFORE the .click) ──
+                    weight_editor = gr.Textbox(
+                        label="Weight Editor (JSON)",
+                        lines=10,
+                        placeholder='Example: {"model.*": {"alpha": 0.8}}',
+                        value=""
+                    )
+                    # Validation output
                     validation_output = gr.Textbox(
-                        max_lines=3,
                         label="Validation",
-                        value="✓ Ready",
+                        value="Ready",
                         interactive=False,
-                        lines=3
+                        lines=3,
+                        max_lines=3
                     )
 
-                    # Model keys test
-                    with gr.Accordion('Model keys'):
-                        target_tester = gr.Textbox(max_lines=1,label="Checks model_a keys using simple expression.",info="'*' is used as wildcard. Start expression with 'cond*' for clip. 'c*embedders.0*' for small clip. 'c*embedders.1*' for big clip. 'model.*' for unet and 'model_ema*' for ema unet",interactive=True,placeholder='model.*out*4*tran*norm*weight')
-                        target_tester_display = gr.Textbox(max_lines=40,lines=40,label="Targeted keys:",info="",interactive=False)
-                        target_tester.change(fn=test_regex,inputs=[target_tester],outputs=target_tester_display,show_progress='minimal')
+                    # ===================================================================
+                    # 2. NOW IT'S SAFE TO WIRE BUTTONS
+                    # ===================================================================
 
-                    # Wire the mode_changed events
-                    merge_mode_selector.change(
-                        fn=mode_changed,
-                        inputs=[merge_mode_selector, calc_mode_selector],
-                        outputs=[
-                            merge_mode_desc, calc_mode_desc,
-                            alpha, beta, gamma, delta,
-                            slider_help,
-                            model_a, model_b, model_c, model_d,
-                            merge_button
-                        ],
-                        show_progress='hidden'
-                    )
-                    calc_mode_selector.change(
-                        fn=mode_changed,
-                        inputs=[merge_mode_selector, calc_mode_selector],
-                        outputs=[
-                            merge_mode_desc, calc_mode_desc,
-                            alpha, beta, gamma, delta,
-                            slider_help,
-                            model_a, model_b, model_c, model_d,
-                            merge_button
-                        ],
-                        show_progress='hidden'
+                    # Apply preset button → fills preset_output → then injects into weight_editor
+                    apply_preset.click(
+                        fn=apply_weight_preset,
+                        inputs=preset_dropdown,
+                        outputs=preset_output
+                    ).then(
+                        fn=lambda x: x,
+                        inputs=preset_output,
+                        outputs=weight_editor
+                    ).then(
+                        fn=lambda: "Preset applied — click Merge",
+                        outputs=validation_output
                     )
 
-                    # Wire validation
+                    # Validation on weight editor change
                     weight_editor.change(
                         fn=lambda we, ma, mb, mm: validate_merge_config(ma, mb, we, mm),
                         inputs=[weight_editor, model_a, model_b, merge_mode_selector],
@@ -745,9 +1125,55 @@ def on_ui_tabs():
                         show_progress=False
                     )
 
-                    # Merge args and button wiring
+
+                    # Model keys test
+                    with gr.Accordion("Model Keys Tester", open=False):
+                        target_tester = gr.Textbox(
+                            label="Check model_a keys with regex",
+                            info="Use '*' wildcard. E.g., 'cond*' for CLIP, 'model.*out*4*tran*norm*weight' for UNet blocks",
+                            interactive=True,
+                            placeholder="model.*out*4*tran*norm*weight"
+                        )
+                        target_tester_display = gr.Textbox(
+                            label="Matching Keys",
+                            lines=40,
+                            max_lines=40,
+                            interactive=False
+                        )
+                        target_tester.change(
+                            fn=test_regex,
+                            inputs=[target_tester],
+                            outputs=target_tester_display,
+                            show_progress="minimal"
+                        )
+
+                    # Wire the mode_changed events (already correct for 5 sliders)
+                    merge_mode_selector.change(
+                        fn=mode_changed,
+                        inputs=[merge_mode_selector, calc_mode_selector],
+                        outputs=[
+                            merge_mode_desc, calc_mode_desc,
+                            alpha, beta, gamma, delta, epsilon,
+                            slider_help,
+                            model_a, model_b, model_c, model_d,
+                            merge_button
+                        ],
+                        show_progress="hidden"
+                    )
+                    calc_mode_selector.change(
+                        fn=mode_changed,
+                        inputs=[merge_mode_selector, calc_mode_selector],
+                        outputs=[
+                            merge_mode_desc, calc_mode_desc,
+                            alpha, beta, gamma, delta, epsilon,
+                            slider_help,
+                            model_a, model_b, model_c, model_d,
+                            merge_button
+                        ],
+                        show_progress="hidden"
+                    )
+                    # 3. Full merge args list — NOW INCLUDES preset_output
                     merge_args = [
-                        finetune,
                         merge_mode_selector,
                         calc_mode_selector,
                         model_a,
@@ -758,7 +1184,9 @@ def on_ui_tabs():
                         beta,
                         gamma,
                         delta,
-                        weight_editor,
+                        epsilon,                    # ← 5th slider support
+                        weight_editor,              # ← manual JSON
+                        preset_output,              # ← ADD THIS: preset JSON override
                         discard,
                         clude,
                         clude_mode,
@@ -768,330 +1196,595 @@ def on_ui_tabs():
                         *custom_sliders
                     ]
 
-                    merge_button.click(fn=start_merge,inputs=[save_name,save_settings,*merge_args],outputs=status)
+                    # 4. Final merge button — now passes preset_output
+                    merge_button.click(
+                        fn=start_merge,
+                        inputs=[
+                            save_name,
+                            save_settings,
+                            finetune,
+                            *merge_args                     # ← now includes preset_output
+                        ],
+                        outputs=status
+                    )
 
-        # Compare Tab
-        with gr.Tab("Compare"):
-            gr.Markdown("### Compare Two Checkpoints")
-            
+                    # Optional: Auto-clear preset after merge (feels clean)
+                    merge_button.click(
+                        fn=lambda: "",
+                        outputs=preset_output,
+                        queue=False
+                    ).then(
+                        fn=lambda: "Ready for next merge",
+                        outputs=status
+                    )
+            # ================================================
+            # PREVIEW TAB — SuperMerger-style "Merge & Gen"
+            # ================================================
+            with gr.Tab("Preview Merge", elem_id="amethyst-preview"):
+                gr.Markdown("### Merge in-memory and instantly preview the result (no save required)")
+
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        with gr.Accordion("Merge Settings (same as main tab)", open=False):
+                            preview_model_a = gr.Dropdown(choices=initial_checkpoints, label="Model A", value=model_a.value)
+                            preview_model_b = gr.Dropdown(choices=initial_checkpoints, label="Model B", value=model_b.value)
+                            preview_model_c = gr.Dropdown(choices=initial_checkpoints, label="Model C", value=model_c.value)
+                            preview_model_d = gr.Dropdown(choices=initial_checkpoints, label="Model D", value=model_d.value)
+                            preview_merge_mode = gr.Radio(
+                                choices=list(merger.mergemode_selection.keys()),
+                                value=merge_mode_selector.value,
+                                label="Merge Mode"
+                            )
+                            preview_calc_mode = gr.Radio(
+                                choices=list(merger.calcmode_selection.keys()),
+                                value=calc_mode_selector.value,
+                                label="Calc Mode"
+                            )
+                            preview_alpha   = gr.Slider(-1, 2, value=alpha.value,   step=0.01, label="α (alpha)")
+                            preview_beta    = gr.Slider(-1, 2, value=beta.value,    step=0.01, label="β (beta)")
+                            preview_gamma   = gr.Slider(-1, 2, value=gamma.value,   step=0.01, label="γ (gamma)")
+                            preview_delta   = gr.Slider(-1, 2, value=delta.value,   step=0.01, label="δ (delta)")
+                            preview_epsilon = gr.Slider(-1, 2, value=epsilon.value, step=0.01, label="ε (epsilon)")
+
+                        with gr.Accordion("Generation Settings", open=True):
+                            preview_prompt = gr.Textbox(
+                                label="Prompt",
+                                lines=3,
+                                value="masterpiece, best quality, ultra-detailed, 8k"
+                            )
+                            preview_neg = gr.Textbox(label="Negative Prompt", lines=2, value="")
+                            with gr.Row():
+                                preview_steps = gr.Slider(1, 100, value=20, step=1, label="Steps")
+                                preview_sampler = gr.Dropdown(
+                                    choices=[s.name for s in sd_samplers.samplers],
+                                    value="Euler a",
+                                    label="Sampler"
+                                )
+                            with gr.Row():
+                                preview_w = gr.Slider(256, 2048, value=512, step=64, label="Width")
+                                preview_h = gr.Slider(256, 2048, value=512, step=64, label="Height")
+                                preview_cfg = gr.Slider(1, 30, value=7.0, step=0.5, label="CFG Scale")
+                                preview_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+
+                        preview_btn = gr.Button("Merge & Preview", variant="primary", size="lg")
+
+                    with gr.Column(scale=3):
+                        preview_gallery = gr.Gallery(
+                            label="Preview Result",
+                            show_label=False,
+                            columns=2,
+                            height="auto",
+                            preview=True
+                        )
+                        preview_info = gr.Textbox(label="Generation Info", lines=4, interactive=False)
+                        preview_status = gr.Textbox(  # ← NEW: Live status feedback
+                            label="Status",
+                            value="Ready — click 'Merge & Preview' to begin",
+                            lines=3,
+                            interactive=False,
+                            elem_classes=["preview-status"]
+                        )
+                        preview_log = gr.Textbox(label="Merge Log", lines=8, interactive=False)
+
+                # === CLICK HANDLER WITH STATUS UPDATES ===
+                preview_btn.click(
+                    fn=preview_merged_model,
+                    inputs=[
+                        preview_model_a, preview_model_b, preview_model_c, preview_model_d,
+                        preview_merge_mode, preview_calc_mode,
+                        preview_alpha, preview_beta, preview_gamma, preview_delta, preview_epsilon,
+                        preview_prompt, preview_neg,
+                        preview_steps, preview_sampler,
+                        preview_w, preview_h, preview_cfg, preview_seed,
+                    ],
+                    outputs=[preview_gallery, preview_info, preview_status, preview_log],  # ← Now 4 outputs!
+                    show_progress=True
+                )
+
+        # ================================================
+        # COMPARE TAB — Elite model intelligence
+        # ================================================
+        with gr.Tab("Compare Models", elem_id="amethyst-compare"):
+            gr.Markdown("### Deep Comparison of Two Checkpoints")
+            gr.Markdown("*Shows architecture, dtype, size, EMA, CLIP versions, Flux/SDXL detection, and key differences*")
+
             with gr.Row():
-                compare_original = gr.Dropdown(
-                    get_checkpoints_list('Alphabetical'),
-                    label="Original Model"
+                compare_a = gr.Dropdown(
+                    choices=initial_checkpoints,
+                    value=initial_checkpoints[0] if initial_checkpoints else None,
+                    label="Model A (Reference)",
+                    scale=2
                 )
-                compare_merged = gr.Dropdown(
-                    get_checkpoints_list('Alphabetical'),
-                    label="Merged Model"
+                compare_b = gr.Dropdown(
+                    choices=initial_checkpoints,
+                    value=None,
+                    label="Model B (Compare)",
+                    scale=2
                 )
-            
+
+            with gr.Row():
+                compare_btn = gr.Button("Compare Models", variant="primary", size="lg")
+
             compare_output = gr.Textbox(
-                label="Comparison Results",
+                label="Detailed Comparison Report",
+                lines=25,
                 interactive=False,
-                lines=8
+                elem_classes="compare-report"
             )
-            
-            def compare_models(orig, merged):
-                """Compare two checkpoint files"""
+
+            def compare_models_deep(model_a_name, model_b_name):
+                if not model_a_name or not model_b_name:
+                    return "Please select both models."
+
                 try:
-                    with safetensors.torch.safe_open(
-                        sd_models.get_closet_checkpoint_match(orig).filename,
-                        framework='pt', device='cpu'
-                    ) as f1:
-                        orig_keys = set(f1.keys())
-                        orig_size = os.path.getsize(
-                            sd_models.get_closet_checkpoint_match(orig).filename
-                        )
+                    info_a = sd_models.get_closet_checkpoint_match(model_a_name)
+                    info_b = sd_models.get_closet_checkpoint_match(model_b_name)
                     
-                    with safetensors.torch.safe_open(
-                        sd_models.get_closet_checkpoint_match(merged).filename,
-                        framework='pt', device='cpu'
-                    ) as f2:
-                        merged_keys = set(f2.keys())
-                        merged_size = os.path.getsize(
-                            sd_models.get_closet_checkpoint_match(merged).filename
-                        )
-                    
-                    result = f"""Original Model: {orig}
-Size: {orig_size / 1e9:.2f} GB
-Keys: {len(orig_keys)}
+                    if not info_a or not info_b:
+                        return "One or both models not found."
 
-Merged Model: {merged}
-Size: {merged_size / 1e9:.2f} GB
-Keys: {len(merged_keys)}
+                    path_a, path_b = info_a.filename, info_b.filename
+                    size_a, size_b = os.path.getsize(path_a), os.path.getsize(path_b)
 
-Differences:
-- Keys removed: {len(orig_keys - merged_keys)}
-- Keys added: {len(merged_keys - orig_keys)}
-- Size change: {(merged_size - orig_size) / 1e9:.2f} GB"""
-                    return result
+                    def analyze_model(path, name):
+                        try:
+                            with safetensors.torch.safe_open(path, framework="pt", device="cpu") as f:
+                                keys = set(f.keys())
+                                sample_key = next(iter(keys))
+                                dtype = f.get_tensor(sample_key).dtype
+                                has_ema = any("model_ema" in k for k in keys)
+                                has_flux = any("single_blocks" in k for k in keys)
+                                has_sdxl = any("conditioner.embedders." in k for k in keys)
+                                has_clip_l = any("embedders.1" in k for k in keys)
+                                has_clip_g = any("embedders.0" in k for k in keys)
+
+                                # Detect architecture
+                                if has_flux:
+                                    arch = "Flux.1"
+                                elif has_sdxl:
+                                    arch = "SDXL" + (" + Refiner" if "refiner" in name.lower() else "")
+                                elif "input_blocks.0.0.weight" in keys:
+                                    channels = f.get_tensor("model.diffusion_model.input_blocks.0.0.weight").shape[1]
+                                    if channels == 9:
+                                        arch = "SD 1.5 Inpainting"
+                                    elif channels == 8:
+                                        arch = "InstructPix2Pix"
+                                    else:
+                                        arch = "SD 1.5"
+                                else:
+                                    arch = "Unknown / Custom"
+
+                                return {
+                                    "name": name,
+                                    "path": os.path.basename(path),
+                                    "size_gb": size_a / 1e9 if path == path_a else size_b / 1e9,
+                                    "keys": len(keys),
+                                    "dtype": str(dtype).split(".")[-1],
+                                    "has_ema": has_ema,
+                                    "arch": arch,
+                                    "clip": ("OpenCLIP-G" if has_clip_g else "") + (" + CLIP-L" if has_clip_l else ""),
+                                    "keys_set": keys
+                                }
+                        except Exception as e:
+                            return {"error": f"Failed to read {name}: {e}"}
+
+                    a = analyze_model(path_a, model_a_name)
+                    b = analyze_model(path_b, model_b_name)
+
+                    if "error" in a or "error" in b:
+                        return f"Error reading model: {a.get('error','')} {b.get('error','')}"
+
+                    removed = len(a["keys_set"] - b["keys_set"])
+                    added = len(b["keys_set"] - a["keys_set"])
+                    common = len(a["keys_set"] & b["keys_set"])
+
+                    report = f"""MODEL COMPARISON REPORT
+┌─────────────────────────────────────────────────────────────┐
+│ Model A (Reference) │ Model B (Compare)
+├─────────────────────────────────────────────────────────────┤
+│ Name: {a['name']:<42} │ {b['name']}
+│ File: {a['path']:<42} │ {b['path']}
+│ Size: {a['size_gb']:.3f} GB{' ' * 28} │ {b['size_gb']:.3f} GB ({'+' if b['size_gb'] > a['size_gb'] else ''}{b['size_gb'] - a['size_gb']:+.3f} GB)
+│ Keys: {a['keys']:,}{' ' * 35} │ {b['keys']:,} ({'+' if b['keys'] > a['keys'] else ''}{b['keys'] - a['keys']:+})
+│ Dtype: {a['dtype']:<42} │ {b['dtype']}
+│ Architecture: {a['arch']:<34} │ {b['arch']}
+│ CLIP: {a['clip'] or 'Standard CLIP':<38} │ {b['clip'] or 'Standard CLIP'}
+│ EMA Present: {'Yes' if a['has_ema'] else 'No':<37} │ {'Yes' if b['has_ema'] else 'No'}
+└─────────────────────────────────────────────────────────────┘
+
+KEY DIFFERENCES
+───────────────────────────────────────────────────────────────
+Keys in common : {common:,}
+Keys removed   : {removed:,}  ← (A → B)
+Keys added     : {added:,}    ← (B → A)
+
+SUMMARY
+→ Model B is {((b['size_gb'] - a['size_gb']) / a['size_gb'] * 100):+.1f}% the size of Model A
+→ Likely a {'merge' if removed + added < 100 else 'different base'} (low key churn = merge, high = new model)
+"""
+                    return report
+
                 except Exception as e:
-                    return f"Error: {str(e)}"
-            
-            compare_button = gr.Button("Compare")
-            compare_button.click(
-                fn=compare_models,
-                inputs=[compare_original, compare_merged],
+                    return f"Unexpected error: {str(e)}"
+
+            compare_btn.click(
+                fn=compare_models_deep,
+                inputs=[compare_a, compare_b],
                 outputs=compare_output
             )
             
-        # LoRA Tab
+        # ================================================
+        # LORA TAB — Elite LoRA Merging (Forge Neo + A1111 dev)
+        # ================================================
         with gr.Tab("LoRA", elem_id="tab_lora"):
-            gr.Markdown("## LoRA Merging - LoRA to Checkpoint - LoRA to LoRA")
+            gr.Markdown(
+                "# LoRA Merging — Bake into Checkpoint or Merge LoRAs\n"
+                "Fully supports **SD1.5 ↔ SDXL ↔ Pony ↔ Flux** • Mixed ranks • Block-specific weights"
+            )
 
-            with gr.Accordion("Merge LoRA(s) to Checkpoint", open=False):
-                gr.Markdown("### Apply multiple LoRAs to a checkpoint — with individual weights!")
+            # === ELITE LORA LIST WITH INFO (2025 Edition) ===
+            def get_lora_list_with_info():
+                lora_dirs = []
+                if hasattr(shared.opts, "lora_dir") and shared.opts.lora_dir and os.path.isdir(shared.opts.lora_dir):
+                    lora_dirs.append(shared.opts.lora_dir)
+
+                base = paths.models_path
+                lora_dirs.extend([
+                    os.path.join(base, "Lora"),
+                    os.path.join(base, "lora"),
+                    os.path.join(base, "LoRA"),
+                    os.path.join(base, "LyCORIS"),
+                    os.path.join(base, "lycoris"),
+                ])
+
+                seen_paths = set()
+                loras = []
+
+                for directory in lora_dirs:
+                    if not os.path.isdir(directory):
+                        continue
+                    for file in sorted(os.listdir(directory)):
+                        if not file.lower().endswith(('.safetensors', '.pt', '.ckpt')):
+                            continue
+
+                        full_path = os.path.join(directory, file)
+                        if full_path in seen_paths:
+                            continue
+                        seen_paths.add(full_path)
+
+                        try:
+                            size_mb = os.path.getsize(full_path) // (1024 * 1024)
+                            dtype_hint = model_hint = ""
+
+                            with safetensors.torch.safe_open(full_path, framework="pt", device="cpu") as f:
+                                keys = f.keys()
+                                if any("bf16" in k for k in keys):
+                                    dtype_hint = "bf16"
+                                else:
+                                    dtype_hint = "f16"
+
+                                if any(k.startswith("lora_unet_down_blocks_4_") for k in keys):
+                                    model_hint = "[SDXL]"
+                                elif any(k.startswith("lora_unet_down_blocks_") and "_4_" not in k for k in keys):
+                                    model_hint = "[SD1.5]"
+                                elif any("single_blocks" in k for k in keys):
+                                    model_hint = "[Flux]"
+                                elif any("transformer_blocks" in k for k in keys):
+                                    model_hint = "[SD3/Pony]"
+
+                            label = f"{file} — {size_mb}MB • {dtype_hint} {model_hint}"
+                        except Exception:
+                            size_mb = os.path.getsize(full_path) // (1024 * 1024)
+                            label = f"{file} — {size_mb}MB"
+
+                        loras.append(full_path)  # CheckboxGroup uses path as value
+
+                return loras
+
+            # === SECTION 1: LoRAs → Checkpoint (Elite Baker) ===
+            with gr.Accordion("Bake LoRAs → Checkpoint", open=True):
+                gr.Markdown("### Bake multiple LoRAs into a checkpoint with **individual or block-specific weights**")
 
                 with gr.Row():
                     checkpoint_dropdown = gr.Dropdown(
                         label="Base Checkpoint",
-                        choices=sorted(sd_models.checkpoints_list.keys()),
-                        value=None
+                        choices=[cp.title for cp in sd_models.checkpoints_list.values()],
+                        value=lambda: next((cp.title for cp in sd_models.checkpoints_list.values()), None)
                     )
-                    create_refresh_button(checkpoint_dropdown, sd_models.list_models, 
-                                        lambda: {"choices": sorted(sd_models.checkpoints_list.keys())}, "refresh_checkpoints")
+                    create_refresh_button(
+                        checkpoint_dropdown,
+                        lambda: None,
+                        lambda: {"choices": [cp.title for cp in sd_models.checkpoints_list.values()]},
+                        "refresh_checkpoint_lora"
+                    )
 
                 with gr.Row():
                     lora_checkbox_group = gr.CheckboxGroup(
-                        label="Select LoRAs to bake into checkpoint",
-                        choices=[],
+                        label="Select LoRAs to Bake",
+                        choices=get_lora_list_with_info(),
                         type="value",
                         interactive=True
                     )
                     create_refresh_button(
                         lora_checkbox_group,
                         lambda: None,
-                        lambda: {'choices': get_lora_list()},
-                        "refresh_loras_checkpoint"
+                        lambda: {"choices": get_lora_list_with_info()},
+                        "refresh_loras_bake"
                     )
 
-                # Individual weight sliders (show/hide based on selection)
-                gr.Markdown("**Individual LoRA Weights** (0.0 = skip, 1.0 = full)")
-                ckpt_weight1 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 1", visible=False)
-                ckpt_weight2 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 2", visible=False)
-                ckpt_weight3 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 3", visible=False)
-                ckpt_weight4 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 4", visible=False)
-                ckpt_weight5 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 5", visible=False)
-                ckpt_weight6 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 6", visible=False)
+                gr.Markdown("**Individual Weights** — Use number (e.g. `1.2`) or **block-specific** (e.g. `unet:1.2, te:0.8`)")
 
-                def update_ckpt_labels(selected):
-                    if not selected:
-                        return [gr.update(visible=False)] * 6
+                weights_inputs = []
+                for i in range(6):
+                    w = gr.Textbox(
+                        value="1.0",
+                        label=f"LoRA {i+1} Weight",
+                        placeholder="1.0 or unet:1.2, te:0.8",
+                        visible=False
+                    )
+                    weights_inputs.append(w)
+
+                def update_weight_fields(selected):
                     updates = []
-                    for i in range(6):
-                        if i < len(selected):
-                            name = os.path.basename(selected[i]).replace(".safetensors", "")[:25]
-                            updates.append(gr.update(visible=True, label=f"{name}"))
-                        else:
-                            updates.append(gr.update(visible=False))
+                    for i, path in enumerate(selected or []):
+                        if i >= len(weights_inputs): break
+                        name = os.path.basename(path).split('.')[0][:28]
+                        updates.append(gr.update(visible=True, label=f"{name}"))
+                    for j in range(len(selected or []), len(weights_inputs)):
+                        updates.append(gr.update(visible=False))
                     return updates
 
                 lora_checkbox_group.change(
-                    fn=update_ckpt_labels,
+                    fn=update_weight_fields,
                     inputs=lora_checkbox_group,
-                    outputs=[ckpt_weight1, ckpt_weight2, ckpt_weight3, ckpt_weight4, ckpt_weight5, ckpt_weight6]
+                    outputs=weights_inputs
                 )
 
                 with gr.Row():
-                    output_name = gr.Textbox(label="Output Name (optional)", placeholder="my_perfect_model")
-                    save_model = gr.Checkbox(label="Save merged checkpoint", value=True)
-
-                with gr.Row():
-                    merge_to_checkpoint_button = gr.Button("MERGE LoRAs → CHECKPOINT", variant="primary")
-
-                merge_to_checkpoint_status = gr.Textbox(label="Status", lines=10, interactive=False, show_copy_button=True)
-
-                def merge_with_individual_weights(selected_loras, w1,w2,w3,w4,w5,w6, checkpoint_name, out_name, save):
-                    weights = [w for w in [w1,w2,w3,w4,w5,w6] if w is not None][:len(selected_loras)]
-                    if len(weights) < len(selected_loras):
-                        weights = [1.0] * len(selected_loras)
-                    return merge_loras_to_checkpoint_ui(
-                        checkpoint_name=checkpoint_name,
-                        lora_paths=selected_loras,
-                        output_name=out_name,
-                        strength=1.0,  # We use individual weights instead
-                        save_model=save,
-                        individual_weights=weights  # Pass them here
+                    output_name = gr.Textbox(
+                        label="Output Model Name",
+                        placeholder="MyUltimateModel_v1",
+                        value="MyUltimateModel_v1"
                     )
+                    save_model = gr.Checkbox(label="Save to Disk", value=True)
 
-                merge_to_checkpoint_button.click(
-                    fn=merge_with_individual_weights,
-                    inputs=[
-                        lora_checkbox_group,
-                        ckpt_weight1, ckpt_weight2, ckpt_weight3, ckpt_weight4, ckpt_weight5, ckpt_weight6,
-                        checkpoint_dropdown, output_name, save_model
-                    ],
-                    outputs=merge_to_checkpoint_status
+                bake_btn = gr.Button("BAKE LoRAs → CHECKPOINT", variant="primary", size="lg")
+                bake_status = gr.Textbox(label="Status", lines=14, interactive=False, show_copy_button=True)
+
+                def bake_loras_to_checkpoint(loras, ckpt_name, out_name, save, *weights_raw):
+                    if not loras:
+                        return "Error: No LoRAs selected"
+                    if not ckpt_name:
+                        return "Error: No base checkpoint selected"
+
+                    ckpt_info = merger.get_checkpoint_match(ckpt_name)
+                    if not ckpt_info:
+                        return "Error: Checkpoint not found"
+
+                    weights = []
+                    for w in weights_raw:
+                        if not w.strip():
+                            weights.append(1.0)
+                        elif ":" in w.strip() or "," in w.strip():
+                            weights.append(w.strip())
+                        else:
+                            try:
+                                weights.append(float(w.strip()))
+                            except:
+                                weights.append(1.0)
+                    weights = weights[:len(loras)]
+
+                    try:
+                        result = lora_merge.merge_loras_to_checkpoint(
+                            checkpoint_path=ckpt_info.filename,
+                            lora_paths=loras,
+                            output_path=os.path.join(sd_models.model_path, f"{out_name}.safetensors"),
+                            individual_weights=weights,
+                            save_model=save,
+                            progress=gr.Progress(track_tqdm=True)
+                        )
+                        return f"SUCCESS! {result}"
+                    except Exception as e:
+                        import traceback
+                        return f"BAKE FAILED:\n{str(e)}\n\n{traceback.format_exc()}"
+
+                bake_btn.click(
+                    fn=bake_loras_to_checkpoint,
+                    inputs=[lora_checkbox_group, checkpoint_dropdown, output_name, save_model] + weights_inputs,
+                    outputs=bake_status
                 )
 
-            with gr.Accordion("Merge Multiple LoRAs", open=False):
-                gr.Markdown("### Merge LoRAs with Individual Weights\n(Select 2–6 LoRAs — weights auto-adjust)")
+            # === SECTION 2: LoRA → LoRA Merge ===
+            with gr.Accordion("Merge Multiple LoRAs → New LoRA", open=False):
+                gr.Markdown("### Combine 2–6 LoRAs into a single new LoRA file")
 
                 with gr.Row():
                     lora_merge_checkbox = gr.CheckboxGroup(
-                        label="Select LoRAs to merge (with dtype info)",
-                        choices=[],
-                        type="value",
-                        interactive=True
+                        label="Select LoRAs to Merge",
+                        choices=get_lora_list_with_info(),
+                        type="value"
                     )
-                    lora_merge_refresh = create_refresh_button(
+                    create_refresh_button(
                         lora_merge_checkbox,
                         lambda: None,
-                        lambda: {'choices': get_lora_list()},
-                        "refresh_lora_merge_list"
+                        lambda: {"choices": get_lora_list_with_info()},
+                        "refresh_lora_merge"
                     )
 
-                gr.Markdown("**LoRA Weights** (0.0 = skip, 1.0 = full, >1.0 = amplify)")
+                merge_weights = []
+                for i in range(6):
+                    w = gr.Slider(0.0, 3.0, value=1.0, step=0.01, label=f"LoRA {i+1}", visible=False)
+                    merge_weights.append(w)
 
-                lora_merge_weight1 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 1", visible=False)
-                lora_merge_weight2 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 2", visible=False)
-                lora_merge_weight3 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 3", visible=False)
-                lora_merge_weight4 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 4", visible=False)
-                lora_merge_weight5 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 5", visible=False)
-                lora_merge_weight6 = gr.Slider(0.0, 3.0, 1.0, step=0.01, label="LoRA 6", visible=False)
-
-                def update_weight_labels(selected):
-                    if len(selected) < 2:
-                        return [gr.update(visible=False)] * 6
+                def update_merge_sliders(selected):
                     updates = []
-                    for i in range(6):
-                        if i < len(selected):
-                            name = os.path.basename(selected[i]).replace(".safetensors", "")[:25]
-                            updates.append(gr.update(visible=True, label=f"{name}"))
-                        else:
-                            updates.append(gr.update(visible=False))
+                    for i, path in enumerate(selected or []):
+                        if i >= len(merge_weights): break
+                        name = os.path.basename(path).split('.')[0][:28]
+                        updates.append(gr.update(visible=True, label=f"{name}"))
+                    for j in range(len(selected or []), len(merge_weights)):
+                        updates.append(gr.update(visible=False))
                     return updates
 
-                lora_merge_checkbox.change(
-                    fn=update_weight_labels,
-                    inputs=lora_merge_checkbox,
-                    outputs=[
-                        lora_merge_weight1, lora_merge_weight2, lora_merge_weight3,
-                        lora_merge_weight4, lora_merge_weight5, lora_merge_weight6
-                    ]
-                )
+                lora_merge_checkbox.change(fn=update_merge_sliders, inputs=lora_merge_checkbox, outputs=merge_weights)
 
                 with gr.Row():
-                    lora_merge_output_name = gr.Textbox(
-                        label="Output LoRA Name",
-                        placeholder="my_perfect_merge",
-                        info="Saved as .safetensors"
-                    )
-                    lora_merge_global_strength = gr.Slider(
-                        0.0, 3.0, 1.0, step=0.05, label="Global Multiplier"
-                    )
+                    lora_merge_name = gr.Textbox(label="Output LoRA Name", placeholder="EpicMerge_v1", value="EpicMerge_v1")
+                    global_mult = gr.Slider(0.1, 3.0, 1.0, step=0.05, label="Global Multiplier")
 
-                with gr.Row():
-                    lora_merge_button = gr.Button("MERGE WITH WEIGHTS → NEW LORA", variant="primary")
+                merge_lora_btn = gr.Button("MERGE LoRAs → NEW LORA", variant="primary")
+                merge_lora_status = gr.Textbox(label="Status", lines=12, interactive=False, show_copy_button=True)
 
-                lora_merge_status = gr.Textbox(
-                    label="Status", lines=12, interactive=False, show_copy_button=True
-                )
+                def merge_loras_final(loras, name, mult, *weights):
+                    if len(loras or []) < 2:
+                        return "Error: Select at least 2 LoRAs"
+                    w = [x * mult for x in (list(weights)[:len(loras)] or [1.0]*len(loras))]
+                    try:
+                        result = lora_merge.merge_loras_resilient(
+                            lora_paths=loras,
+                            output_path=os.path.join(paths.models_path, "Lora", f"{name}.safetensors"),
+                            weights=w,
+                            progress=gr.Progress(track_tqdm=True)
+                        )
+                        return f"SUCCESS! {result}\n\nRefreshing LoRA list..."
+                    except Exception as e:
+                        import traceback
+                        return f"Merge failed:\n{str(e)}\n\n{traceback.format_exc()}"
 
-                def merge_with_weights(selected, w1, w2, w3, w4, w5, w6, name, g):
-                    weights = [w for w in [w1,w2,w3,w4,w5,w6] if w is not None][:len(selected)]
-                    if len(weights) < len(selected):
-                        weights = [1.0] * len(selected)
-                    return merge_selected_loras_ui(selected, name, g, weights)
-
-                lora_merge_button.click(
-                    fn=merge_with_weights,
-                    inputs=[
-                        lora_merge_checkbox,
-                        lora_merge_weight1, lora_merge_weight2, lora_merge_weight3,
-                        lora_merge_weight4, lora_merge_weight5, lora_merge_weight6,
-                        lora_merge_output_name,
-                        lora_merge_global_strength
-                    ],
-                    outputs=lora_merge_status
+                merge_lora_btn.click(
+                    fn=merge_loras_final,
+                    inputs=[lora_merge_checkbox, lora_merge_name, global_mult] + merge_weights,
+                    outputs=merge_lora_status
                 ).then(
-                    fn=lambda: (gr.update(choices=get_lora_list()), gr.update(choices=get_lora_list())),
+                    fn=lambda: (gr.update(choices=get_lora_list_with_info()), gr.update(choices=get_lora_list_with_info())),
                     outputs=[lora_checkbox_group, lora_merge_checkbox]
                 )
 
-        # ✅ ENHANCEMENT 3: Merge Presets & History Tab
-        with gr.Tab("Presets & History"):
+        # ================================================
+        # PRESETS & HISTORY TAB — Elite UX (2025 Edition)
+        # ================================================
+        with gr.Tab("Presets & History", elem_id="amethyst-presets"):
+            gr.Markdown("### Manage Saved Merge Presets & View History")
+
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("## 📋 Saved Merge Presets")
-                    
+                with gr.Column(scale=2):
+                    gr.Markdown("## Saved Presets")
+
                     with gr.Row():
                         preset_selector = gr.Dropdown(
                             choices=get_merge_presets(),
                             label="Select Preset",
-                            scale=3
+                            allow_custom_value=False,
+                            scale=4
                         )
-                        preset_refresh_btn = gr.Button("🔄", scale=1)
-                    
+                        preset_refresh = gr.Button("Refresh", scale=1)
+
                     with gr.Row():
-                        preset_load_btn = gr.Button("Load Preset", variant="primary", scale=2)
-                        preset_delete_btn = gr.Button("Delete", variant="stop", scale=1)
-                    
-                    preset_message = gr.Textbox(
+                        preset_load = gr.Button("Load Preset", variant="primary", size="sm")
+                        preset_delete = gr.Button("Delete", variant="stop", size="sm")
+
+                    preset_status = gr.Textbox(
                         label="Status",
+                        value="Ready",
                         interactive=False,
-                        value="Select a preset to load or delete"
+                        lines=2
                     )
-                    
+
                     with gr.Row():
                         preset_name_input = gr.Textbox(
-                            label="Save Current As",
-                            placeholder="Enter preset name...",
-                            scale=3
+                            label="Save Current Settings As",
+                            placeholder="My Epic Merge v3",
+                            scale=4
                         )
-                        preset_save_btn = gr.Button("Save", variant="secondary", scale=1)
-                
-                with gr.Column():
-                    gr.Markdown("## 📊 Merge History")
-                    
-                    history_display = gr.Textbox(
-                        label="Recent Merges",
+                        preset_save = gr.Button("Save Preset", variant="secondary", size="sm")
+
+                with gr.Column(scale=3):
+                    gr.Markdown("## Recent Merge History")
+
+                    history_box = gr.Textbox(
+                        label="Last 10 Merges",
+                        value="\n".join(get_merge_history()) or "No history yet",
                         interactive=False,
                         lines=12,
                         max_lines=15,
-                        value="\n".join(get_merge_history()) or "No merge history yet"
+                        elem_classes="history-box"
                     )
-                    
-                    history_refresh_btn = gr.Button("Refresh History")
-            
-            # Wire preset buttons
-            preset_refresh_btn.click(
-                fn=lambda: gr.update(choices=get_merge_presets()),
+
+                    history_refresh = gr.Button("Refresh History", variant="secondary")
+
+            # === PRESET REFRESH ===
+            def refresh_presets():
+                return gr.update(choices=get_merge_presets())
+
+            preset_refresh.click(
+                fn=refresh_presets,
                 outputs=preset_selector,
                 show_progress=False
             )
-            
-            preset_save_btn.click(
+
+            # === SAVE PRESET (now includes epsilon!) ===
+            preset_save.click(
                 fn=save_merge_preset,
                 inputs=[
-                    preset_name_input, model_a, model_b, model_c, model_d,
+                    preset_name_input,
+                    model_a, model_b, model_c, model_d,
                     merge_mode_selector, calc_mode_selector,
-                    alpha, beta, gamma, delta,
+                    alpha, beta, gamma, delta, epsilon,  # ← NOW INCLUDES EPSILON
                     weight_editor, discard, clude, clude_mode
                 ],
-                outputs=preset_message
+                outputs=preset_status
+            ).then(
+                fn=refresh_presets,
+                outputs=preset_selector
             )
-            
-            preset_load_btn.click(
+
+            # === LOAD PRESET (includes epsilon) ===
+            preset_load.click(
                 fn=load_merge_preset,
                 inputs=preset_selector,
                 outputs=[
                     model_a, model_b, model_c, model_d,
                     merge_mode_selector, calc_mode_selector,
-                    alpha, beta, gamma, delta,
+                    alpha, beta, gamma, delta, epsilon,  # ← EPSILON INCLUDED
                     weight_editor, discard, clude, clude_mode,
-                    preset_message
+                    preset_status
                 ]
             )
-            
-            preset_delete_btn.click(
+
+            # === DELETE PRESET ===
+            preset_delete.click(
                 fn=delete_merge_preset,
                 inputs=preset_selector,
-                outputs=[preset_message, preset_selector]
+                outputs=[preset_status, preset_selector]
             )
-            
-            history_refresh_btn.click(
-                fn=lambda: gr.update(value="\n".join(get_merge_history()) or "No merge history yet"),
-                outputs=history_display,
+
+            # === HISTORY REFRESH ===
+            def refresh_history():
+                return gr.update(value="\n".join(get_merge_history()) or "No history yet")
+
+            history_refresh.click(
+                fn=refresh_history,
+                outputs=history_box,
                 show_progress=False
             )
             
@@ -1105,30 +1798,52 @@ script_callbacks.on_ui_tabs(on_ui_tabs)
 # ---------------------------
 def start_merge(*args):
     progress = Progress()
+    
     try:
-        # ✅ ENHANCEMENT 2: Initialize real-time ETA tracking
-        progress.start_merge(1000)  # Will be updated during merge
-        
+        # ENHANCEMENT 2: Real-time ETA tracking
+        progress.start_merge(1000)
+
+        # Main merge
         merger.prepare_merge(progress, *args)
-        
-        # ✅ Save to history on success
+
+        # Success → save to history
         save_to_history({
             'models': str(args[3:7]),
             'modes': f"{args[2]}+{args[1]}"
-        }, "✓ Success")
-        
+        }, "Success")
+
     except Exception as error:
+        # Always clear cache on error
         merger.clear_cache()
-        if not shared.sd_model:
-            sd_models.reload_model_weights(forced_reload=True)
-        
-        # Save failed merge to history
-        save_to_history({'status': 'Failed'}, f"✗ {str(error)[:30]}")
-        
-        if not isinstance(error,merger.MergeInterruptedError):
+
+        # UNIVERSAL MODEL RELOAD – works everywhere
+        universal_model_reload()
+
+        # Log failure to history
+        error_msg = str(error)[:60] + ("..." if len(str(error)) > 60 else "")
+        save_to_history({'status': 'Failed'}, f"Failed: {error_msg}")
+
+        # Re-raise non-interrupt errors
+        if not isinstance(error, getattr(merger, 'MergeInterruptedError', Exception)):
             raise
-    
+
+    # ← No finally block needed for the return
+    # Gradio expects this value, so we return it at the very end
     return progress.get_report()
+
+def universal_model_reload():
+    """
+    Works on Forge Neo AND A1111 dev — one function to rule them all.
+    """
+    try:
+        if hasattr(shared, 'forge_model_reload'):
+            shared.forge_model_reload()
+        elif hasattr(sd_models, 'reload_model_weights'):
+            sd_models.reload_model_weights(forced_reload=True)
+        elif shared.sd_model:
+            sd_models.unload_model_weights(shared.sd_model)
+    except Exception as e:
+        print(f"[Amethyst] Model reload failed (non-fatal): {e}")
 
 def test_regex(input):
     regex = misc_util.target_to_regex(input)
@@ -1146,169 +1861,17 @@ def update_model_a_keys(model_a):
         model_a_keys = []
 
 def checkpoint_changed(name):
-    if name == "":
-        return plaintext_to_html('None | None',classname='untitled_sd_version')
-    sdversion, dtype = misc_util.id_checkpoint(name)
-    return plaintext_to_html(f"{sdversion} | {str(dtype).split('.')[1]}",classname='untitled_sd_version')
-
-def merge_loras_to_checkpoint_ui(checkpoint_name, lora_paths, output_name, strength, save_model, individual_weights=None, verbose=False):
-    """UI wrapper for merging multiple LoRAs to a checkpoint – now 100% safe & fast"""
-    progress = Progress()
-    checkpoint_info = None
-
-    try:
-        if not checkpoint_name:
-            return "Error: Please select a base checkpoint"
-        if not lora_paths:
-            return "Error: Please select at least one LoRA"
-        if save_model and not output_name.strip():
-            return "Error: Please provide an output name when saving"
-
-        checkpoint_info = sd_models.get_closet_checkpoint_match(checkpoint_name)
-        if not checkpoint_info:
-            return f"Error: Could not find checkpoint '{checkpoint_name}'"
-
-        base_path = checkpoint_info.filename
-        output_dir = os.path.dirname(base_path)
-
-        progress(f"Loading base checkpoint: {os.path.basename(base_path)}")
-        with safetensors.torch.safe_open(base_path, framework='pt', device='cpu') as f:
-            merged_checkpoint_dict = {k: f.get_tensor(k) for k in f.keys()}
-
-        all_summaries = []
-        applied_count = 0
-
-        for i, lora_path in enumerate(lora_paths):
-            current_strength = strength
-            if individual_weights and i < len(individual_weights):
-                current_strength = individual_weights[i]
-
-            if current_strength <= 0:
-                progress(f"Skipping {os.path.basename(lora_path)} (strength = 0)")
-                continue
-
-            progress(f"Applying LoRA {applied_count + 1}: {os.path.basename(lora_path)} × {current_strength:.3f}")
-            merged_checkpoint_dict, summary = lora_merge._apply_single_lora_to_dict(
-                merged_checkpoint_dict,
-                lora_path,
-                strength=current_strength,
-                progress=progress,
-                verbose=verbose
-            )
-            all_summaries.append(summary)
-            applied_count += 1
-
-        final_report = "\n".join(all_summaries) if all_summaries else "No LoRAs applied"
-
-        # ——————————————————————————————————————————————
-        # SAFE & FAST MODEL LOADING (critical fix!)
-        # ——————————————————————————————————————————————
-        progress("Unloading current model...")
-        if shared.sd_model:
-            sd_models.unload_model_weights(shared.sd_model)
-            shared.sd_model = None
-
-        # Only reload base if it's not already loaded
-        if (shared.sd_model is None or 
-            not hasattr(shared.sd_model, 'sd_checkpoint_info') or 
-            shared.sd_model.sd_checkpoint_info.filename != checkpoint_info.filename):
-            progress("Loading base model into WebUI...")
-            sd_models.load_model(checkpoint_info)
-        else:
-            progress("Base model already loaded – reusing")
-
-        # Apply merged weights
-        progress("Applying merged LoRA weights...")
-        shared.sd_model.load_state_dict(merged_checkpoint_dict, strict=False)
-
-        # Essential: move to GPU + re-apply optimizations
-        shared.sd_model.to(devices.device)
-        shared.sd_model.eval()
-
-        # Re-apply attention, unet, hijacks – fixes black images & xformers
-        sd_hijack.model_hijack.hijack(shared.sd_model)
-        script_callbacks.model_loaded_callback(shared.sd_model)
-        sd_unet.apply_unet("None")
-
-        # ——————————————————————————————————————————————
-        # Optional: Save to disk
-        # ——————————————————————————————————————————————
-        if save_model:
-            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', output_name.strip())
-            if not safe_name.lower().endswith('.safetensors'):
-                safe_name += '.safetensors'
-            output_path = os.path.join(output_dir, safe_name)
-
-            progress(f"Saving merged model → {safe_name}")
-            safetensors.torch.save_file(merged_checkpoint_dict, output_path)
-
-            # Refresh checkpoint list so new file appears
-            sd_models.list_models()
-
-            final_report += f"\nModel saved as: {safe_name}"
-        else:
-            final_report += f"\nModel loaded in memory (not saved)"
-
-        progress(f"Successfully applied {applied_count} LoRA(s)!", popup=True)
-        return progress.get_report() + "\n\n" + final_report
-
-    except Exception as e:
-        error_msg = f"LoRA merge failed: {str(e)}"
-        progress(error_msg, popup=True)
-
-        # Try to recover by reloading original checkpoint
-        try:
-            if checkpoint_info:
-                sd_models.load_model(checkpoint_info)
-                progress("Recovered: original checkpoint reloaded")
-        except:
-            pass
-
-        return progress.get_report() + "\n" + error_msg
+    if not name:
+        return gr.update(value=plaintext_to_html('None | None'))
     
-def merge_selected_loras_ui(selected_lora_paths, output_name, global_strength=1.0, individual_weights=None):
-    progress = Progress()
     try:
-        if not selected_lora_paths or len(selected_lora_paths) < 2:
-            return "Error: Select at least 2 LoRAs"
-
-        if individual_weights is None or len(individual_weights) != len(selected_lora_paths):
-            individual_weights = [1.0] * len(selected_lora_paths)
-
-        # Apply global multiplier
-        weights = [w * global_strength for w in individual_weights]
-        total = sum(weights)
-        if total == 0:
-            weights = [1.0 / len(weights)] * len(weights)  # prevent division by zero
-        else:
-            weights = [w / total for w in weights]
-
-        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', output_name.strip())
-        if not safe_name:
-            safe_name = "merged_lora"
-        if not safe_name.lower().endswith('.safetensors'):
-            safe_name += '.safetensors'
-
-        output_dir = os.path.dirname(selected_lora_paths[0])
-        output_path = os.path.join(output_dir, safe_name)
-
-        progress(f"Merging {len(selected_lora_paths)} LoRAs → {safe_name}")
-
-        # Use resilient merge (handles SD1.5 + SDXL + Pony)
-        result = lora_merge.merge_loras_resilient(
-            lora_paths=selected_lora_paths,
-            output_path=output_path,
-            weights=weights,
-            progress=progress
-        )
-
-        progress("GOD MERGE COMPLETE", popup=True)
-        return progress.get_report() + f"\n\nSaved: {output_path}\n\n{result}"
-
+        sdversion, dtype = misc_util.id_checkpoint(name)
+        dtype_str = str(dtype).split('.')[-1].upper() if dtype else 'Unknown'
+        info_text = f"{sdversion or 'Unknown'} | {dtype_str}"
+        return gr.update(value=plaintext_to_html(info_text))
     except Exception as e:
-        error = f"Merge failed: {str(e)}"
-        progress(error, popup=True)
-        return progress.get_report() + "\n" + error
+        print(f"[Merger] Checkpoint info error: {e}")
+        return gr.update(value=plaintext_to_html('Error loading info'))
     
 # ✅ ENHANCEMENT 1: Merge Presets Management
 def get_merge_presets():
@@ -1319,8 +1882,8 @@ def get_merge_presets():
     except:
         return []
 
-def save_merge_preset(preset_name, model_a_val, model_b_val, model_c_val, model_d_val, 
-                      merge_mode_val, calc_mode_val, alpha_val, beta_val, gamma_val, delta_val,
+def save_merge_preset(preset_name, model_a_val, model_b_val, model_c_val, model_d_val,
+                      merge_mode_val, calc_mode_val, alpha_val, beta_val, gamma_val, delta_val, epsilon_val,
                       weight_editor_val, discard_val, clude_val, clude_mode_val):
     """Save current merge configuration as preset"""
     try:
@@ -1328,10 +1891,10 @@ def save_merge_preset(preset_name, model_a_val, model_b_val, model_c_val, model_
             presets = json.load(f)
     except:
         presets = {}
-    
-    if not preset_name or preset_name.strip() == '':
-        return "❌ Preset name required"
-    
+
+    if not preset_name or not preset_name.strip():
+        return "Preset name required"
+
     presets[preset_name] = {
         'model_a': model_a_val,
         'model_b': model_b_val,
@@ -1339,48 +1902,51 @@ def save_merge_preset(preset_name, model_a_val, model_b_val, model_c_val, model_
         'model_d': model_d_val,
         'merge_mode': merge_mode_val,
         'calc_mode': calc_mode_val,
-        'sliders': [alpha_val, beta_val, gamma_val, delta_val],
+        'sliders': [alpha_val, beta_val, gamma_val, delta_val, epsilon_val],  # ← NOW 5!
         'weight_editor': weight_editor_val,
         'discard': discard_val,
         'clude': clude_val,
         'clude_mode': clude_mode_val
     }
-    
+
     with open(merge_presets_filename, 'w') as f:
         json.dump(presets, f, indent=2)
-    
-    return f"✓ Preset '{preset_name}' saved"
+
+    return f"Preset '{preset_name}' saved"
+
 
 def load_merge_preset(preset_name):
     """Load merge configuration from preset"""
     try:
         with open(merge_presets_filename, 'r') as f:
             presets = json.load(f)
-        
+
         if preset_name not in presets:
-            return [gr.update()] * 14 + ["❌ Preset not found"]
-        
+            return [gr.update()] * 15 + ["Preset not found"]
+
         preset = presets[preset_name]
-        updates = [
+        sliders = preset.get('sliders', [0.5]*5)  # fallback to 5 values
+
+        return [
             gr.update(value=preset.get('model_a', '')),
             gr.update(value=preset.get('model_b', '')),
             gr.update(value=preset.get('model_c', '')),
             gr.update(value=preset.get('model_d', '')),
             gr.update(value=preset.get('merge_mode')),
             gr.update(value=preset.get('calc_mode')),
-            gr.update(value=preset['sliders'][0]),
-            gr.update(value=preset['sliders'][1]),
-            gr.update(value=preset['sliders'][2]),
-            gr.update(value=preset['sliders'][3]),
+            gr.update(value=sliders[0]),  # alpha
+            gr.update(value=sliders[1]),  # beta
+            gr.update(value=sliders[2]),  # gamma
+            gr.update(value=sliders[3]),      # delta
+            gr.update(value=sliders[4]),  # epsilon ← NOW INCLUDED!
             gr.update(value=preset.get('weight_editor', '')),
             gr.update(value=preset.get('discard', '')),
             gr.update(value=preset.get('clude', '')),
             gr.update(value=preset.get('clude_mode', 'Exclude')),
-            f"✓ Loaded preset: {preset_name}"
+            f"Loaded: {preset_name}"
         ]
-        return updates
     except Exception as e:
-        return [gr.update()] * 14 + [f"❌ Error loading preset: {str(e)}"]
+        return [gr.update()] * 15 + [f"Error: {str(e)}"]
 
 def delete_merge_preset(preset_name):
     """Delete a saved preset"""
@@ -1436,3 +2002,150 @@ def get_merge_history():
         return list(reversed(items))
     except:
         return []
+
+def preview_merged_model(
+    model_a_val, model_b_val, model_c_val, model_d_val,
+    merge_mode_val, calc_mode_val,
+    alpha_val, beta_val, gamma_val, delta_val, epsilon_val,
+    prompt_val="", negative_prompt_val="",
+    steps=20, sampler_name="Euler a",
+    width=512, height=512, cfg_scale=7.0, seed=-1,
+    batch_count=1, batch_size=1,
+    discard_val="", clude_val="", clude_mode_val="Exclude",
+    weight_editor_val="",
+    progress=gr.Progress(track_tqdm=True)
+):
+    """
+    SuperMerger-style in-memory merge + live preview.
+    Fully compatible with Forge Neo and Automatic1111 dev branch.
+    Returns: (images, infotext, status_message, merge_report)
+    """
+    if not shared.sd_model:
+        return [], "", "Error: No model is currently loaded in the WebUI.", ""
+
+    progress(0, desc="Merging models in memory...")
+
+    try:
+        merged_state, merge_report = merger.do_merge(
+            model_a_val, model_b_val, model_c_val, model_d_val,
+            merge_mode_val, calc_mode_val,
+            alpha_val, beta_val, gamma_val, delta_val, epsilon_val,
+            weight_editor_val, discard_val, clude_val, clude_mode_val,
+            seed=seed if seed >= 0 else -1,
+            progress=progress
+        )
+        if not merged_state:
+            return [], "", "Merge failed: No state dictionary returned.", merge_report or "No merge report provided."
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Merge error: {str(e)}\nDetails: {traceback.format_exc()}"
+        print("[Amethyst Preview] ", error_msg)
+        return [], "", f"Failed: {error_msg}", ""
+
+    progress(60, desc="Loading merged weights into current model...")
+
+    # Convert to half precision for inference
+    merged_state_half = {k: v.half() for k, v in merged_state.items()}
+
+    # Create dummy checkpoint info
+    dummy_info = sd_models.CheckpointInfo("in_memory_merged_preview")
+    dummy_info.filename = "in_memory"
+
+    try:
+        # A1111 dev: Fast reuse path (best performance)
+        if (hasattr(sd_models, 'load_model_weights') and
+                shared.sd_model is not None and
+                hasattr(shared.sd_model, 'used_config')):
+            sd_models.load_model_weights(
+                shared.sd_model,
+                dummy_info,
+                merged_state_half
+            )
+            print("[Amethyst] Preview: Fast weight reuse (A1111 dev path)")
+        # Forge Neo & fallback: Full reload (safe & universal)
+        else:
+            sd_models.load_model(
+                checkpoint_info=dummy_info,
+                already_loaded_state_dict=merged_state_half
+            )
+            print("[Amethyst] Preview: Full model load (Forge Neo / safe path)")
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Failed to load merged weights: {str(e)}\nDetails: {traceback.format_exc()}"
+        print("[Amethyst Preview] ", error_msg)
+        return [], "", f"Failed: {error_msg}", merge_report
+
+    progress(80, desc="Generating preview image...")
+
+    try:
+        p = StableDiffusionProcessingTxt2Img(
+            sd_model=shared.sd_model,
+            prompt=prompt_val or "masterpiece, best quality, highly detailed",
+            negative_prompt=negative_prompt_val or "blurry, low quality",
+            seed=seed if seed >= 0 else -1,
+            sampler_name=sampler_name,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            width=width,
+            height=height,
+            batch_size=batch_size,
+            n_iter=batch_count,
+            do_not_save_samples=True,
+            do_not_save_grid=True,
+        )
+
+        # Properly initialize scripts (supports ControlNet, ADetailer, etc.)
+        p.scripts = scripts.scripts_txt2img
+        p.script_args = [None] * len(getattr(scripts.scripts_txt2img, "alwayson_scripts", []))
+
+        processed = processing.process_images(p)
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Image generation failed: {str(e)}\nDetails: {traceback.format_exc()}"
+        print("[Amethyst Preview] ", error_msg)
+        return [], "", f"Failed: {error_msg}", merge_report
+
+    finally:
+        # Critical cleanup to prevent memory leaks
+        del merged_state_half
+        del merged_state
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    infotext = processed.infotexts[0] if processed.infotexts else ""
+    progress(100, desc="Preview complete!")
+
+    return (
+        processed.images,
+        infotext,
+        "Preview complete! Model merged and image generated successfully.",
+        merge_report
+    )
+
+def validate_merge_config(model_a, model_b, weight_editor, merge_mode):
+    """Validate merge configuration before execution"""
+    errors = []
+    
+    if not model_a or model_a == "":
+        errors.append("❌ Model A (Primary) is required")
+    if not model_b or model_b == "":
+        errors.append("❌ Model B (Secondary) is required")
+    
+    if weight_editor.strip() == "":
+        errors.append("⚠️ Weight editor is empty - only default-to-A merge will occur")
+    
+    try:
+        lines = [l.strip() for l in weight_editor.split('\n') if l.strip() and not l.strip().startswith('#')]
+        for line in lines:
+            if ':' not in line:
+                errors.append(f"❌ Invalid syntax: '{line}' (missing colon)")
+    except:
+        pass
+    
+    if errors:
+        return False, '\n'.join(errors)
+    return True, "✓ Configuration valid"

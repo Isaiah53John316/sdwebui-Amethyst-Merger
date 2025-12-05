@@ -8,6 +8,10 @@ import os
 from functools import wraps
 import re
 
+def tensor_size(t):
+    """Return tensor size in bytes — safely handles non-floating point tensors"""
+    return t.element_size() * t.nelement() if t.is_floating_point() or t.is_complex() else 0
+
 def recurse(operation):
     source_tensors = []
     for source in operation.sources:
@@ -15,7 +19,7 @@ def recurse(operation):
             source_tensors.append(source.merge())
         else:
             # Scalar value - convert to tensor if needed
-            source_tensors.append(torch.tensor(source, device=cmn.device(), dtype=cmn.dtype()))
+            source_tensors.append(torch.tensor(source, device=cmn.get_device(), dtype=cmn.get_dtype()))
     return operation.oper(*source_tensors)
 
 def cache_operation(func):
@@ -91,76 +95,83 @@ class Operation:
         return self
         
 
-# ≈ make LoadTensor respect cross-arch target shapes + survive missing keys
 class LoadTensor(Operation):
     def __init__(self, key, checkpoint_name):
         super().__init__(key)
-        # ALWAYS store the **exact** string that was used when the file was opened
-        self.checkpoint_name = checkpoint_name
-        self._resolved_path = checkpoint_name  # keep original for debugging
+        self.checkpoint_name = checkpoint_name or ''
+        self._resolved_path = checkpoint_name
 
     def merge(self) -> torch.Tensor:
+        """
+        Load a single tensor from the specified checkpoint.
+        In kitchen-sink mode: just load it — let initialize_task() handle resizing.
+        """
         if cmn.loaded_checkpoints is None:
             raise RuntimeError("Checkpoints not loaded")
 
-        # ← THE FIX: resolve the exact key that is actually in the dict
+        # Find the correct file
         file = None
         for loaded_key in cmn.loaded_checkpoints.keys():
-            if os.path.samefile(loaded_key, self.checkpoint_name):
-                file = cmn.loaded_checkpoints[loaded_key]
-                break
+            try:
+                if self.checkpoint_name and os.path.samefile(loaded_key, self.checkpoint_name):
+                    file = cmn.loaded_checkpoints[loaded_key]
+                    break
+            except (OSError, FileNotFoundError):
+                continue
 
-        # Fallback to primary if still not found (should never happen now)
+        # Fallback to primary if not found
         if file is None:
-            file = cmn.loaded_checkpoints.get(cmn.primary)
+            # PRIMARY MODEL FIRST (the correct, safe order)
+            if cmn.primary and cmn.primary in cmn.loaded_checkpoints:
+                file = cmn.loaded_checkpoints[cmn.primary]
+            # THEN fall back to the first loaded checkpoint (in global order)
+            elif cmn.checkpoints_global:
+                first_cp = cmn.checkpoints_global[0]
+                file = cmn.loaded_checkpoints.get(first_cp)
+            # ABSOLUTE LAST RESORT: any loaded checkpoint
+            elif cmn.loaded_checkpoints:
+                file = next(iter(cmn.loaded_checkpoints.values()))
+            
+            if file is None:
+                raise RuntimeError(f"No checkpoint available for tensor '{self.key}' (requested: {self.checkpoint_name})")
 
+        # Load the tensor (let initialize_task() handle any errors/reshaping)
         try:
             tensor = file.get_tensor(self.key)
         except SafetensorError:
-            # Still try primary as last resort
-            file = cmn.loaded_checkpoints.get(cmn.primary)
-            try:
-                tensor = file.get_tensor(self.key)
-            except SafetensorError:
-                if getattr(cmn, 'is_cross_arch', False):
-                    shapes = getattr(cmn, 'cross_arch_target_shapes', {})
-                    if self.key in shapes:
-                        target = shapes[self.key]
-                        print(f"[Merger] Missing key {self.key} → zeros {target}")
-                        return torch.zeros(target, device=cmn.device(), dtype=cmn.dtype())
-                raise
+            # In kitchen-sink mode, we don't care if a key is missing here
+            # initialize_task() will find it in another model or SmartResize it
+            raise RuntimeError(f"Key {self.key} missing from {self.checkpoint_name} — handled by recovery")
 
-        tensor = tensor.to(cmn.device())
+        # Move to correct device (let initialize_task() handle dtype/shape)
+        tensor = tensor.to(device=cmn.get_device())
 
-        if tensor.ndim == 0:
+        if tensor.ndim == 0:  # scalar tensor
             return tensor
-
-        # Cross-arch resizing (unchanged)
-        if getattr(cmn, 'is_cross_arch', False):
-            shapes = getattr(cmn, 'cross_arch_target_shapes', {})
-            if self.key in shapes:
-                target = shapes[self.key]
-                if tensor.shape != target:
-                    tensor = SmartResize(f"LoadTensor_fix_{os.path.basename(self.checkpoint_name)}", target, tensor).oper(tensor)
-                    if tensor.shape != target:
-                        tensor = tensor.view(-1)[:torch.tensor(target).prod()].view(target)
 
         return tensor
 
-# === FIXED: Add ===
+# === BASIC OPERATORS (fixed indentation) ===
 class Add(Operation):
+    @multi_cache_operation
     def oper(self, a, b):
         return _safe_binary_op("Add", a, b, lambda x, y: x + y)
 
+
 class Sub(Operation):
+    @multi_cache_operation
     def oper(self, a, b):
         return _safe_binary_op("Sub", a, b, lambda x, y: x - y)
 
+
 class Multiply(Operation):
+    @multi_cache_operation
     def oper(self, a, b):
         return _safe_binary_op("Mul", a, b, lambda x, y: x * y)
 
+
 class MultiplyTensors(Operation):
+    @multi_cache_operation
     def oper(self, a, b):
         return _safe_binary_op("MulT", a, b, lambda x, y: x * y)
 
@@ -172,8 +183,10 @@ class Extract(Operation):
         self.beta = beta
         self.gamma = gamma
 
+    @multi_cache_operation
     def oper(self, base: torch.Tensor | None, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         target_shape = base.shape if base is not None else a.shape
+
         if a.shape != target_shape:
             a = SmartResize("tmp", target_shape, a).oper(a)
         if b.shape != target_shape:
@@ -189,13 +202,18 @@ class Extract(Operation):
 
         c = torch.cosine_similarity(a_f, b_f, dim=-1).clamp(-1, 1).unsqueeze(-1)
         d = ((c + 1) / 2) ** self.gamma
-
         result = torch.lerp(a_f, b_f, self.alpha) * torch.lerp(d, 1 - d, self.beta)
+
         return result.to(dtype)
 
 
 class Similarities(Extract):
+    def __init__(self, key, alpha, beta, gamma, a, b):
+        super().__init__(key, alpha, beta, gamma, a, b)
+
+    @multi_cache_operation
     def oper(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # Pure similarity-driven interpolation (no base subtraction)
         return super().oper(None, a, b)
 
 
@@ -206,12 +224,12 @@ class ReBasin(Operation):
 
     @multi_cache_operation
     def oper(self, a, b):
-        # Permutation alignment via sorting + lerp — fast, effective
-        a_sorted = torch.sort(a.flatten(), dim=-1)[0]
-        b_sorted = torch.sort(b.flatten(), dim=-1)[0]
+        # Fast permutation alignment via sorting (2025 practical Re-Basin)
+        a_sorted = torch.sort(a.flatten(), dim=-1).values
+        b_sorted = torch.sort(b.flatten(), dim=-1).values
         merged = (1 - self.alpha) * a_sorted + self.alpha * b_sorted
         return merged.view_as(a).to(a.dtype)
-    
+
 
 class DeMe(Operation):
     def __init__(self, key, alpha, a, b):
@@ -220,53 +238,46 @@ class DeMe(Operation):
 
     @multi_cache_operation
     def oper(self, a, b):
-        # Variance-based decoupling (per 2024 paper)
+        # Timestep-decoupled merge (2024 ICLR paper) — variance selection
         var_a = torch.var(a, dim=-1, keepdim=True)
         var_b = torch.var(b, dim=-1, keepdim=True)
         decoupled = torch.where(var_a > var_b, a, b)
         return (1 - self.alpha) * a + self.alpha * decoupled
-    
+
 
 class BlockWeighted(Operation):
     def __init__(self, key, alphas, a, b):
         super().__init__(key, a, b)
-        self.alphas = alphas
+        self.alphas = alphas  # list of 12+ values
 
     @multi_cache_operation
     def oper(self, a, b):
-        # Extract block number from key (e.g., input_blocks.3 → 3)
+        # Extract block index from key: input_blocks.3, output_blocks.7, etc.
         match = re.search(r'\.(\d+)\.', self.key)
-        if match:
-            idx = int(match.group(1))
-            alpha = self.alphas[min(idx, len(self.alphas)-1)]
-        else:
-            alpha = self.alphas[0]  # fallback
+        alpha = self.alphas[min(int(match.group(1)), len(self.alphas)-1)] if match else self.alphas[0]
         return (1 - alpha) * a + alpha * b
 
 
 class ToMe(Operation):
     def __init__(self, key, ratio, tensor):
         super().__init__(key, tensor)
-        self.ratio = ratio
+        self.ratio = float(ratio)
 
     @multi_cache_operation
     def oper(self, tensor):
         if tensor.ndim < 2 or tensor.numel() < 10:
             return tensor
 
-        # Cosine similarity between tokens
+        # Fast ToMe (Token Merging) — CVPR 2023
         normed = F.normalize(tensor, dim=-1)
-        sim = normed @ normed.T
-        values, indices = torch.topk(sim, k=max(2, int(tensor.size(0) * self.ratio)), dim=1)
-        
-        # Merge top-k similar tokens
-        merged = torch.zeros_like(tensor)
-        for i in range(tensor.size(0)):
-            group = tensor[indices[i]]
-            merged[i] = group.mean(0)
-        
-        return merged
+        sim = normed @ normed.T  # [N, N]
 
+        k = max(2, int(tensor.size(0) * self.ratio))
+        _, indices = torch.topk(sim, k, dim=1)  # [N, k]
+
+        # Vectorized merge (faster than loop)
+        merged = tensor[indices].mean(dim=1)  # [N, D]
+        return merged
 
 class AttentionMerge(Operation):
     def __init__(self, key, alpha, a, b):
@@ -275,9 +286,10 @@ class AttentionMerge(Operation):
 
     @multi_cache_operation
     def oper(self, a, b):
+        # Only merge attention-related layers (Q, K, V, proj, etc.)
         if 'attention' in self.key.lower() or 'attn' in self.key.lower():
             return (1 - self.alpha) * a + self.alpha * b
-        return a  # non-attention layers unchanged
+        return a  # Everything else stays from Model A
 
 
 class Smooth(Operation):
@@ -286,69 +298,65 @@ class Smooth(Operation):
 
     @multi_cache_operation
     def oper(self, tensor):
-        # Fast, safe, 1D conv-based smoothing — works on ALL PyTorch versions
         if tensor.numel() < 5:
             return tensor
 
-        # Gaussian kernel for sigma=1.0 (kernel size 5)
-        device = tensor.device
-        dtype = tensor.dtype
-        kernel_size = 5
-        sigma = 1.0
+        device, dtype = tensor.device, tensor.dtype
+        kernel_size, sigma = 5, 1.0
         center = kernel_size // 2
+
+        # Create 1D Gaussian kernel
         x = torch.arange(kernel_size, device=device, dtype=dtype)
         kernel = torch.exp(-0.5 * ((x - center) / sigma) ** 2)
         kernel = kernel / kernel.sum()
-        kernel = kernel.view(1, 1, -1)  # [1,1,kernel_size]
+        kernel = kernel.view(1, 1, -1)  # [1,1,5]
 
         orig_shape = tensor.shape
 
-        # Flatten to 1D for smoothing along the last dimension
-        flattened = tensor.flatten().unsqueeze(0).unsqueeze(0)  # [1,1,N]
-        padding = (center, center)
-        padded = F.pad(flattened, padding, mode='replicate')  # Safe padding mode
-        smoothed = F.conv1d(padded, kernel).squeeze()  # [N]
+        # Flatten and prepare for conv1d
+        x = tensor.flatten().unsqueeze(0).unsqueeze(0)  # [1,1,N]
+        x = F.pad(x, (center, center), mode='replicate')
+        smoothed = F.conv1d(x, kernel)                  # [1,1,N]
+        smoothed = smoothed.squeeze(0).squeeze(0)       # [N] — safe squeeze
 
-        # Restore original shape
-        result = smoothed.view(orig_shape)
+        # Restore original shape — SAFE for all cases
+        return smoothed.view(orig_shape).to(dtype)
 
-        return result.to(dtype)
-    
 
 class TIES(Operation):
     def __init__(self, key, density, seed, a, b):
         super().__init__(key, a, b)
-        self.density = density
-        self.seed = seed
+        self.density = float(density)
+        self.seed = int(seed)
 
     @multi_cache_operation
     def oper(self, a, b):
-        if self.density <= 0.0: return a
-        if self.density >= 1.0: return b
+        if self.density <= 0.0:
+            return a
+        if self.density >= 1.0:
+            return b
 
         torch.manual_seed(self.seed)
-
         delta = b - a
         abs_delta = delta.abs()
+
         k = max(1, int(self.density * abs_delta.numel()))
-        threshold = torch.topk(abs_delta.flatten(), k).values.min()
+        threshold = torch.topk(abs_delta.flatten(), k).values[-1]  # .min() → [-1] for safety
         mask = abs_delta >= threshold
 
-        sign_a = torch.sign(a)
-        sign_b = torch.sign(b)
-        resolved_sign = torch.where(sign_a == sign_b, sign_a, torch.sign(sign_a + sign_b))
+        # Sign resolution
+        sign = torch.sign(delta)
+        resolved_sign = torch.where(sign == 0, torch.sign(a), sign)  # fallback to a's sign
 
-        elected_delta = delta * resolved_sign * mask.to(delta.dtype)
+        elected_delta = delta * mask.to(delta.dtype) * resolved_sign
 
-        dominate_a = mask & (sign_a == resolved_sign)
-        dominate_b = mask & (sign_b == resolved_sign)
+        # Dominance resolution
+        result = torch.where(mask & (torch.sign(a) == resolved_sign), a, b)
 
-        result = torch.where(dominate_a, a, b)
-        result = torch.where(dominate_b, b, result)
-
-        if elected_delta.norm(p=2) > 0:
+        # L2-norm preservation
+        if elected_delta.norm(p=2) > 1e-8:
             scale = delta.norm(p=2) / elected_delta.norm(p=2)
-            result = a + elected_delta * scale
+            result = a + elected_delta * scale.clamp_max(10.0)  # prevent explosion
 
         return result.to(a.dtype)
 
@@ -389,6 +397,106 @@ class DARE(Operation):
 
         return (a + dared_delta).to(a.dtype)
 
+class DARE3(Operation):
+    def __init__(self, key, density, dropout_p=0.3, seed=42, a=None, b=None, c=None):
+        super().__init__(key, a, b, c)
+        self.density = density
+        self.dropout_p = dropout_p
+        self.seed = seed
+
+    @multi_cache_operation
+    def oper(self, a, b, c):
+        if self.density <= 0.0:
+            return a
+
+        torch.manual_seed(self.seed + hash(self.key) % (2**32-1))
+
+        # Compute deltas from A (the base)
+        delta_b = b - a
+        delta_c = c - a
+
+        # Combine deltas in magnitude space
+        abs_delta = torch.stack([delta_b.abs(), delta_c.abs()], dim=0)
+        max_magnitude, source = torch.max(abs_delta, dim=0)
+
+        # Top-k selection on strongest signals
+        k = max(1, int(self.density * max_magnitude.numel()))
+        threshold = torch.topk(max_magnitude.flatten(), k).values.min()
+        mask = max_magnitude >= threshold
+
+        # Choose which model contributed the winning signal
+        delta = torch.where(source == 0, delta_b, delta_c)
+
+        # Optional dropout on surviving parameters
+        if self.dropout_p > 0.0:
+            keep = 1.0 - self.dropout_p
+            dropout_mask = torch.bernoulli(torch.full_like(mask.float(), keep)).bool()
+            mask = mask & dropout_mask
+
+        # Random scaling in [0.5, 2.0] on survivors (the DARE secret sauce)
+        scale = torch.ones_like(delta)
+        if mask.any():
+            scale[mask] = torch.empty(mask.sum(), device=delta.device).uniform_(0.5, 2.0)
+
+        dared_delta = delta * mask.to(delta.dtype) * scale
+
+        # L2-rescale to preserve energy
+        if dared_delta.norm(p=2) > 0:
+            rescale_factor = (delta_b.norm(p=2) + delta_c.norm(p=2)) / (dared_delta.norm(p=2) + 1e-8)
+            dared_delta = dared_delta * rescale_factor
+
+        return (a + dared_delta).to(a.dtype)
+
+class SLERP3(Operation):
+    def __init__(self, key, alpha, beta, a, b, c):
+        super().__init__(key, a, b, c)
+        self.alpha = alpha   # weight for B
+        self.beta = beta     # weight for C (alpha + beta <= 1.0, remainder is A)
+
+    @multi_cache_operation
+    def oper(self, a, b, c):
+        # Normalize weights
+        total = self.alpha + self.beta
+        if total <= 0.0:
+            return a
+        alpha = self.alpha / total if total > 0 else 0.0
+        beta = self.beta / total if total > 0 else 0.0
+        gamma = 1.0 - alpha - beta  # weight for A
+
+        if gamma >= 1.0:
+            return a
+        if alpha >= 1.0:
+            return b
+        if beta >= 1.0:
+            return c
+
+        # Flatten for vector operations
+        a_flat = a.flatten()
+        b_flat = b.flatten()
+        c_flat = c.flatten()
+
+        # Compute log map to origin (A as base)
+        def log_map(x, base):
+            cos_theta = torch.sum(x * base) / (torch.norm(x) * torch.norm(base) + 1e-8)
+            cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+            theta = torch.acos(cos_theta)
+            if theta < 1e-6:
+                return torch.zeros_like(x)
+            return (x - cos_theta * base) * (theta / torch.sin(theta))
+
+        log_b = log_map(b_flat, a_flat)
+        log_c = log_map(c_flat, a_flat)
+
+        # Weighted average in tangent space
+        log_merged = alpha * log_b + beta * log_c
+
+        # Exp map back to manifold
+        norm = torch.norm(log_merged)
+        if norm < 1e-6:
+            return a
+        exp_merged = torch.cos(norm) * a_flat + torch.sin(norm) * (log_merged / norm)
+
+        return exp_merged.view_as(a).to(a.dtype)
 
 class SLERP(Operation):
     def __init__(self, key, alpha, a, b):
@@ -424,6 +532,8 @@ class TrainDiff(Operation):
     @multi_cache_operation
     def oper(self, a, b, c):
         delta = b - c
+        if delta.numel() == 0:
+            return a
         delta = delta - delta.mean()
         return (a + delta).to(a.dtype)
 
@@ -474,198 +584,240 @@ def resize_tensors(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torc
 
 
 class InterpolateDifference(Operation):
-    def __init__(self,key,alpha,beta,gamma,seed,*sources):
-        super().__init__(key,*sources)
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.seed = seed
+    def __init__(self, key, alpha, beta, gamma, seed, *sources):
+        super().__init__(key, *sources)
+        self.alpha = float(alpha)
+        self.beta = int(beta)   # 0 or 1
+        self.gamma = float(gamma)
+        self.seed = int(seed)
 
+    @multi_cache_operation
     def oper(self, a, b):
-        alpha = max(self.alpha,0.001)
-
+        alpha = max(self.alpha, 0.001)
         delta = torch.abs(a - b)
 
+        # Avoid division by zero
+        delta_max = torch.max(delta)
+        if delta_max == 0:
+            return a  # or b, they're identical
+
         if self.beta != 1:
-            diff = ((torch.max(delta) - delta) / torch.max(delta)) ** (1 / alpha - 1)
+            diff = ((delta_max - delta) / delta_max) ** (1 / alpha - 1)
         else:
-            diff = (delta / torch.max(delta)) ** (1 / alpha - 1)
+            diff = (delta / delta_max) ** (1 / alpha - 1)
 
-        diff = torch.nan_to_num(diff)
+        diff = torch.nan_to_num(diff, nan=0.0, posinf=1.0, neginf=0.0)
 
-        rngenerator = torch.Generator(device=diff.device)
-        rngenerator.manual_seed(self.seed)
-        bitmask = torch.bernoulli(torch.clamp(diff,0,1),out=torch.empty_like(diff),generator=rngenerator)
+        # Bernoulli mask with seed
+        rng = torch.Generator(device=diff.device)
+        rng.manual_seed(self.seed + hash(self.key) % (2**32 - 1))  # key-specific seed
+        bitmask = torch.bernoulli(torch.clamp(diff, 0.0, 1.0), generator=rng)
 
+        # Final interpolation
         interpolated_mask = torch.lerp(bitmask, diff, self.gamma)
+        result = a * (1 - interpolated_mask) + b * interpolated_mask
 
-        res = a * (1 - interpolated_mask) + b * interpolated_mask
-        return res
+        return result.to(a.dtype)
 
 class ManualEnhancedInterpolateDifference(Operation):
     def __init__(self, key, alpha, beta, gamma, delta, seed, *sources):
         super().__init__(key, *sources)
-        self.alpha = alpha  # Interpolation strength
-        self.beta = beta    # Lower threshold for mean differences
-        self.gamma = gamma  # Upper threshold for mean differences
-        self.delta = delta  # Smoothness factor
-        self.seed = seed    # Seed for random number generation
+        self.alpha = float(alpha)    # Interpolation strength
+        self.beta = float(beta)      # Lower threshold
+        self.gamma = float(gamma)    # Upper threshold
+        self.delta = float(delta)    # Smoothness factor
+        self.seed = int(seed)
 
+    @multi_cache_operation
     def oper(self, a, b):
-        # Calculate absolute differences
+        # Absolute differences
         delta = torch.abs(a - b)
-        
-        # Normalize differences
-        diff = (torch.max(delta) - delta) / torch.max(delta)
-        diff = torch.nan_to_num(diff)
-        
-        # Calculate mean differences
-        mean_diff = torch.mean(diff, 0, keepdim=True)
-        
-        # Create mask based on mean differences
-        mask = torch.logical_and(self.beta < mean_diff, mean_diff < self.gamma)
-        
-        # Apply power function to differences
-        powered_diff = diff ** (1 / max(self.alpha, 0.001) - 1)
-        powered_diff = torch.nan_to_num(powered_diff)
-        
-        # Apply mask to powered differences
-        masked_diff = powered_diff * mask.float()
-        
-        # Generate random mask
-        rng = torch.Generator(device=a.device)
-        rng.manual_seed(self.seed)
-        random_mask = torch.bernoulli(torch.clamp(masked_diff, 0, 1), generator=rng)
-        
-        # Interpolate between random mask and powered differences
-        interpolated_mask = torch.lerp(random_mask, masked_diff, self.delta)
-        
-        # Apply final interpolation
-        result = a * (1 - interpolated_mask) + b * interpolated_mask
-        
-        return result
 
+        # Avoid division by zero
+        delta_max = torch.max(delta)
+        if delta_max == 0:
+            return a  # a and b are identical
+
+        # Normalize differences: 1 = no difference, 0 = max difference
+        diff = (delta_max - delta) / delta_max
+        diff = torch.nan_to_num(diff, nan=0.0)
+
+        # Mean difference per channel (for attention layers, etc.)
+        mean_diff = torch.mean(diff, dim=0, keepdim=True)
+
+        # Create threshold mask
+        mask = torch.logical_and(self.beta < mean_diff, mean_diff < self.gamma)
+
+        # Apply power function (controls curve shape)
+        alpha_safe = max(self.alpha, 0.001)
+        powered_diff = diff ** (1 / alpha_safe - 1)
+        powered_diff = torch.nan_to_num(powered_diff, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # Apply threshold mask
+        masked_diff = powered_diff * mask.float()
+
+        # Random mask with seed
+        rng = torch.Generator(device=a.device)
+        rng.manual_seed(self.seed + hash(self.key) % (2**32 - 1))
+        random_mask = torch.bernoulli(torch.clamp(masked_diff, 0.0, 1.0), generator=rng)
+
+        # Final interpolation between random and smooth
+        interpolated_mask = torch.lerp(random_mask, masked_diff, self.delta)
+
+        # Apply to output
+        result = a * (1 - interpolated_mask) + b * interpolated_mask
+
+        return result.to(a.dtype)
+    
 class AutoEnhancedInterpolateDifference(Operation):
     def __init__(self, key, alpha, beta, gamma, seed, *sources):
         super().__init__(key, *sources)
-        self.alpha = alpha  # Interpolation strength
-        self.beta = beta    # Threshold adjustment factor
-        self.gamma = gamma  # Smoothness factor
-        self.seed = seed    # Seed for random number generation
+        self.alpha = float(alpha)    # Interpolation strength
+        self.beta = float(beta)      # Threshold adjustment factor
+        self.gamma = float(gamma)    # Smoothness factor
+        self.seed = int(seed)
 
+    @multi_cache_operation
     def oper(self, a, b):
-        # Calculate absolute differences
         delta = torch.abs(a - b)
-        
-        # Normalize differences
+
+        # Avoid division by zero
         max_delta = torch.max(delta)
+        if max_delta == 0:
+            return a  # a and b are identical
+
+        # Normalize: 1 = no difference, 0 = max difference
         diff = (max_delta - delta) / max_delta
-        diff = torch.nan_to_num(diff)
-        
-        # Calculate mean differences
+        diff = torch.nan_to_num(diff, nan=0.0)
+
+        # Global mean difference (adaptive center)
         mean_diff = torch.mean(diff)
-        
-        # Dynamically set lower and upper thresholds
+
+        # Dynamic thresholds — the genius of your method
         lower_threshold = mean_diff * (1 - self.beta)
         upper_threshold = mean_diff * (1 + self.beta)
-        
-        # Create mask based on dynamic thresholds
-        mask = torch.logical_and(lower_threshold < diff, diff < upper_threshold)
-        
-        # Apply power function to differences
-        powered_diff = diff ** (1 / max(self.alpha, 0.001) - 1)
-        powered_diff = torch.nan_to_num(powered_diff)
-        
-        # Apply mask to powered differences
-        masked_diff = powered_diff * mask.float()
-        
-        # Generate random mask
-        rng = torch.Generator(device=a.device)
-        rng.manual_seed(self.seed)
-        random_mask = torch.bernoulli(torch.clamp(masked_diff, 0, 1), generator=rng)
-        
-        # Interpolate between random mask and powered differences
-        interpolated_mask = torch.lerp(random_mask, masked_diff, self.gamma)
-        
-        # Apply final interpolation
-        result = a * (1 - interpolated_mask) + b * interpolated_mask
-        
-        return result
 
-#class SingularValueDeOperator(Operation):
-#    def __init__(self, key, alpha, beta, seed, *sources):
-#        super().__init__(key, *sources)
-#        self.alpha = alpha  # threshold for significant singular values
-#        self.beta = beta    # used to determine which singular values to keep
-#
-#    def oper(self, a, b):
-#        assert a.shape == b.shape, "Tensors must have the same shape"
-#
-#        diff = a - b
-#        U, S, Vh = torch.linalg.svd(diff)
-#
-#        # Apply thresholding based on alpha
-#        significant_values = S > self.alpha
-#
-#        # Optionally keep only top k singular values based on beta
-#        if self.beta < 1:
-#            k = max(1, int(self.beta * len(S)))
-#            top_k_mask = torch.empty_like(significant_values)
-#            top_k_mask[:k] = True
-#            significant_values = significant_values & top_k_mask
-#
-#        # Reconstruct the difference using only significant singular values
-#        S_filtered = S * significant_values
-#        rng = torch.Generator(device=a.device)
-#        rng.manual_seed(self.seed)
-#        reconstructed_diff = torch.matmul(U, torch.matmul(torch.diag(S_filtered), Vh), generator=rng)
-#
-#        result = reconstructed_diff
-#        return result
+        # Mask: keep values near the mean difference
+        mask = torch.logical_and(lower_threshold < diff, diff < upper_threshold)
+
+        # Power curve for shaping
+        alpha_safe = max(self.alpha, 0.001)
+        powered_diff = diff ** (1 / alpha_safe - 1)
+        powered_diff = torch.nan_to_num(powered_diff, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # Apply mask
+        masked_diff = powered_diff * mask.float()
+
+        # Random mask with seed
+        rng = torch.Generator(device=a.device)
+        rng.manual_seed(self.seed + hash(self.key) % (2**32 - 1))
+        random_mask = torch.bernoulli(torch.clamp(masked_diff, 0.0, 1.0), generator=rng)
+
+        # Final lerp between random and smooth
+        interpolated_mask = torch.lerp(random_mask, masked_diff, self.gamma)
+
+        result = a * (1 - interpolated_mask) + b * interpolated_mask
+
+        return result.to(a.dtype)
+
+class SingularValueDeOperator(Operation):
+    def __init__(self, key, alpha, beta, seed, *sources):
+        super().__init__(key, *sources)
+        self.alpha = float(alpha)    # Threshold for significant singular values
+        self.beta = float(beta)      # Fraction of top singular values to keep (0.1–0.5)
+        self.seed = int(seed)
+
+    @multi_cache_operation
+    def oper(self, a, b):
+        # Only works on 2D+ tensors — skip 1D (bias) and scalars
+        if a.ndim < 2 or b.ndim < 2:
+            return a
+
+        # Skip if shapes don't match (after SmartResize)
+        if a.shape != b.shape:
+            return a
+
+        try:
+            diff = a - b
+
+            # SVD — the heart of the method
+            U, S, Vh = torch.linalg.svd(diff, full_matrices=False)
+
+            # Keep only significant singular values
+            threshold = self.alpha * S.max()
+            significant = S > threshold
+
+            # Keep top-k fraction (beta)
+            if self.beta < 1.0:
+                k = max(1, int(self.beta * len(S)))
+                top_k = torch.zeros_like(significant)
+                top_k[:k] = True
+                significant = significant & top_k
+
+            # Zero out non-significant values
+            S_filtered = S * significant.float()
+
+            # Reconstruct denoised difference
+            reconstructed = torch.matmul(U, torch.matmul(torch.diag(S_filtered), Vh))
+
+            # Add back to base (a)
+            result = a + reconstructed
+
+            return result.to(a.dtype)
+
+        except Exception as e:
+            # If anything goes wrong (e.g., SVD convergence), fall back to original
+            print(f"[SVD] Failed on {self.key}: {e} — using original")
+            return a
 
 
 class TensorExchange(Operation):
     def __init__(self, key, alpha, seed, *sources):
         super().__init__(key, *sources)
-        self.alpha = alpha
-        self.seed = seed
+        self.alpha = float(alpha)
+        self.seed = int(seed)
 
+    @multi_cache_operation
     def oper(self, a, b):
-        # Use hash of key + seed to deterministically choose tensor
         import hashlib
         hash_input = f"{self.key}{self.seed}".encode()
         hash_val = int(hashlib.md5(hash_input).hexdigest(), 16)
-        # Normalize hash to 0-1 range
         choice_val = (hash_val % 10000) / 10000.0
-
-        # If choice_val < alpha, return b, else return a
-        if choice_val < self.alpha:
-            return b
-        else:
-            return a
+        return b if choice_val < self.alpha else a
 
 
 class WeightSumCutoff(Operation):
-    def __init__(self,key,alpha, beta, gamma, *sources):
-        super().__init__(key,*sources)
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
+    def __init__(self, key, alpha, beta, gamma, *sources):
+        super().__init__(key, *sources)
+        self.alpha = float(alpha)    # Merge strength
+        self.beta = float(beta)      # Lower threshold
+        self.gamma = float(gamma)    # Upper threshold
 
+    @multi_cache_operation
     def oper(self, a, b):
         delta = torch.abs(a - b)
 
-        diff = (torch.max(delta) - delta) / torch.max(delta)
-        diffn = torch.nan_to_num(diff)
+        # Avoid division by zero
+        delta_max = torch.max(delta)
+        if delta_max == 0:
+            return a  # a and b are identical
 
-        mean = torch.mean(diffn,0,True)
-        mask = torch.logical_and(mean < self.beta,self.gamma < mean)
-        mul = self.alpha*mask
+        # Normalized similarity: 1 = identical, 0 = max difference
+        diff = (delta_max - delta) / delta_max
+        diff = torch.nan_to_num(diff, nan=0.0)
 
-        res = a * (1 - mul) + b * mul
-        return res
-#The cache
-tensor_size = lambda x: x.element_size() * x.nelement()
+        # Mean similarity per channel
+        mean_sim = torch.mean(diff, dim=0, keepdim=True)  # [1, C]
+
+        # Keep only channels where similarity is BETWEEN beta and gamma
+        # → beta < mean_sim < gamma
+        mask = (mean_sim > self.beta) & (mean_sim < self.gamma)
+
+        # Apply cutoff: only merge in the selected range
+        mul = self.alpha * mask.float()
+        result = a * (1 - mul) + b * mul
+
+        return result.to(a.dtype)
 
 class WeightsCache:
     def __init__(self, size):
@@ -687,7 +839,7 @@ class WeightsCache:
     def __getitem__(self, key: Operation) -> torch.Tensor:
         t = self.mapping[key]
         self.mapping.move_to_end(key)
-        return t.clone().to(cmn.device()).type(cmn.dtype())
+        return t.clone().to(cmn.get_device()).type(cmn.get_dtype())
     
 
 weights_cache = WeightsCache(4096)
