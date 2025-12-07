@@ -1,5 +1,4 @@
 import torch, scipy
-import scripts.untitled.common as cmn
 import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
@@ -7,6 +6,7 @@ from safetensors import SafetensorError   # ← THIS LINE IS THE FIX (adds missi
 import os
 from functools import wraps
 import re
+from scripts.untitled.common import cmn
 
 def tensor_size(t):
     """Return tensor size in bytes — safely handles non-floating point tensors"""
@@ -93,7 +93,66 @@ class Operation:
         if cmn.opts['cache_size'] > 512:
             self.merge_func = cache_operation(recurse)
         return self
-        
+
+class CopyPrimary(Operation):
+    """
+    Copy from primary model — 100% safe for cross-arch, never crashes
+    Now fully integrated with MergeStats via constructor injection
+    """
+    def __init__(self, key, primary_path, stats=None):
+        super().__init__(key)
+        self.primary_path = primary_path
+        self.stats = stats  # ← MergeStats instance passed from create_tasks()
+
+    @multi_cache_operation
+    def oper(self, *args):
+        file = cmn.loaded_checkpoints.get(self.primary_path)
+        model_name = os.path.basename(self.primary_path) if self.primary_path else "Unknown"
+        resized = False
+
+        if file and self.key in file.keys():
+            try:
+                t = file.get_tensor(self.key)
+
+                # RESIZE IF CROSS-ARCH
+                if cmn.is_cross_arch:
+                    target_shape = cmn.cross_arch_target_shapes.get(self.key)
+                    if target_shape and t.shape != target_shape:
+                        t = SmartResize(f"CopyPrimary_{self.key}", target_shape, t).oper(t)
+                        resized = True
+
+                # Stats update
+                if self.stats:
+                    self.stats.copied_primary += 1
+                    if resized:
+                        self.stats.smart_resized += 1
+
+                # Logging
+                if resized:
+                    print(f"[FinalCopy] {self.key} ← COPIED FROM PRIMARY + RESIZED ({model_name})")
+                else:
+                    print(f"[FinalCopy] {self.key} ← COPIED FROM PRIMARY ({model_name})")
+
+                return t.to(cmn.get_device(), dtype=cmn.get_dtype())
+
+            except Exception as e:
+                print(f"[CopyPrimary] FAILED reading {self.key} from {model_name}: {e}")
+
+        # ULTIMATE FALLBACK: Zero-fill with target shape (cross-arch)
+        if cmn.is_cross_arch:
+            target_shape = cmn.cross_arch_target_shapes.get(self.key)
+            if target_shape:
+                t = torch.zeros(target_shape, dtype=cmn.get_dtype(), device=cmn.get_device())
+                if self.stats:
+                    self.stats.zero_filled += 1
+                print(f"[Emergency] {self.key} ← ZERO-FILLED (CopyPrimary fallback)")
+                return t
+
+        # ABSOLUTE LAST RESORT: Should never happen
+        if self.stats:
+            self.stats.skipped += 1
+        print(f"[CRITICAL] {self.key} ← SKIPPED in CopyPrimary (impossible state)")
+        return torch.tensor([], dtype=cmn.get_dtype(), device=cmn.get_device())
 
 class LoadTensor(Operation):
     def __init__(self, key, checkpoint_name):
@@ -174,7 +233,6 @@ class MultiplyTensors(Operation):
     @multi_cache_operation
     def oper(self, a, b):
         return _safe_binary_op("MulT", a, b, lambda x, y: x * y)
-
 
 class Extract(Operation):
     def __init__(self, key, alpha, beta, gamma, *args):
@@ -875,7 +933,7 @@ class SmartResize(Operation):
                 return t  # insane size, skip
 
             # Memory-safe path: large first dim = likely token embedding (49408, 768) → (49408, 1280)
-            if target[0] > 10000:  # vocab-sized first dim
+            if target[0] > 20000:  # vocab-sized first dim
                 new_t = torch.zeros(target, device=device, dtype=dtype)
                 min_rows = min(t.shape[0], target[0])
                 for i in range(min_rows):

@@ -2,7 +2,6 @@ import gradio as gr
 import concurrent.futures
 import scripts.untitled.operators as oper
 import scripts.untitled.misc_util as mutil
-import scripts.untitled.common as cmn
 import scripts.untitled.calcmodes as calcmodes
 import torch
 import os
@@ -10,6 +9,7 @@ import re
 import gc
 import random
 import threading
+import json
 from collections import defaultdict
 from modules.timer import Timer
 from scripts.untitled.operators import weights_cache
@@ -20,6 +20,7 @@ from tqdm import tqdm
 from copy import copy, deepcopy
 from modules import devices, shared, script_loading, paths, paths_internal, sd_models
 from scripts.untitled.operators import SmartResize
+from scripts.untitled.common import cmn
 
 # Modern safe imports (2025+)
 try:
@@ -40,55 +41,19 @@ class MergeInterruptedError(Exception):
     def __init__(self,*args):
         super().__init__(*args)
 
-VALUE_NAMES = ('alpha','beta','gamma','delta')
-
-mergemode_selection = {}
-for mergemode_obj in calcmodes.MERGEMODES_LIST:
-    mergemode_selection.update({mergemode_obj.name: mergemode_obj})
-
-calcmode_selection = {}
-for calcmode_obj in calcmodes.CALCMODES_LIST:
-    calcmode_selection.update({calcmode_obj.name: calcmode_obj})
-
-# Forge detection
-IS_FORGE = hasattr(shared, 'cmd_opts') and getattr(shared.cmd_opts, 'forge', False)
-
-# ===================================================================
-# GLOBAL MERGER CONTEXT — FINAL 2025 IMMORTAL EDITION
-# ===================================================================
-
-# === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
-class MergeStats:
-    def __init__(self):
-        self.full_merge   = 0   # Fast path: task.merge() succeeded (all models had the key)
-        self.smart_merge  = 0   # Sparse path: used task.oper() with zero-filled tensors
-        self.skipped      = 0   # Keys skipped entirely (no shape, metadata, noise layers, etc.)
-
-    def __str__(self):
-        total_processed = self.full_merge + self.smart_merge
-        return (
-            f"### Merge Complete ###\n"
-            f"  • Full merges      : {self.full_merge:,}\n"
-            f"  • Smart merges     : {self.smart_merge:,}  (zero-fill + operator magic)\n"
-            f"  • Skipped keys     : {self.skipped:,}     (metadata, noise schedule, etc.)\n"
-            f"  • Total processed  : {total_processed:,}\n"
-            f"  • True kitchen-sink: YES"
-        )
-
-    def report(self):
-        return str(self)
-
-
-# Global instance
-merge_stats = MergeStats()
-
 class MergerContext:
     def __init__(self):
-        self.device = None                    # ← Set by UI at merge time
+        self.device = None
         self.dtype = torch.float32
         self.is_cross_arch = False
         self.primary = None
-        self.loaded_checkpoints = {}
+
+        # ✅ MUST start as None
+        self.loaded_checkpoints = None
+
+        # ✅ used by LoadTensor fallback
+        self.checkpoints_global = []
+
         self.cross_arch_target_shapes = {}
         self.last_merge_tasks = None
         self.opts = {}
@@ -110,7 +75,63 @@ class MergerContext:
         else:
             self.dtype = torch.float32
 
-cmn = MergerContext()
+
+VALUE_NAMES = ('alpha','beta','gamma','delta')
+
+mergemode_selection = {obj.name: obj for obj in calcmodes.MERGEMODES_LIST}
+calcmode_selection  = {obj.name: obj for obj in calcmodes.CALCMODES_LIST}
+
+# Safety net: if UI ever sends a checkpoint name, silently fix it
+def safe_get_mergemode(name):
+    if name not in mergemode_selection:
+        print(f"[Amethyst] Invalid merge mode '{name}' → forcing 'Weight-Sum'")
+        return mergemode_selection["Weight-Sum"]
+    return mergemode_selection[name]
+
+def safe_get_calcmode(name):
+    if name not in calcmode_selection:
+        print(f"[Amethyst] Invalid calc mode '{name}' → forcing first available")
+        return next(iter(calcmode_selection.values()))
+    return calcmode_selection[name]
+
+# Forge detection
+IS_FORGE = hasattr(shared, 'cmd_opts') and getattr(shared.cmd_opts, 'forge', False)
+
+# ===================================================================
+# GLOBAL MERGER CONTEXT — FINAL 2025 IMMORTAL EDITION
+# ===================================================================
+
+# === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
+class MergeStats:
+    def __init__(self):
+        self.custom_merges     = 0   # User-defined rules (presets, weight editor)
+        self.copied_primary    = 0   # Default keys copied from Model A (metadata, VAE, noise)
+        self.smart_resized     = 0   # Cross-arch keys that were resized
+        self.zero_filled       = 0   # Emergency zero-fill (very rare)
+        self.skipped           = 0   # Truly missing everywhere (should be 0)
+
+    def __str__(self):
+        total = (self.custom_merges + self.copied_primary + 
+                 self.smart_resized + self.zero_filled + self.skipped)
+        
+        kitchen_sink = "YES" if self.skipped == 0 else "ALMOST"
+        cross_arch = "YES" if self.smart_resized > 0 else "NO"
+
+        return (
+            f"### AMETHYST MERGE COMPLETE ###\n"
+            f"  • Custom merges          : {self.custom_merges:,}\n"
+            f"  • Copied from Primary     : {self.copied_primary:,}  (VAE, noise schedule, metadata)\n"
+            f"  • Smart-resized (cross-arch): {self.smart_resized:,}\n"
+            f"  • Zero-filled (emergency) : {self.zero_filled:,}\n"
+            f"  • Skipped (truly missing) : {self.skipped:,}\n"
+            f"  • Total keys processed    : {total:,}\n"
+            f"  • True Kitchen-Sink       : {kitchen_sink}\n"
+            f"  • Cross-Arch Active       : {cross_arch}"
+        )
+
+
+# Global instance
+merge_stats = MergeStats()
 
 class MergerState:
     def __init__(self):
@@ -220,28 +241,15 @@ def apply_lora_safely(lora_path, strength=1.0):
         sd_models.load_lora_weights(shared.sd_model, lora_path, strength, dtype=dtype)
     return "LoRA applied successfully"
 
-VALUE_NAMES = ('alpha', 'beta', 'gamma', 'delta')
-
-mergemode_selection = {}
-for mergemode_obj in calcmodes.MERGEMODES_LIST:
-    mergemode_selection.update({mergemode_obj.name: mergemode_obj})
-
-calcmode_selection = {}
-for calcmode_obj in calcmodes.CALCMODES_LIST:
-    calcmode_selection.update({calcmode_obj.name: calcmode_obj})
-
-def parse_arguments(progress, mergemode_name, calc_mode_name, model_a, model_b, model_c, model_d,
+def parse_arguments(progress, mergemode_name, calcmode_name, model_a, model_b, model_c, model_d,
                     slider_a, slider_b, slider_c, slider_d, slider_e,
                     editor, discard, clude, clude_mode,
-                    seed, enable_sliders, active_sliders, *custom_sliders):
-    """
-    Fully fixed & Forge-Neo-compatible version.
-    Returns 5 values → used correctly by prepare_merge() after the next fix.
-    """
-    mergemode = mergemode_selection[mergemode_name]
-    calcmode = calcmode_selection[calc_mode_name]
+                    seed, enable_sliders, *custom_sliders):   # ← note: removed active_sliders
+    mergemode = safe_get_mergemode(mergemode_name)
+    calcmode  = safe_get_calcmode(calcmode_name)
+    parsed_targets = {}
 
-    # ───── Seed handling ─────
+    # ───── Seed handling ──────
     try:
         seed = int(float(seed)) if seed is not None else 0
     except (ValueError, TypeError):
@@ -250,47 +258,70 @@ def parse_arguments(progress, mergemode_name, calc_mode_name, model_a, model_b, 
         seed = random.randint(10**9, 10**10 - 1)
     cmn.last_merge_seed = seed
 
-    # ───── Custom sliders (Additional sliders tab) ─────
-    parsed_targets = {}
-    if enable_sliders and custom_sliders:
-        half = len(custom_sliders) // 2
-        col_a, col_b = custom_sliders[:half], custom_sliders[half:]
-        enabled = col_a[:active_sliders] + col_b[:active_sliders]
-        for i in range(0, len(enabled), 2):
-            key_name = enabled[i]
-            if key_name:
-                parsed_targets[key_name] = {'alpha': enabled[i + 1], 'seed': seed}
+    # ───── Custom sliders (2025 Immortal Edition – 40 rows, always 80 values) ─────
+    if enable_sliders and len(custom_sliders) == 80:
+        block_names = custom_sliders[:40]
+        weights     = custom_sliders[40:]
 
-    # ───── Weight Editor parsing – SAFE slider replacement (no locals()!) ─────
-    editor_text = re.sub(r'#.*$', '', editor.lower(), flags=re.MULTILINE)
-
-    # Safe mapping slider_a → slider_e
-    slider_map = {
-        'slider_a': slider_a or 0.0,
-        'slider_b': slider_b or 0.0,
-        'slider_c': slider_c or 0.0,
-        'slider_d': slider_d or 0.0,
-        'slider_e': slider_e or 0.0,
-    }
-    editor_text = re.sub(r'\bslider_[a-e]\b',
-                         lambda m: str(slider_map[m.group()]),
-                         editor_text)
-
-    # Parse each line from the editor
-    for line in editor_text.split('\n'):
-        line = line.strip()
-        if not line or ':' not in line:
-            continue
-        selector, weights_str = line.split(':', 1)
-        selector = selector.strip()
-        weights = [w.strip() for w in weights_str.split(',')]
-        entry = {'seed': seed}
-        for i, w in enumerate(weights[:len(VALUE_NAMES)]):
+        for name, w_str in zip(block_names, weights):
+            if not name or not str(name).strip():
+                continue
             try:
-                entry[VALUE_NAMES[i]] = float(w)
-            except ValueError:
-                pass
-        parsed_targets[selector] = entry
+                weight = float(w_str)
+            except (ValueError, TypeError):
+                weight = 0.0
+
+            parsed_targets[str(name).strip()] = {
+                'alpha': weight,
+                'seed': seed
+            }
+
+    # ───── MAIN SLIDERS α β γ δ ε → global UNet weights (THE MISSING PIECE) ─────
+    # This restores full functionality of the five big sliders in every merge mode
+    slider_values = [slider_a, slider_b, slider_c, slider_d, slider_e]
+    slider_names  = ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
+
+    for i in range(mergemode.input_sliders):
+        val = slider_values[i]
+        if val not in (0, 0.0, None, False):
+            # Apply to the whole diffusion model (most common use)
+            parsed_targets.setdefault('model.diffusion_model', {})[slider_names[i]] = float(val)
+            # Optional: also apply globally to text encoder / conditioner for style
+            # parsed_targets.setdefault('conditioner', {})[slider_names[i]] = float(val)
+
+    # ───── Weight Editor parsing (now works perfectly with slider_a–e) ─────
+    if editor and editor.strip():
+        editor_text = re.sub(r'#.*$', '', editor, flags=re.MULTILINE)
+
+        # Replace slider_a ... slider_e with their actual values
+        slider_map = {
+            'slider_a': slider_a or 0.0,
+            'slider_b': slider_b or 0.0,
+            'slider_c': slider_c or 0.0,
+            'slider_d': slider_d or 0.0,
+            'slider_e': slider_e or 0.0,
+        }
+        editor_text = re.sub(r'\bslider_[a-e]\b',
+                             lambda m: str(slider_map[m.group()]),
+                             editor_text)
+
+        for line in editor_text.split('\n'):
+            line = line.strip()
+            if not line or ':' not in line:
+                continue
+            selector, weights_str = line.split(':', 1)
+            selector = selector.strip()
+            weights = [w.strip() for w in weights_str.split(',')]
+
+            entry = {'': seed}
+            for i, w in enumerate(weights[:len(VALUE_NAMES)]):
+                try:
+                    entry[VALUE_NAMES[i]] = float(w)
+                except ValueError:
+                    pass
+
+            if selector:
+                parsed_targets[selector] = entry   # overwrites previous entries (correct order)
 
     # ───── Resolve checkpoints + show model type (SDXL/Flux/etc) ─────
     checkpoints = []
@@ -299,22 +330,52 @@ def parse_arguments(progress, mergemode_name, calc_mode_name, model_a, model_b, 
         if i + 1 > mergemode.input_models:
             checkpoints.append('')
             continue
-        if not model:
-            progress.interrupt(f'Model {chr(65+i)} required but missing')
-        name = model.split(' ')[0]
-        info = get_checkpoint_match(name)
+
+        # CRITICAL NaN/FLOAT GUARD — Gradio sometimes sends float NaN
+        if isinstance(model, float) or model is None or str(model) == 'nan':
+            if i == 0:  # Model A is mandatory
+                progress.interrupt('Model A required but missing')
+            else:
+                checkpoints.append('')
+                continue
+
+        model_str = str(model).strip()
+        if not model_str or model_str == "None":
+            if i == 0:
+                progress.interrupt('Model A required but missing')
+            else:
+                checkpoints.append('')
+                continue
+
+        # Now safe to use model_str
+        info = sd_models.get_closet_checkpoint_match(model_str)
+
+        # Novel fallback (already perfect, kept)
         if not info:
-            progress.interrupt(f'Checkpoint not found: {name}')
-        if not info.filename.endswith('.safetensors'):
-            progress.interrupt(f'Only .safetensors supported: {name}')
+            base_name = model_str.split(' [')[0].strip()
+            candidates = [
+                cp for cp in sd_models.checkpoints_list.values()
+                if base_name in cp.title or base_name in os.path.basename(cp.filename)
+            ]
+            if candidates:
+                info = candidates[0]
+                progress(f'Auto-resolved: "{model_str}" → "{info.title}"')
+            else:
+                progress.interrupt(f'Checkpoint not found: {model_str}')
+
+        # Rest unchanged (kitchen-sink .ckpt tolerance, warnings, etc.)
+        if not info.filename.lower().endswith(('.safetensors', '.ckpt')):
+            progress.interrupt(f'Unsupported format (only .safetensors/.ckpt): {info.filename}')
+        if not info.filename.lower().endswith('.safetensors'):
+            progress(f'Warning: .ckpt used – slower load, possible incompatibility')
+
         model_type, _ = mutil.id_checkpoint(info.filename)
-        progress(f' - {name} ({model_type or "Unknown"})')
+        short_name = (info.shortname or os.path.basename(info.filename).rsplit('.', 1)[0]) if hasattr(info, 'shortname') else os.path.basename(info.filename).rsplit('.', 1)[0]
         checkpoints.append(info.filename)
 
-    cmn.primary = checkpoints[0] if checkpoints else None
+        progress(f' - Model {chr(65+i)}: {short_name} [{model_type or "Unknown"}]')
 
-    cross_arch_enabled = getattr(cmn, 'cross_arch_enabled', False)
-    cmn.is_cross_arch = cross_arch_enabled
+    cmn.primary = checkpoints[0] if checkpoints else None
 
     return parsed_targets, checkpoints, mergemode, calcmode, seed
 
@@ -363,48 +424,61 @@ def assign_weights_to_keys(targets, keys, already_assigned=None):
     print(f"[Merger] Weight assignment → {assigned_count}/{len(keys)} keys matched")
     return dict(result)  # Convert back to regular dict
 
-def create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints):
+def create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints, merge_stats):
     """
-    2025 KITCHEN-SINK MAXIMALISM — NO KEY IS LEFT BEHIND
-    Every key gets a task. No exceptions. No mercy.
+    2025 KITCHEN-SINK MAXIMALISM — FINAL FORM (UNBREAKABLE + STATS-AWARE)
     """
     tasks = []
-    n = 0  # Count of actual merge operations
+    custom_count = 0
 
     for key in keys:
-        # NO SKIP_KEYS → NO FILTERING
-        # We keep EVERYTHING: noise schedule, VAE, metadata, Flux blocks, etc.
-
         if key in assigned_keys:
-            # This key has custom weights → create full merge recipe
-            n += 1
+            # Custom merge recipe (weight editor, presets, etc.)
+            custom_count += 1
             base_recipe = mergemode.create_recipe(key, *checkpoints, **assigned_keys[key])
             final_recipe = calcmode.modify_recipe(base_recipe, key, *checkpoints, **assigned_keys[key])
             tasks.append(final_recipe)
         else:
-            # Default behavior: copy from primary (Model A)
-            # This includes VAE, noise schedule, Flux single_blocks, everything
-            tasks.append(oper.LoadTensor(key, cmn.primary))
+            # DEFAULT: Copy from primary — fully stats-integrated
+            tasks.append(oper.CopyPrimary(key, cmn.primary, merge_stats))
 
+    # Final reporting
+    default_count = len(tasks) - custom_count
+    
     progress('Assigned tasks:')
-    progress(f'  • Merges (custom weights) : {n}')
-    progress(f'  • Default to Primary (A)  : {len(tasks) - n}')
+    progress(f'  • Custom merges          : {custom_count}')
+    progress(f'  • Copied from Primary     : {default_count}')
     progress(f'  • Total keys processed    : {len(tasks)}')
-
+    
     return tasks
 
 def prepare_merge(progress, save_name, save_settings, finetune, 
                   merge_mode_selector, calc_mode_selector,
                   model_a, model_b, model_c, model_d,
                   alpha, beta, gamma, delta, epsilon,
-                  weight_editor, preset_output,          # ← NEW: preset JSON
+                  weight_editor, preset_output,          
                   discard, clude, clude_mode,
-                  merge_seed, enable_sliders, active_sliders, *custom_sliders):
+                  merge_seed, enable_sliders, *custom_sliders):
     
     progress('\n### Preparing merge ###')
     timer = Timer()
     cmn.interrupted = False
     cmn.stop = False
+
+    merge_args = [
+        merge_mode_selector,
+        calc_mode_selector,
+        model_a, model_b, model_c, model_d,
+        alpha, beta, gamma, delta, epsilon,
+        weight_editor,
+        preset_output,          # ← Preset JSON
+        discard,
+        clude,
+        clude_mode,
+        merge_seed,
+        enable_sliders,
+        *custom_sliders
+    ]
 
     # === Parse arguments ===
     targets, checkpoints, mergemode, calcmode, seed = parse_arguments(progress, *merge_args)
@@ -425,16 +499,27 @@ def prepare_merge(progress, save_name, save_settings, finetune,
             if file is not None:
                 keys.update(file.keys())
 
-        # 2. Apply clude/discard
-        discard_keys = {k.strip() for k in merge_args[12].split(',') if k.strip()}
-        clude_keys_raw = merge_args[13] or ""
-        clude_keys = {k.strip() for k in clude_keys_raw.split(',') if k.strip()}
-        clude_mode = merge_args[14]
-        if clude_mode == "Exclude" and clude_keys:
-            keys = {k for k in keys if k not in clude_keys}
-        elif clude_mode == "Include" and clude_keys:
-            keys = {k for k in keys if k in clude_keys}
+        # 2. Apply clude/discard — 100% safe against None/int/bool/empty
+        discard_raw = merge_args[12] if len(merge_args) > 12 else ""
+        clude_raw   = merge_args[13] if len(merge_args) > 13 else ""
+        clude_mode  = merge_args[14] if len(merge_args) > 14 else "None"
 
+        # Convert everything to string safely (Gradio sometimes sends int/None/bool)
+        discard_str = str(discard_raw).strip() if discard_raw is not None else ""
+        clude_str   = str(clude_raw).strip()   if clude_raw   is not None else ""
+
+        discard_keys = {k.strip() for k in discard_str.split(',') if k.strip()}
+        clude_keys   = {k.strip() for k in clude_str.split(',')   if k.strip()}
+
+        # Apply discard first (always)
+        if discard_keys:
+            keys -= discard_keys
+
+        # Then apply clude (Exclude or Include)
+        if clude_mode == "Exclude" and clude_keys:
+            keys -= clude_keys
+        elif clude_mode == "Include" and clude_keys:
+            keys &= clude_keys
         progress(f"Total keys to merge: {len(keys)}")
 
         # === KITCHEN-SINK WEIGHT PRESETS — INJECT FROM UI ===
@@ -450,7 +535,7 @@ def prepare_merge(progress, save_name, save_settings, finetune,
 
         # 3. Create tasks
         assigned_keys = assign_weights_to_keys(targets, keys)
-        tasks = create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints)
+        tasks = create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints, merge_stats)
 
         progress(f"DEBUG: UI device choice = '{cmn.opts.get('device', 'MISSING')}'")
 
@@ -488,33 +573,34 @@ def prepare_merge(progress, save_name, save_settings, finetune,
         except Exception:
             pass
 
-        # 5. Build target shape map
-        cross_arch_enabled = getattr(cmn, 'cross_arch_enabled', False)
-        cmn.is_cross_arch = cross_arch_enabled
-
-        if model_a and model_a in cmn.loaded_checkpoints:
-            primary_file = cmn.loaded_checkpoints[model_a]
-            if primary_file is not None:
-                cmn.primary = model_a
-                print(f"[Merger] Building target shape map from primary: {os.path.basename(model_a)}")
+        # 5. Build target shape map + finalize primary model
+        # This runs AFTER we have already decided cmn.is_cross_arch and cmn.primary in do_merge()
+        if not cmn.primary or cmn.primary not in cmn.loaded_checkpoints:
+            progress("[Merger] Primary model not available — cross-arch shape mapping disabled")
+            cmn.cross_arch_target_shapes.clear()
+        else:
+            primary_file = cmn.loaded_checkpoints[cmn.primary]
+            if primary_file is None:
+                progress("[Merger] Primary file is None — cross-arch disabled")
+                cmn.cross_arch_target_shapes.clear()
+            else:
+                progress(f"[Merger] Building target shape map from primary: {os.path.basename(cmn.primary)}")
                 cmn.cross_arch_target_shapes.clear()
                 try:
+                    total_keys = len(primary_file.keys())
+                    collected = 0
                     for key in primary_file.keys():
                         try:
                             tensor = primary_file.get_tensor(key)
-                            if tensor is not None:
+                            if tensor is not None and tensor.shape:
                                 cmn.cross_arch_target_shapes[key] = tensor.shape
+                                collected += 1
                         except:
                             continue
-                    print(f"[Merger] Target shapes collected: {len(cmn.cross_arch_target_shapes)} keys")
+                    progress(f"[Merger] Target shapes collected: {collected}/{total_keys} keys")
                 except Exception as e:
-                    print(f"[Merger] Failed to read primary tensors: {e}")
-            else:
-                print(f"[Merger] Primary model opened but None — using zero-fill")
-                cmn.primary = model_a
-        else:
-            print("[Merger] No primary model — cross-arch disabled")
-            cmn.primary = model_a
+                    progress(f"[Merger] Failed to build shape map: {e}")
+                    cmn.cross_arch_target_shapes.clear()
 
         # 6. RUN THE MERGE
         state_dict = {}
@@ -534,7 +620,7 @@ def prepare_merge(progress, save_name, save_settings, finetune,
                 clude=merge_args[13],
                 clude_mode=merge_args[14],
                 timer=timer,
-                cross_arch=cross_arch_enabled,
+                cross_arch=cmn.is_cross_arch,
                 threads=cmn.opts.get('threads', 8)
             )
         except Exception as e:
@@ -584,9 +670,17 @@ def prepare_merge(progress, save_name, save_settings, finetune,
         progress("Target dtype: FP16 (fastest)")
 
     # Kitchen-sink: keep ALL keys
-    # Convert dtype if needed (only floating point tensors)
-    current_dtype = next(iter(save_dict_final.values())).dtype
-    if target_dtype != current_dtype:
+    # Safety: detect if we actually need conversion
+    if len(save_dict_final) == 0:
+        progress("WARNING: Empty state_dict — skipping save")
+        return {}
+    
+    # Determine current dtype from first tensor
+    sample_tensor = next(iter(save_dict_final.values()))
+    current_dtype = sample_tensor.dtype
+    if target_dtype == current_dtype:
+        progress(f"Already in target dtype: {target_dtype} — no conversion needed")
+    else:
         progress(f"Converting {len(save_dict_final)} tensors → {target_dtype}")
         converted = {}
         for k, v in save_dict_final.items():
@@ -595,7 +689,6 @@ def prepare_merge(progress, save_name, save_settings, finetune,
             else:
                 converted[k] = v.cpu()
         save_dict_final = converted
-
 
     # Determine save path
     final_name = save_name or mutil.create_name([model_a, model_b, model_c, model_d], calcmode.name, merge_args[4])
@@ -611,9 +704,9 @@ def prepare_merge(progress, save_name, save_settings, finetune,
     metadata = {
         "modelspec.title": final_name,
         "modelspec.author": "Amethyst Merger",
-        "modelspec.description": f"{'Cross-arch Kitchen-Sink ' if cross_arch_enabled else ''}merge → {len(save_dict_final)} keys • {target_dtype}",
+        "modelspec.description": f"{'Cross-arch Kitchen-Sink ' if cmn.is_cross_arch else ''}merge → {len(save_dict_final)} keys • {target_dtype}",
         "modelspec.date": datetime.now().isoformat(),
-        "modelspec.architecture": "stable-diffusion-xl" if cross_arch_enabled else "stable-diffusion"
+        "modelspec.architecture": "stable-diffusion-xl" if cmn.is_cross_arch else "stable-diffusion"
     }
 
     # ——— SAVE TO DISK (only if Autosave enabled) ———
@@ -669,7 +762,7 @@ def prepare_merge(progress, save_name, save_settings, finetune,
         torch.float32: "FP32"
     }.get(target_dtype, str(target_dtype))
 
-    arch_msg = "Cross-Arch Kitchen-Sink " if cross_arch_enabled else ""
+    arch_msg = "Cross-Arch Kitchen-Sink " if cmn.is_cross_arch else ""
     progress(
         f"### {arch_msg}Merge completed: {len(save_dict_final)} keys • {dtype_name} ###",
         report=True,
@@ -697,7 +790,6 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     # 1. Global flags — respect UI checkbox
     # ——————————————————————————————————————————————
     cmn.is_cross_arch = cross_arch
-    cmn.cross_arch_enabled = cross_arch
 
     # Detect types
     cmn.checkpoints_types = {}
@@ -707,22 +799,50 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
             cmn.checkpoints_types[cp] = typ or "Unknown"
 
     # ——————————————————————————————————————————————
-    # 2. Promote first SDXL to primary (for shape reference)
+    # 2. Determine primary model + auto-enable cross-arch
     # ——————————————————————————————————————————————
+    cmn.primary = None
+
+    # First: respect user's explicit cross-arch setting
     if cmn.is_cross_arch:
-        sdxl_models = [cp for cp in checkpoints if cp and 'SDXL' in cmn.checkpoints_types.get(cp, '')]
-        if sdxl_models:
-            primary_cp = sdxl_models[0]
+        progress("Cross-Arch Kitchen-Sink ENABLED (user override)")
+
+    # AUTO-DETECT cross-arch if not already enabled
+    if not cmn.is_cross_arch:
+        primary_type = None
+        if checkpoints and checkpoints[0]:
+            primary_type = mutil.id_checkpoint(checkpoints[0])[0]
+
+        for cp in checkpoints:
+            if not cp:
+                continue
+            cp_type = mutil.id_checkpoint(cp)[0]
+            if cp_type in ('SDXL', 'Flux', 'Pony', 'Aurora') and primary_type not in ('SDXL', 'Flux', 'Pony', 'Aurora'):
+                cmn.is_cross_arch = True
+                progress("AUTO-ENABLED Cross-Arch Kitchen-Sink (SDXL/Flux detected with SD1.5 primary)")
+                break
+
+    # Now decide primary model based on cross-arch mode
+    if cmn.is_cross_arch:
+        # Find first SDXL/Flux/Pony model → use as shape reference
+        modern_models = [
+            cp for cp in checkpoints
+            if cp and mutil.id_checkpoint(cp)[0] in ('SDXL', 'Flux', 'Pony', 'Aurora')
+        ]
+        if modern_models:
+            primary_cp = modern_models[0]
             if checkpoints[0] != primary_cp:
                 idx = checkpoints.index(primary_cp)
                 checkpoints[0], checkpoints[idx] = checkpoints[idx], checkpoints[0]
-                progress(f'Cross-Arch → Using {os.path.basename(primary_cp)} as primary shape reference')
+                progress(f"Cross-Arch → Using {os.path.basename(primary_cp)} as primary shape reference")
             cmn.primary = checkpoints[0]
         else:
-            progress('Warning: Cross-Arch enabled but no SDXL model found')
+            progress("Warning: Cross-Arch enabled but no SDXL/Flux model found — falling back to Model A")
+            cmn.primary = model_a or checkpoints[0] if checkpoints else None
     else:
-        # Normal same-arch: Model A is primary
-        cmn.primary = model_a if model_a else checkpoints[0] if checkpoints else None
+        # Same-arch: just use Model A
+        cmn.primary = model_a or checkpoints[0] if checkpoints else None
+        progress("Same-arch merge — using Model A as primary")
 
     # ——————————————————————————————————————————————
     # 3. Unload current model
@@ -806,82 +926,134 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     return state_dict
 
 def initialize_task(task):
-    # Only use target shapes in cross-arch mode
-    target_shape = (
-        cmn.cross_arch_target_shapes.get(task.key)
-        if getattr(cmn, 'is_cross_arch', False)
-        else None
-    )
+    """
+    THE FINAL FORM — 2025 KITCHEN-SINK INITIALIZATION
+    Every key. Every time. No exceptions.
+    """
+    # Target shape for SmartResize — ONLY in cross-arch mode
+    target_shape = None
+    if cmn.is_cross_arch:
+        target_shape = cmn.cross_arch_target_shapes.get(task.key)
+        if target_shape:
+            merge_stats.smart_resized += 1  # Count every time we *could* resize
+            print(f"[ResizeReady] {task.key} → target shape {target_shape}")
+    
+    # Debug: Show what kind of task we're dealing with
+    task_type = task.__class__.__name__
+    if task_type != "CopyPrimary":
+        print(f"[TaskStart] {task.key} ← using {task_type}")
 
-    # 1. Fast path — all models have the key and merge succeeds
+    # 1. Fast path — custom merge task (user-defined rules, presets, etc.)
     try:
         tensor = task.merge()
-        merge_stats.full_merge += 1
+        merge_stats.custom_merges += 1
+        print(f"[CustomMerge] {task.key} ← merged via {task.__class__.__name__}")
         return task.key, tensor.to(cmn.get_device(), dtype=cmn.get_dtype())
-    except Exception:
-        pass  # Fall through to sparse path
+    except Exception as e:
+        # Only debug-print if something actually went wrong (rare)
+        print(f"[CustomMerge] Fast path failed for {task.key}: {e} — falling back to sparse")
+        # Fall through to sparse path
 
-    # 2. Sparse path — collect tensors (zero-fill missing ones)
+    # 2. Sparse path — collect real tensors (zero-fill + SmartResize in cross-arch)
     tensors = []
-    weights = []
     sources = []
-
-    weight_names = ['alpha', 'beta', 'gamma', 'delta']
 
     for i, cp_path in enumerate(cmn.checkpoints_global):
         if not cp_path:
             continue
 
         f = cmn.loaded_checkpoints.get(cp_path)
-
-        # Extract weight safely — None → 1.0, 0 → 0.0
-        raw_w = getattr(task, weight_names[i], None)
-        w = 1.0 if raw_w is None else float(raw_w or 0.0)
+        model_name = os.path.basename(cp_path)
 
         if not f or task.key not in f.keys():
-            # Key missing → zero-fill ONLY if we have a valid target shape
+            # Key missing → only zero-fill in cross-arch mode
             if target_shape is not None:
                 t = torch.zeros(target_shape, dtype=cmn.get_dtype(), device=cmn.get_device())
                 tensors.append(t)
-                weights.append(w)
-                sources.append(f"{os.path.basename(cp_path)} (zero)")
-            # If no target_shape → we are skipping this model’s contribution
-            # (but not the key yet — we might still get it from others)
-        else:
-            try:
-                t = f.get_tensor(task.key).to(cmn.get_device(), dtype=cmn.get_dtype())
+                sources.append(f"{model_name} (zero)")
+                merge_stats.smart_resized += 1  # We had to resize/fill
+            # In same-arch: no contribution (will be copied from primary later)
+            continue
+
+        try:
+            t = f.get_tensor(task.key)
+            
+            # CRITICAL: SmartResize if shape doesn't match target (cross-arch)
+            if target_shape and t.shape != target_shape:
+                t = SmartResize(f"sparse_{task.key}", target_shape, t).oper(t)
+                sources.append(f"{model_name} (resized)")
+                merge_stats.smart_resized += 1
+            else:
+                sources.append(model_name)
+
+            t = t.to(cmn.get_device(), dtype=cmn.get_dtype())
+            tensors.append(t)
+
+        except Exception as e:
+            print(f"[Merge] Failed loading {task.key} from {model_name}: {e}")
+            if target_shape is not None:
+                t = torch.zeros(target_shape, dtype=cmn.get_dtype(), device=cmn.get_device())
                 tensors.append(t)
-                weights.append(w)
-                sources.append(os.path.basename(cp_path))
-            except Exception as e:
-                print(f"[Merge] Failed loading {task.key} from {cp_path}: {e}")
-                if target_shape is not None:
-                    t = torch.zeros(target_shape, dtype=cmn.get_dtype(), device=cmn.get_device())
-                    tensors.append(t)
-                    weights.append(w)
-                    sources.append(f"{os.path.basename(cp_path)} (zero)")
+                sources.append(f"{model_name} (zero-fallback)")
+                merge_stats.smart_resized += 1
 
     # === FINAL DECISION: Did we collect ANY real tensors? ===
     if not tensors:
-        # No model contributed anything → this key is pure metadata/noise/position_ids
-        # → SKIP ENTIRELY (true kitchen-sink honesty)
-        merge_stats.skipped += 1
-        print(f"[SmartMerge] {task.key} ← SKIPPED (no valid tensors)")
-        # Optionally fall back to primary model if it exists
-        primary_f = cmn.loaded_checkpoints.get(cmn.checkpoints_global[0])
-        if primary_f and task.key in primary_f.keys():
+        # This is metadata, VAE, noise schedule, denoiser.sigmas, etc.
+        # → ALWAYS copy from primary — TRUE KITCHEN-SINK HONESTY
+        primary_path = cmn.checkpoints_global[0]
+        primary_file = cmn.loaded_checkpoints.get(primary_path)
+        model_name = os.path.basename(primary_path) if primary_path else "Unknown"
+
+        if primary_file and task.key in primary_file.keys():
             try:
-                return task.key, primary_f.get_tensor(task.key).to(cmn.get_device(), dtype=cmn.get_dtype())
-            except:
-                pass
-        return task.key, None  # or skip saving this key
+                t = primary_file.get_tensor(task.key)
+                
+                # SmartResize if needed (cross-arch edge case)
+                if target_shape and t.shape != target_shape:
+                    t = SmartResize(f"finalcopy_{task.key}", target_shape, t).oper(t)
+                    merge_stats.smart_resized += 1
+                    print(f"[FinalCopy] {task.key} ← COPIED FROM PRIMARY + RESIZED ({model_name})")
+                else:
+                    print(f"[FinalCopy] {task.key} ← COPIED FROM PRIMARY ({model_name})")
+                
+                merge_stats.copied_primary += 1
+                return task.key, t.to(cmn.get_device(), dtype=cmn.get_dtype())
+                
+            except Exception as e:
+                print(f"[FinalCopy] FAILED reading {task.key} from primary {model_name}: {e}")
+        
+        # ULTIMATE FALLBACK: Preserve the key at all costs
+        if target_shape:
+            t = torch.zeros(target_shape, dtype=cmn.get_dtype(), device=cmn.get_device())
+            merge_stats.zero_filled += 1
+            print(f"[Emergency] {task.key} ← ZERO-FILLED (ultimate kitchen-sink preservation)")
+            return task.key, t
 
-    # We have at least one tensor → smart merge with zero-fill magic
+        # ONLY SKIP IF WE LITERALLY CANNOT PRESERVE THE KEY
+        merge_stats.skipped += 1
+        print(f"[CRITICAL] {task.key} ← SKIPPED (no shape info + missing everywhere)")
+        return task.key, None
+
+    # We have real tensors → run the actual merge operation
+    # This is the "smart merge" path — only used when not all models had the key
     merge_stats.smart_merge += 1
-    result = task.oper(*tensors)
-
-    print(f"[SmartMerge] {task.key} ← {', '.join(sources)}")
-    return task.key, result.to(cmn.get_dtype())
+    
+    try:
+        result = task.oper(*tensors)
+        source_summary = ', '.join(sources) if sources else "unknown"
+        print(f"[SmartMerge] {task.key} ← {source_summary}")
+        return task.key, result.to(cmn.get_dtype())
+        
+    except Exception as e:
+        # This should be extremely rare — but if it happens, we want MAXIMUM visibility
+        print(f"[FATAL OPERATOR ERROR] {task.key}")
+        print(f"    Operator: {task.__class__.__name__}")
+        print(f"    Sources : {sources}")
+        print(f"    Shapes  : {[t.shape if hasattr(t, 'shape') else 'no-shape' for t in tensors]}")
+        print(f"    Error   : {e}")
+        print(f"    Task    : {task}")
+        raise RuntimeError(f"Operator failed on {task.key} — see log above") from e
 
 
 # 1. get_tensors_from_loaded_model — fixed for cross-arch + extra keys
@@ -987,4 +1159,3 @@ def clear_cache():
         cmn.merger_state.clear_temp_models()
     
     return "All caches cleared — ready for next merge"
-

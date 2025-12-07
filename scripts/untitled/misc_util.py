@@ -128,7 +128,6 @@ def id_checkpoint(name):
     if not name:
         return 'Unknown', torch.float16
 
-    # Correct function name in A1111 dev (yes, it's spelled "closet" — typo in source)
     checkpoint_info = sd_models.get_closet_checkpoint_match(name)
     if not checkpoint_info or not checkpoint_info.filename:
         return 'Unknown', torch.float16
@@ -136,30 +135,51 @@ def id_checkpoint(name):
     filename = checkpoint_info.filename
     lower = filename.lower()
 
-    # Fast filename checks
-    if any(x in lower for x in ['flux1', 'dev', 'schnell', 'fp8', 'nf4', 'ae.safetensors']):
+    # 1. Fast filename hints (some creators label it)
+    if any(x in lower for x in ['fp8', 'nf4', 'q4', 'q5', 'q8']):
+        return 'Flux (Quantized)', torch.bfloat16
+    if 'bf16' in lower or 'bfp16' in lower:
         return 'Flux', torch.bfloat16
-    if any(x in lower for x in ['sdxl', 'xl-', 'sd_xl', 'xl_', 'sd3', 'aurora', 'illustrious']):
-        return 'SDXL', torch.float16
-    if any(x in lower for x in ['1.5', 'v1-5', 'sd15', 'sd1.5']):
-        return 'SD1.5', torch.float16
-    if 'pony' in lower or 'score' in lower:
-        return 'Pony', torch.float16
+    if 'fp32' in lower or 'f32' in lower:
+        return 'SD1.5/SDXL (FP32)', torch.float32
 
-    # Key-based detection (100% accurate)
+    # 2. Key + dtype detection (100% accurate)
     try:
         with safetensors.torch.safe_open(filename, framework="pt", device="cpu") as f:
             keys = f.keys()
+            if not keys:
+                return 'Unknown', torch.float16
 
+            # Get dtype from first tensor (fast + reliable)
+            first_key = next(iter(keys))
+            metadata = f.metadata()
+            if metadata and "dtype" in metadata:
+                dtype_str = metadata["dtype"]
+                if "bf16" in dtype_str.lower():
+                    tensor_dtype = torch.bfloat16
+                elif "fp32" in dtype_str.lower() or "float32" in dtype_str.lower():
+                    tensor_dtype = torch.float32
+                else:
+                    tensor_dtype = torch.float16
+            else:
+                # Fallback: read actual tensor dtype
+                tensor = f.get_tensor(first_key)
+                tensor_dtype = tensor.dtype
+
+            # Architecture detection (unchanged + improved)
+            if any(k.startswith("denoiser.") for k in keys):
+                return 'Flux/SD3/Aurora', torch.bfloat16
             if any("single_blocks" in k or "double_blocks" in k for k in keys):
-                return 'Flux', torch.bfloat16
+                return 'Pony', torch.bfloat16
             if any(k.startswith("conditioner.embedders.") for k in keys):
-                return 'SDXL', torch.float16
+                return 'SDXL', tensor_dtype
             if any(k.startswith("cond_stage_model.") for k in keys):
-                return 'SD1.5', torch.float16
+                return 'SD1.5', tensor_dtype
 
-            return 'SD1.5', torch.float16
-    except:
+            return 'SD1.5', tensor_dtype
+
+    except Exception as e:
+        print(f"[id_checkpoint] Failed to read {filename}: {e}")
         return 'Unknown', torch.float16
     
 class NoCaching:

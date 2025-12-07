@@ -5,6 +5,40 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from modules import shared
 
+class MergerContext:
+    def __init__(self):
+        self.device = None
+        self.dtype = torch.float32
+        self.is_cross_arch = False
+        self.primary = None
+
+        # ✅ MUST start as None
+        self.loaded_checkpoints = None
+
+        # ✅ used by LoadTensor fallback
+        self.checkpoints_global = []
+
+        self.cross_arch_target_shapes = {}
+        self.last_merge_tasks = None
+        self.opts = {}
+
+    def get_device(self):
+        return self.device
+
+    def get_dtype(self):
+        return self.dtype
+
+    def set_device(self, device_str: str):
+        self.device = torch.device(device_str if device_str != "cuda" else "cuda")
+
+    def set_dtype(self, dtype_str: str):
+        if dtype_str == "fp16":
+            self.dtype = torch.float16
+        elif dtype_str == "bf16":
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float32
+
 # =============================================================================
 # MERGE HISTORY — Elite, Safe, Cross-Platform (Forge Neo + A1111 dev)
 # =============================================================================
@@ -115,3 +149,5 @@ checkpoints_types: Dict[str, str] = {}  # Maps checkpoint path → type (SDXL, S
 
 # Initialize history (do this once in your extension's on_ui_tabs or script init)
 # merge_history = MergeHistory(merge_history_filename)
+
+cmn = MergerContext()
