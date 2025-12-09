@@ -662,15 +662,36 @@ def on_ui_tabs():
                             cross_arch_mode = gr.Checkbox(
                                 label="Enable Cross-Arch Merge (SD1.5 / Pony / Flux to SDXL)",
                                 value=False,
-                                info="Keeps every key from every model • Resizes intelligently • Produces ~7.4 GB superset models"
+                                info="Resizes intelligently"
+                            )
+                            keep_zero_fill = gr.Checkbox(
+                                label="Kitchen-Sink Mode (Preserve All Keys)",
+                                value=True,
+                                info="Zero-fill missing keys — true kitchen-sink for future merging"
+                            )
+                            bloat_mode = gr.Checkbox(
+                                label="Legacy Bloat Mode",
+                                value=False,
+                                info="Pad tensors for max file size (~7.5GB+) — like old mergers"
                             )
 
+                        # Cross-Arch handler
                         cross_arch_mode.change(
-                            fn=lambda x: (
-                                setattr(cmn, 'cross_arch_enabled', x),
-                                setattr(cmn, 'is_cross_arch', x)
-                            ),
+                            fn=lambda x: setattr(cmn, 'is_cross_arch', x),
                             inputs=cross_arch_mode,
+                            outputs=None
+                        )
+
+                        # Kitchen-Sink Mode (zero-fill) — save to options
+
+                        keep_zero_fill.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=keep_zero_fill,
+                            outputs=None
+                        )
+                        bloat_mode.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=bloat_mode,
                             outputs=None
                         )
 
@@ -891,6 +912,18 @@ def on_ui_tabs():
                             },
                             default=8192
                         )
+                        cmn.opts.create_option(
+                            'keep_zero_fill',
+                            gr.Checkbox,
+                            {"label": "Kitchen-Sink Mode (Preserve All Keys)"},
+                            True
+                        )
+                        cmn.opts.create_option(
+                            'bloat_mode',
+                            gr.Checkbox,
+                            {"label": "Legacy Bloat Mode (Max File Size)"},
+                            False
+                        )
 
                         def update_cache_size(value):
                             weights_cache.__init__(max(0, int(value)))
@@ -1002,7 +1035,7 @@ def on_ui_tabs():
                                             max_lines=4,
                                             label='Include/Exclude:',
                                             info="Entered targets will remain as model_a when set to 'Exclude', and will be the only ones to be merged if set to 'Include'. Separate with whitespace.",
-                                            value='clip',
+                                            value='',
                                             lines=4,
                                             scale=4
                                         )
@@ -1019,7 +1052,7 @@ def on_ui_tabs():
                                             max_lines=5,
                                             label='Discard:',
                                             info="Remove layers from final save (autosave only). Examples: 'model_ema', 'first_stage_model', or 'model_ema first_stage_model'. Leave empty to keep all layers.",
-                                            value='model_ema',
+                                            value='',
                                             lines=5,
                                             scale=1
                                         )
@@ -1030,8 +1063,8 @@ def on_ui_tabs():
                     weight_editor = gr.Textbox(
                         label="Weight Editor (JSON)",
                         lines=10,
-                        placeholder='Example: {"model.*": {"alpha": 0.8}}',
-                        value=""
+                        placeholder='.*:alpha,beta,gamma,delta,epsilon',
+                        value=".*:alpha,beta,gamma,delta,epsilon"
                     )
                     # Validation output
                     validation_output = gr.Textbox(
@@ -1048,7 +1081,7 @@ def on_ui_tabs():
                     # Validation on weight editor change
                     weight_editor.change(
                         fn=lambda we, ma, mb, mm: validate_merge_config(ma, mb, we, mm),
-                        inputs=[weight_editor, model_a, model_b, merge_mode_selector],
+                        inputs=[weight_editor, model_a, model_b, model_c, model_d, merge_mode_selector],
                         outputs=validation_output,
                         show_progress=False
                     )
@@ -1122,7 +1155,9 @@ def on_ui_tabs():
                             merge_seed,
                             enable_sliders,
                             slider_slider,         
-                            *custom_sliders
+                            *custom_sliders,
+                            keep_zero_fill,      # Kitchen-Sink Mode
+                            bloat_mode,          # Legacy Bloat Mode
                         ],
                         outputs=status
                     )
@@ -1145,7 +1180,7 @@ def on_ui_tabs():
                             preset_dropdown = gr.Dropdown(
                                 label="Weight Preset",
                                 choices=[
-                                    "Custom (Manual)",
+                                    "Global Sliders (Default)",
                                     "50/50 UNet + Keep CLIP",
                                     "UNet 50/50 + Noise Blend",
                                     "Keep CLIP/T5 + Full UNet Merge",
@@ -1153,7 +1188,7 @@ def on_ui_tabs():
                                     "Primary Dominance (A=1.0, Others=0.0)",
                                     "Secondary Dominance (B=1.0, Others=0.0)",
                                 ],
-                                value="Custom (Manual)",
+                                value="Global Sliders (Default)",
                                 info="Quick presets for true kitchen-sink merging"
                             )
                             apply_preset = gr.Button(value="Apply Preset", variant="primary")
@@ -1165,7 +1200,15 @@ def on_ui_tabs():
                         # ------------------------------------------------------------------
                         def apply_weight_preset(choice: str) -> str:
                             presets = {
-                                "Custom (Manual)": "{}",
+                                "Global Sliders (Default)": json.dumps({
+                                                        ".*": {
+                                        "alpha": "alpha",
+                                        "beta": "beta",
+                                       "gamma": "gamma",
+                                        "delta": "delta",
+                                        "epsilon": "epsilon"
+                                                           }
+                                }, indent=2),
 
                                 "50/50 UNet + Keep CLIP": json.dumps({
                                     "model.diffusion_model.*": {"alpha": 0.5, "beta": 0.5},
@@ -1214,7 +1257,7 @@ def on_ui_tabs():
                         fn=lambda: "Preset applied — click Merge",
                         outputs=validation_output
                         )
-
+        
             # ================================================
             # PREVIEW TAB — SuperMerger-style "Merge & Gen"
             # ================================================
@@ -1785,8 +1828,7 @@ SUMMARY
                 outputs=history_box,
                 show_progress=False
             )
-            
-    return [(cmn.blocks, "Untitled merger", "untitled_merger")]
+        return [(cmn.blocks, "Untitled merger", "untitled_merger")]
 
 # register the tab
 script_callbacks.on_ui_tabs(on_ui_tabs)
@@ -1800,10 +1842,13 @@ def start_merge(save_name, save_settings, finetune,
                 alpha, beta, gamma, delta, epsilon,
                 weight_editor, preset_output,          # ← Preset JSON
                 discard, clude, clude_mode,
-                merge_seed, enable_sliders, *custom_sliders):
+                merge_seed, enable_sliders, *custom_sliders,):
     
     progress = Progress()
     
+    keep_zero_fill = cmn.opts.get('keep_zero_fill', True)
+    bloat_mode = cmn.opts.get('bloat_mode', False)
+
     try:
         # ENHANCEMENT 2: Real-time ETA tracking
         progress.start_merge(1000)
@@ -1824,7 +1869,9 @@ def start_merge(save_name, save_settings, finetune,
             clude_mode,
             merge_seed,
             enable_sliders,         
-            *custom_sliders
+            *custom_sliders,
+            keep_zero_fill,
+            bloat_mode,
         ]
 
         # Main merge
@@ -1871,9 +1918,18 @@ def universal_model_reload():
 
 def test_regex(input):
     regex = misc_util.target_to_regex(input)
-    selected_keys = re.findall(regex,'\n'.join(model_a_keys),re.M)
+    
+    # Use ALL keys from every loaded checkpoint — TRUE kitchen-sink
+    all_keys = []
+    for f in cmn.loaded_checkpoints.values():
+        if f is not None:
+            all_keys.extend(f.keys())
+    
+    # Match against the full key set
+    selected_keys = [k for k in all_keys if re.match(regex, k)]
     joined = '\n'.join(selected_keys)
-    return  f'Matched keys: {len(selected_keys)}\n{joined}'
+    
+    return f'Matched keys: {len(selected_keys)}\n{joined}'
 
 def update_model_a_keys(model_a):
     global model_a_keys

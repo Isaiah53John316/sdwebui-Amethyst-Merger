@@ -2,8 +2,12 @@ import gradio as gr
 import re
 import os
 import shutil
+import torch
+import traceback
+import gc
 import json
 import warnings
+import time
 from collections import OrderedDict
 from modules.timer import Timer
 
@@ -335,12 +339,10 @@ def save_state_dict(state_dict, save_path=None, filename=None, settings="", time
         gr.Warning(f"Saved but failed to register: {e}")
         return None
 
-def load_merged_state_dict(state_dict, checkpoint_info):
+def load_merged_state_dict(state_dict, checkpoint_info=None):
     """
-    Load merged model — FULLY BACKWARDS COMPATIBLE.
-    Works perfectly on:
-      • Forge Neo (uses load_model_weights + state_dict arg)
-      • A1111 dev branch (uses load_model or load_model_weights)
+    Load merged model — revert to old, working method with Supermerger-style dummy.
+    Works on A1111 dev (2023–2025) + reForge. No disk, no hash, no metadata.
     """
     if not state_dict:
         gr.Warning("Nothing to load — state_dict is empty")
@@ -349,78 +351,52 @@ def load_merged_state_dict(state_dict, checkpoint_info):
     print(f"[Merger] Converting {len(state_dict)} tensors to float16...")
     state_dict = {k: v.half() for k, v in state_dict.items()}
 
-    # ———————————————————————
-    # 1. A1111 dev fast reuse path (unchanged — perfect)
-    # ———————————————————————
+    if checkpoint_info is None:
+        checkpoint_info = sd_models.CheckpointInfo("merged_in_memory")
+        checkpoint_info.filename = "merged_in_memory"
+        checkpoint_info.name = "merged_in_memory"
+        checkpoint_info.title = "Merged In-Memory"
+        checkpoint_info.hash = None
+        checkpoint_info.sha256 = None
+        checkpoint_info.shorthash = None
+        checkpoint_info.metadata = {}
+        checkpoint_info.registered = True
+
+    # Unload current model (Supermerger-style — full clean)
+    if shared.sd_model is not None:
+        print("[Merger] Unloading current model...")
+        sd_models.unload_model_weights(shared.sd_model)
+        shared.sd_model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    # Load using old, working method (Supermerger + your original)
+    print("[Merger] Loading merged model (in-memory)")
     try:
-        if (hasattr(sd_models, 'load_model_weights') and
-            hasattr(shared, 'sd_model') and shared.sd_model is not None and
-            hasattr(shared.sd_model, 'used_config') and shared.sd_model.used_config):
-
-            config = None
-            try:
-                if hasattr(sd_models_config, 'find_checkpoint_config'):
-                    config = sd_models_config.find_checkpoint_config(state_dict, checkpoint_info)
-            except:
-                pass
-
-            if config and shared.sd_model.used_config == config:
-                print("[Merger] Reusing already loaded model (A1111 dev fast path)")
-                from modules.timer import Timer
-                load_timer = Timer()
-                sd_models.load_model_weights(
-                    shared.sd_model,
-                    checkpoint_info,
-                    state_dict,
-                    load_timer
-                )
-                print(f"[Merger] Weights loaded in: {load_timer.summary()}")
-
-                # Re-apply hijacks and callbacks
-                sd_hijack.model_hijack.hijack(shared.sd_model)
-                script_callbacks.model_loaded_callback(shared.sd_model)
-                sd_models.model_data.set_sd_model(shared.sd_model)
-                sd_unet.apply_unet("upcast")
-                print("[Merger] Model successfully reused!")
-                return
+        sd_models.load_model(
+            checkpoint_info=checkpoint_info,
+            already_loaded_state_dict=state_dict  # Direct state_dict — no disk
+        )
+        print("[Merger] Model loaded via load_model (in-memory)")
     except Exception as e:
-        print(f"[Merger] Fast reuse failed (normal on Forge): {e}")
-
-    # ———————————————————————
-    # 2. UNIVERSAL FALLBACK — works on BOTH Forge Neo AND A1111 dev
-    # ———————————————————————
-    print("[Merger] Loading model normally (Forge Neo + A1111 dev compatible path)")
-
-    try:
-        # Try the NEW Forge Neo way first
-        if hasattr(sd_models, 'load_model_weights'):
-            try:
-                sd_models.load_model_weights(
-                    checkpoint_info=checkpoint_info,
-                    already_loaded_state_dict=state_dict
-                )
-                print("[Merger] Model loaded via load_model_weights (Forge Neo path)")
-                return
-            except TypeError:
-                # Older Forge or A1111 dev — fall back to positional args
-                sd_models.load_model_weights(checkpoint_info, state_dict)
-                print("[Merger] Model loaded via load_model_weights (A1111 dev fallback)")
-                return
-
-        # Ultimate fallback: A1111 dev's old load_model() function
-        if hasattr(sd_models, 'load_model'):
-            sd_models.load_model(
-                checkpoint_info=checkpoint_info,
-                already_loaded_state_dict=state_dict
-            )
-            print("[Merger] Model loaded via legacy load_model()")
-            return
-
-    except Exception as e:
-        gr.Error(f"Failed to load merged model: {e}")
+        print(f"[FATAL] Load failed: {e}")
+        gr.Error(f"In-memory load failed: {e}")
         return
 
-    print("[Merger] Model loaded successfully into UI!")
+    # Re-apply hijacks and callbacks (Supermerger-style)
+    try:
+        sd_hijack.model_hijack.hijack(shared.sd_model)
+        script_callbacks.model_loaded_callback(shared.sd_model)
+        sd_models.model_data.set_sd_model(shared.sd_model)
+        if hasattr(sd_unet, 'apply_unet'):
+            sd_unet.apply_unet("upcast")
+    except Exception as e:
+        print(f"[Merger] Post-load hijacks failed (non-fatal): {e}")
+
+    print("[Merger] Merged model loaded successfully!")
+
 
 def find_checkpoint_w_config(config_source, model_a, model_b, model_c, model_d):
     a = sd_models.get_closet_checkpoint_match(model_a)

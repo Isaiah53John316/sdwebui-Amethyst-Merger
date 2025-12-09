@@ -10,6 +10,9 @@ import gc
 import random
 import threading
 import json
+import psutil
+import time
+from threading import Thread
 from collections import defaultdict
 from modules.timer import Timer
 from scripts.untitled.operators import weights_cache
@@ -104,25 +107,30 @@ IS_FORGE = hasattr(shared, 'cmd_opts') and getattr(shared.cmd_opts, 'forge', Fal
 # === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
 class MergeStats:
     def __init__(self):
-        self.custom_merges     = 0   # User-defined rules (presets, weight editor)
-        self.copied_primary    = 0   # Default keys copied from Model A (metadata, VAE, noise)
-        self.smart_resized     = 0   # Cross-arch keys that were resized
-        self.zero_filled       = 0   # Emergency zero-fill (very rare)
-        self.skipped           = 0   # Truly missing everywhere (should be 0)
+        self.custom_merges     = 0   # Real merges from rules or global sliders
+        self.copied_primary    = 0   # Keys copied from Model A (VAE, metadata, etc.)
+        self.smart_resized     = 0   # Cross-arch: tensors that were SmartResized
+        self.zero_filled       = 0   # Cross-arch: missing keys filled with zeros
+        self.skipped           = 0   # Should always be 0 — true failure
+        self.smart_merge       = 0   # Legacy: sparse merges (multiple sources) — kept for debug
 
     def __str__(self):
-        total = (self.custom_merges + self.copied_primary + 
-                 self.smart_resized + self.zero_filled + self.skipped)
-        
+        total = (self.custom_merges + 
+                 self.copied_primary + 
+                 self.smart_resized + 
+                 self.zero_filled + 
+                 self.skipped)
+
         kitchen_sink = "YES" if self.skipped == 0 else "ALMOST"
-        cross_arch = "YES" if self.smart_resized > 0 else "NO"
+        cross_arch   = "YES" if self.smart_resized > 0 else "NO"
 
         return (
             f"### AMETHYST MERGE COMPLETE ###\n"
             f"  • Custom merges          : {self.custom_merges:,}\n"
-            f"  • Copied from Primary     : {self.copied_primary:,}  (VAE, noise schedule, metadata)\n"
+            f"  • Copied from Primary     : {self.copied_primary:,}  (VAE, metadata, etc.)\n"
             f"  • Smart-resized (cross-arch): {self.smart_resized:,}\n"
             f"  • Zero-filled (emergency) : {self.zero_filled:,}\n"
+            f"  • Smart sparse merges     : {self.smart_merge:,}\n"
             f"  • Skipped (truly missing) : {self.skipped:,}\n"
             f"  • Total keys processed    : {total:,}\n"
             f"  • True Kitchen-Sink       : {kitchen_sink}\n"
@@ -152,6 +160,17 @@ class MergerState:
         self.temp_models.clear()
         import gc
         gc.collect()
+
+    def stop(self):
+        if self.io_start:
+            self.running = False
+            if self.thread:
+                self.thread.join(timeout=3)
+            io = psutil.disk_io_counters()
+            total_read = (io.read_bytes - self.io_start[0]) / (1024*1024)
+            total_write = (io.write_bytes - self.io_start[1]) / (1024*1024)
+            self.progress(f"Disk Monitor: COMPLETE — Total: {total_read:.1f} MB read | {total_write:.1f} GB written")
+            self.io_start = None
 
 # Optional: convenience functions (you can use cmn.get_device() directly too)
 def get_device():
@@ -244,68 +263,58 @@ def apply_lora_safely(lora_path, strength=1.0):
 def parse_arguments(progress, mergemode_name, calcmode_name, model_a, model_b, model_c, model_d,
                     slider_a, slider_b, slider_c, slider_d, slider_e,
                     editor, discard, clude, clude_mode,
-                    seed, enable_sliders, *custom_sliders):   # ← note: removed active_sliders
+                    seed, enable_sliders, *custom_sliders):
     mergemode = safe_get_mergemode(mergemode_name)
     calcmode  = safe_get_calcmode(calcmode_name)
     parsed_targets = {}
 
-    # ───── Seed handling ──────
+    # ───── Seed handling (strict) ─────
     try:
-        seed = int(float(seed)) if seed is not None else 0
+        seed = int(float(seed))
     except (ValueError, TypeError):
-        seed = 0
+        raise ValueError("Invalid seed value")
     if seed < 0:
         seed = random.randint(10**9, 10**10 - 1)
     cmn.last_merge_seed = seed
 
-    # ───── Custom sliders (2025 Immortal Edition – 40 rows, always 80 values) ─────
+    # ───── Custom sliders (40+40) — NO FALLBACKS ─────
     if enable_sliders and len(custom_sliders) == 80:
         block_names = custom_sliders[:40]
-        weights     = custom_sliders[40:]
-
+        weights = custom_sliders[40:]
         for name, w_str in zip(block_names, weights):
-            if not name or not str(name).strip():
+            name = str(name).strip()
+            if not name:
                 continue
             try:
                 weight = float(w_str)
             except (ValueError, TypeError):
-                weight = 0.0
+                raise ValueError(f"Invalid custom slider weight: {w_str}")
+            parsed_targets[name] = {'alpha': weight, 'seed': seed}
 
-            parsed_targets[str(name).strip()] = {
-                'alpha': weight,
-                'seed': seed
-            }
+    # ───── EMPTY WEIGHT EDITOR = GLOBAL SLIDERS (THE ONE TRUE WAY) ─────
+    # If weight editor is empty → do NOTHING here
+    # Global sliders are handled 100% correctly in create_tasks()
+    # This is intentional and perfect
 
-    # ───── MAIN SLIDERS α β γ δ ε → global UNet weights (THE MISSING PIECE) ─────
-    # This restores full functionality of the five big sliders in every merge mode
-    slider_values = [slider_a, slider_b, slider_c, slider_d, slider_e]
-    slider_names  = ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
-
-    for i in range(mergemode.input_sliders):
-        val = slider_values[i]
-        if val not in (0, 0.0, None, False):
-            # Apply to the whole diffusion model (most common use)
-            parsed_targets.setdefault('model.diffusion_model', {})[slider_names[i]] = float(val)
-            # Optional: also apply globally to text encoder / conditioner for style
-            # parsed_targets.setdefault('conditioner', {})[slider_names[i]] = float(val)
-
-    # ───── Weight Editor parsing (now works perfectly with slider_a–e) ─────
+    # ───── Weight Editor parsing — STRICT, NO MERCY ─────
     if editor and editor.strip():
-        editor_text = re.sub(r'#.*$', '', editor, flags=re.MULTILINE)
+        editor_text = re.sub(r'#.*$', '', editor, flags=re.MULTILINE).strip()
+        if not editor_text:
+            raise ValueError("Weight editor is empty or only comments")
 
-        # Replace slider_a ... slider_e with their actual values
+        # Replace slider_a ... slider_e with real values
         slider_map = {
-            'slider_a': slider_a or 0.0,
-            'slider_b': slider_b or 0.0,
-            'slider_c': slider_c or 0.0,
-            'slider_d': slider_d or 0.0,
-            'slider_e': slider_e or 0.0,
+            'slider_a': float(slider_a),
+            'slider_b': float(slider_b),
+            'slider_c': float(slider_c),
+            'slider_d': float(slider_d),
+            'slider_e': float(slider_e),
         }
         editor_text = re.sub(r'\bslider_[a-e]\b',
                              lambda m: str(slider_map[m.group()]),
                              editor_text)
 
-        for line in editor_text.split('\n'):
+        for line_num, line in enumerate(editor_text.split('\n'), 1):
             line = line.strip()
             if not line or ':' not in line:
                 continue
@@ -313,17 +322,17 @@ def parse_arguments(progress, mergemode_name, calcmode_name, model_a, model_b, m
             selector = selector.strip()
             weights = [w.strip() for w in weights_str.split(',')]
 
-            entry = {'': seed}
+            entry = {'seed': seed}
             for i, w in enumerate(weights[:len(VALUE_NAMES)]):
                 try:
                     entry[VALUE_NAMES[i]] = float(w)
                 except ValueError:
-                    pass
+                    raise ValueError(f"Line {line_num}: Invalid weight '{w}' in '{line}'")
+            if not selector:
+                raise ValueError(f"Line {line_num}: Missing selector in '{line}'")
+            parsed_targets[selector] = entry
 
-            if selector:
-                parsed_targets[selector] = entry   # overwrites previous entries (correct order)
-
-    # ───── Resolve checkpoints + show model type (SDXL/Flux/etc) ─────
+    # ───── Resolve checkpoints — NO SILENT SKIPS ─────
     checkpoints = []
     progress('Resolving Checkpoints:')
     for i, model in enumerate((model_a, model_b, model_c, model_d)):
@@ -331,52 +340,26 @@ def parse_arguments(progress, mergemode_name, calcmode_name, model_a, model_b, m
             checkpoints.append('')
             continue
 
-        # CRITICAL NaN/FLOAT GUARD — Gradio sometimes sends float NaN
-        if isinstance(model, float) or model is None or str(model) == 'nan':
-            if i == 0:  # Model A is mandatory
-                progress.interrupt('Model A required but missing')
-            else:
-                checkpoints.append('')
-                continue
+        if not model or str(model).strip() in ('', 'None', 'nan') or isinstance(model, float):
+            if i == 0:
+                raise ValueError("Model A is required")
+            checkpoints.append('')
+            continue
 
         model_str = str(model).strip()
-        if not model_str or model_str == "None":
-            if i == 0:
-                progress.interrupt('Model A required but missing')
-            else:
-                checkpoints.append('')
-                continue
-
-        # Now safe to use model_str
         info = sd_models.get_closet_checkpoint_match(model_str)
-
-        # Novel fallback (already perfect, kept)
         if not info:
-            base_name = model_str.split(' [')[0].strip()
-            candidates = [
-                cp for cp in sd_models.checkpoints_list.values()
-                if base_name in cp.title or base_name in os.path.basename(cp.filename)
-            ]
-            if candidates:
-                info = candidates[0]
-                progress(f'Auto-resolved: "{model_str}" → "{info.title}"')
-            else:
-                progress.interrupt(f'Checkpoint not found: {model_str}')
+            raise ValueError(f"Checkpoint not found: {model_str}")
 
-        # Rest unchanged (kitchen-sink .ckpt tolerance, warnings, etc.)
         if not info.filename.lower().endswith(('.safetensors', '.ckpt')):
-            progress.interrupt(f'Unsupported format (only .safetensors/.ckpt): {info.filename}')
-        if not info.filename.lower().endswith('.safetensors'):
-            progress(f'Warning: .ckpt used – slower load, possible incompatibility')
+            raise ValueError(f"Unsupported format: {info.filename}")
 
         model_type, _ = mutil.id_checkpoint(info.filename)
-        short_name = (info.shortname or os.path.basename(info.filename).rsplit('.', 1)[0]) if hasattr(info, 'shortname') else os.path.basename(info.filename).rsplit('.', 1)[0]
+        short_name = os.path.splitext(os.path.basename(info.filename))[0]
         checkpoints.append(info.filename)
-
         progress(f' - Model {chr(65+i)}: {short_name} [{model_type or "Unknown"}]')
 
     cmn.primary = checkpoints[0] if checkpoints else None
-
     return parsed_targets, checkpoints, mergemode, calcmode, seed
 
 def assign_weights_to_keys(targets, keys, already_assigned=None):
@@ -424,33 +407,82 @@ def assign_weights_to_keys(targets, keys, already_assigned=None):
     print(f"[Merger] Weight assignment → {assigned_count}/{len(keys)} keys matched")
     return dict(result)  # Convert back to regular dict
 
-def create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints, merge_stats):
+def create_tasks(
+    progress, mergemode, calcmode, keys, assigned_keys, discard_keys,
+    checkpoints, merge_stats,
+    alpha, beta, gamma, delta, epsilon,           # ← REQUIRED. NO DEFAULTS.
+    keep_zero_fill=True, bloat_mode=False
+):
     """
-    2025 KITCHEN-SINK MAXIMALISM — FINAL FORM (UNBREAKABLE + STATS-AWARE)
+    2025 KITCHEN-SINK MAXIMALISM — FINAL FORM
+    • No silent fallbacks
+    • No default=0
+    • If no rule + all sliders=0 → FAIL LOUDLY
+    • Only real merges survive
     """
+    import scripts.untitled.operators as oper
+
     tasks = []
     custom_count = 0
+    default_count = 0
 
-    for key in keys:
+    sliders_active = any(v != 0 for v in [alpha, beta, gamma, delta, epsilon])
+
+    for key in sorted(keys):
+        if key in discard_keys:
+            continue
+
+        # 1. Custom per-key rules
         if key in assigned_keys:
-            # Custom merge recipe (weight editor, presets, etc.)
-            custom_count += 1
-            base_recipe = mergemode.create_recipe(key, *checkpoints, **assigned_keys[key])
-            final_recipe = calcmode.modify_recipe(base_recipe, key, *checkpoints, **assigned_keys[key])
-            tasks.append(final_recipe)
-        else:
-            # DEFAULT: Copy from primary — fully stats-integrated
-            tasks.append(oper.CopyPrimary(key, cmn.primary, merge_stats))
+            try:
+                custom_count += 1
+                base_recipe = mergemode.create_recipe(
+                    key, *checkpoints, **assigned_keys[key]
+                )
+                final_recipe = calcmode.modify_recipe(
+                    base_recipe, key, *checkpoints, **assigned_keys[key]
+                )
+                tasks.append(final_recipe)
+                continue
+            except Exception as e:
+                raise RuntimeError(
+                    f"Custom rule failed for key '{key}': {e}\n"
+                    f"   Rule data: {assigned_keys[key]}"
+                ) from e
 
-    # Final reporting
-    default_count = len(tasks) - custom_count
-    
-    progress('Assigned tasks:')
-    progress(f'  • Custom merges          : {custom_count}')
-    progress(f'  • Copied from Primary     : {default_count}')
-    progress(f'  • Total keys processed    : {len(tasks)}')
-    
+        # 2. Global sliders
+        if sliders_active:
+            try:
+                custom_count += 1
+                base_recipe = mergemode.create_recipe(
+                    key, *checkpoints,
+                    alpha=alpha, beta=beta, gamma=gamma, delta=delta, epsilon=epsilon
+                )
+                final_recipe = calcmode.modify_recipe(
+                    base_recipe, key, *checkpoints,
+                    alpha=alpha, beta=beta, gamma=gamma, delta=delta, epsilon=epsilon
+                )
+                tasks.append(final_recipe)
+                continue
+            except Exception as e:
+                raise RuntimeError(
+                    f"Global merge failed for key '{key}': {e}\n"
+                    f"   Sliders: α={alpha}, β={beta}, γ={gamma}, δ={delta}, ε={epsilon}"
+                ) from e
+
+        # 3. NO MERGE → FAIL LOUDLY
+        default_count += 1
+        raise RuntimeError(
+            f"No merge rule for key '{key}' and all sliders are 0.\n"
+            f"   Set at least one slider ≠ 0 or use a weight editor rule."
+        )
+
+    progress("Assigned tasks:")
+    progress(f"  • Custom merges (rules/sliders) : {custom_count:,}")
+    progress(f"  • Intentional failures (no merge) : {default_count:,}")
+    progress(f"  • Total keys processed           : {len(tasks):,}")
     return tasks
+
 
 def prepare_merge(progress, save_name, save_settings, finetune, 
                   merge_mode_selector, calc_mode_selector,
@@ -458,7 +490,7 @@ def prepare_merge(progress, save_name, save_settings, finetune,
                   alpha, beta, gamma, delta, epsilon,
                   weight_editor, preset_output,          
                   discard, clude, clude_mode,
-                  merge_seed, enable_sliders, *custom_sliders):
+                  merge_seed, enable_sliders, *custom_sliders, keep_zero_fill=True, bloat_mode=False):
     
     progress('\n### Preparing merge ###')
     timer = Timer()
@@ -474,10 +506,12 @@ def prepare_merge(progress, save_name, save_settings, finetune,
         preset_output,          # ← Preset JSON
         discard,
         clude,
-        clude_mode,
         merge_seed,
+        clude_mode,
         enable_sliders,
-        *custom_sliders
+        *custom_sliders,
+        keep_zero_fill,
+        bloat_mode
     ]
 
     # === Parse arguments ===
@@ -535,7 +569,13 @@ def prepare_merge(progress, save_name, save_settings, finetune,
 
         # 3. Create tasks
         assigned_keys = assign_weights_to_keys(targets, keys)
-        tasks = create_tasks(progress, mergemode, calcmode, keys, assigned_keys, discard_keys, checkpoints, merge_stats)
+        tasks = create_tasks(
+        progress, mergemode, calcmode, keys, assigned_keys, discard_keys,
+        checkpoints, merge_stats,
+        alpha=alpha, beta=beta, gamma=gamma, delta=delta, epsilon=epsilon,
+        keep_zero_fill=keep_zero_fill,
+        bloat_mode=bloat_mode
+        )
 
         progress(f"DEBUG: UI device choice = '{cmn.opts.get('device', 'MISSING')}'")
 
@@ -621,7 +661,9 @@ def prepare_merge(progress, save_name, save_settings, finetune,
                 clude_mode=merge_args[14],
                 timer=timer,
                 cross_arch=cmn.is_cross_arch,
-                threads=cmn.opts.get('threads', 8)
+                threads=cmn.opts.get('threads', 8),
+                keep_zero_fill=merge_args[-2],   # keep_zero_fill
+                bloat_mode=merge_args[-1],       # bloat_mode
             )
         except Exception as e:
             import traceback
@@ -711,9 +753,14 @@ def prepare_merge(progress, save_name, save_settings, finetune,
 
     # ——— SAVE TO DISK (only if Autosave enabled) ———
     if save_to_disk:
-        import safetensors.torch
-        safetensors.torch.save_file(save_dict_final, full_path, metadata=metadata)
-        progress(f"Model saved: {os.path.basename(full_path)} ({target_dtype})")
+        try:
+            import safetensors.torch
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            safetensors.torch.save_file(save_dict_final, full_path, metadata=metadata)
+            progress(f"Model saved: {os.path.basename(full_path)} ({dtype_name})", popup=True)
+        except Exception as e:
+            progress(f"Save failed: {e}")
+            save_to_disk = False  # Prevent trying to load a broken file
     else:
         progress("Autosave disabled — no file written")
 
@@ -722,49 +769,76 @@ def prepare_merge(progress, save_name, save_settings, finetune,
         try:
             progress("Loading merged model directly into WebUI...")
 
-            # FINAL 2025: Use your own bulletproof loader (fast reuse + universal fallback)
+            # === 1. FULL UNLOAD CURRENT MODEL — MANDATORY ===
+            if shared.sd_model is not None:
+                print("[Merger] Unloading current model to prevent OOM...")
+                try:
+                    sd_models.unload_model_weights(shared.sd_model)
+                except:
+                    pass
+                try:
+                    shared.sd_model = shared.sd_model.to('cpu')
+                    del shared.sd_model
+                except:
+                    pass
+                shared.sd_model = None
+
+            # === 2. FULL MEMORY CLEANUP ===
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
+            # === 3. Create valid checkpoint_info ===
+            dummy_info = sd_models.CheckpointInfo(final_name)
+            dummy_info.filename = full_path if save_to_disk and os.path.exists(full_path) else "in_memory_merged"
+            dummy_info.title = final_name
+            dummy_info.name = final_name
+            dummy_info.hash = None
+
+            # === 4. Load the merged model ===
             from scripts.untitled.misc_util import load_merged_state_dict
-            load_merged_state_dict(save_dict_final, None)  # checkpoint_info=None = in-memory
+            load_merged_state_dict(save_dict_final, dummy_info)
 
-            # Force correct name in dropdown (your excellent fix)
-            if hasattr(shared.sd_model, "sd_checkpoint_info"):
-                ci = shared.sd_model.sd_checkpoint_info
-                ci.name = final_name
-                ci.title = final_name
-                ci.filename = full_path if save_to_disk else ""
-                # Refresh model list
-                sd_models.list_models()
+            # === 5. Force correct dropdown name ===
+            if hasattr(shared, 'sd_model') and shared.sd_model is not None:
+                ci = getattr(shared.sd_model, "sd_checkpoint_info", None)
+                if ci:
+                    ci.name = final_name
+                    ci.title = final_name
+                    ci.filename = dummy_info.filename
 
-            progress("Merged model loaded instantly and ready to generate!")
+            # === 6. Refresh model list ===
+            sd_models.list_models()
+
+            # === 7. Final cleanup ===
+            try:
+                del save_dict_final
+            except:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            progress("Merged model loaded instantly and ready to generate!", popup=True)
+
         except Exception as e:
+            import traceback
+            print(f"[FATAL] In-memory load failed: {e}\n{traceback.format_exc()}")
             progress(f"In-memory load failed: {e}")
-            progress("Model merged successfully — reload UI or select manually.")
+            progress("Model merged successfully — select from dropdown or restart UI.")
     else:
         progress("Load in Memory disabled — model not loaded")
 
-    # ——— UI REFRESH (when model is not loaded in memory) ———
+    # ——— UI REFRESH (when not loaded in memory) ———
     if save_to_disk:
-        sd_models.list_models()  # normal refresh after saving a real file
-    else:
-        # We didn't save a file and didn't load in memory → still try to update the current model's displayed name
-        if shared.sd_model and hasattr(shared.sd_model, "sd_checkpoint_info"):
-            info = shared.sd_model.sd_checkpoint_info
-            info.name = final_name
-            info.title = final_name
-            # Dummy assignment to trigger some internal refresh paths (harmless)
-            sd_models.send_model_to_cpu = lambda *_, **__: None
-            sd_models.list_models()
+        sd_models.list_models()
 
     # ——— Final success report ———
-    dtype_name = {
-        torch.float16: "FP16",
-        torch.bfloat16: "BF16",
-        torch.float32: "FP32"
-    }.get(target_dtype, str(target_dtype))
-
     arch_msg = "Cross-Arch Kitchen-Sink " if cmn.is_cross_arch else ""
+    keys_count = len(save_dict_final) if 'save_dict_final' in locals() else 0
     progress(
-        f"### {arch_msg}Merge completed: {len(save_dict_final)} keys • {dtype_name} ###",
+        f"### {arch_msg}Merge completed: {keys_count} keys • {dtype_name} ###",
         report=True,
         popup=True,
     )
@@ -774,12 +848,63 @@ def prepare_merge(progress, save_name, save_settings, finetune,
 def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict, progress, 
              merge_mode, calc_mode, alpha=0, beta=0, gamma=0, delta=0, epsilon=0,
              weight_editor="", discard="", clude="", clude_mode="Exclude", timer=None,
-             cross_arch=False, threads=8):
+             cross_arch=False, threads=8, keep_zero_fill=True, bloat_mode=False):
     """
     FINAL KITCHEN-SINK CROSS-ARCH MERGE ENGINE – 2025 EDITION
     Keeps every key • Resizes intelligently • Works every time
     """
     progress('### Starting merge ###')
+    # ——————————————————————————————————————————————
+    # NOVEL FEATURE: Real-Time Disk Usage Monitor
+    # ——————————————————————————————————————————————
+    disk_monitor = None
+    if cmn.opts.get('disk_monitor', True):
+        class LiveDiskMonitor:
+            def __init__(self, progress):
+                self.progress = progress
+                self.start_io = None
+                self.running = False
+                self.thread = None
+
+            def start(self):
+                io = psutil.disk_io_counters()
+                if io is None:
+                    self.progress("Disk Monitor: psutil failed (no permission?)")
+                    return
+                self.start_io = io.read_bytes, io.write_bytes
+                self.running = True
+                self.progress("🔍 Disk Monitor: STARTED — watching real-time IO...")
+                
+                def monitor_loop():
+                    last_read = self.start_io[0]
+                    last_write = self.start_io[1]
+                    while self.running:
+                        time.sleep(2)
+                        current = psutil.disk_io_counters()
+                        if current:
+                            read_mb = (current.read_bytes - last_read) / (1024*1024)
+                            write_mb = (current.write_bytes - last_write) / (1024*1024)
+                            if read_mb > 5 or write_mb > 5:
+                                self.progress(f"💾 Disk IO: +{read_mb:.1f} MB read | +{write_mb:.1f} MB written")
+                            last_read = current.read_bytes
+                            last_write = current.write_bytes
+                self.thread = Thread(target=monitor_loop, daemon=True)
+                self.thread.start()
+
+            def stop(self):
+                if not self.start_io:
+                    return
+                self.running = False
+                if self.thread:
+                    self.thread.join(timeout=3)
+                final = psutil.disk_io_counters()
+                if final and self.start_io:
+                    total_read = (final.read_bytes - self.start_io[0]) / (1024*1024)
+                    total_write = (final.write_bytes - self.start_io[1]) / (1024*1024)
+                    self.progress(f"💾 Disk Monitor: COMPLETE — Total Read: {total_read:.1f} MB | Total Written: {total_write:.2f} GB")
+
+        disk_monitor = LiveDiskMonitor(progress)
+        disk_monitor.start()
 
     cmn.checkpoints_global = checkpoints
 
@@ -923,6 +1048,9 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     progress(str(merge_stats), report=True, popup=True)
     progress(f'### Merge completed: {len(state_dict)} tensors ###')
 
+    if disk_monitor:
+        disk_monitor.stop()
+
     return state_dict
 
 def initialize_task(task):
@@ -1035,6 +1163,14 @@ def initialize_task(task):
         print(f"[CRITICAL] {task.key} ← SKIPPED (no shape info + missing everywhere)")
         return task.key, None
 
+    elif len(tensors) == 1:
+        if tensors[0].numel() == 0:
+            print(f"[ScalarKey] {task.key} ← single source, size-0 tensor → using as-is")
+        else:
+            print(f"[SingleSource] {task.key} ← only one real tensor → using it")
+        merge_stats.copied_primary += 1
+        return task.key, tensors[0]
+
     # We have real tensors → run the actual merge operation
     # This is the "smart merge" path — only used when not all models had the key
     merge_stats.smart_merge += 1
@@ -1074,12 +1210,14 @@ def get_tensors_from_loaded_model(state_dict: dict, tasks: list) -> tuple[dict, 
     if len(cmn.last_merge_tasks) != len(tasks):
         return state_dict, tasks
 
-    # Compare tasks exactly (key + operation + weights)
-    if any(t1.key != t2.key or 
-           type(t1.operation) != type(t2.operation) or
-           getattr(t1, 'alpha', 1.0) != getattr(t2, 'alpha', 1.0) or
-           getattr(t1, 'beta', 1.0)  != getattr(t2, 'beta', 1.0)
-           for t1, t2 in zip(cmn.last_merge_tasks, tasks)):
+    # Compare tasks exactly — SAFE FOR CopyPrimary (which has no .operation)
+    if any(
+        t1.key != t2.key or
+        getattr(t1, 'operation', None).__class__ != getattr(t2, 'operation', None).__class__ or
+        getattr(t1, 'alpha', 1.0) != getattr(t2, 'alpha', 1.0) or
+        getattr(t1, 'beta', 1.0) != getattr(t2, 'beta', 1.0)
+        for t1, t2 in zip(cmn.last_merge_tasks, tasks)
+    ):
         return state_dict, tasks
 
     # Safe to reuse — same merge, same everything
