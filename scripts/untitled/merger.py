@@ -911,7 +911,7 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     for path, f in cmn.loaded_checkpoints.items():
         status = "OPENED" if f is not None else "FAILED/None"
         print(f"[DIAG] {status} → {os.path.basename(path) if path else 'None'}")
-    # ——————————————————————————————————————————————
+# ——————————————————————————————————————————————
     # 1. Global flags — respect UI checkbox
     # ——————————————————————————————————————————————
     cmn.is_cross_arch = cross_arch
@@ -927,48 +927,43 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     # 2. Determine primary model + auto-enable cross-arch
     # ——————————————————————————————————————————————
     cmn.primary = None
+    cmn.is_cross_arch = False
 
     # First: respect user's explicit cross-arch setting
-    if cmn.is_cross_arch:
+    if getattr(cmn, 'force_cross_arch', False):
+        cmn.is_cross_arch = True
         progress("Cross-Arch Kitchen-Sink ENABLED (user override)")
 
-    # AUTO-DETECT cross-arch if not already enabled
+    # AUTO-DETECT cross-arch: ANY model differs from ANY other
     if not cmn.is_cross_arch:
-        primary_type = None
-        if checkpoints and checkpoints[0]:
-            primary_type = mutil.id_checkpoint(checkpoints[0])[0]
-
+        types = []
         for cp in checkpoints:
             if not cp:
                 continue
-            cp_type = mutil.id_checkpoint(cp)[0]
-            if cp_type in ('SDXL', 'Flux', 'Pony', 'Aurora') and primary_type not in ('SDXL', 'Flux', 'Pony', 'Aurora'):
-                cmn.is_cross_arch = True
-                progress("AUTO-ENABLED Cross-Arch Kitchen-Sink (SDXL/Flux detected with SD1.5 primary)")
-                break
+            model_type, _ = mutil.id_checkpoint(cp)
+            types.append(model_type)
+        if len(set(types)) > 1:
+            cmn.is_cross_arch = True
+            progress(f"AUTO-ENABLED Cross-Arch Kitchen-Sink (detected types: {set(types)})")
 
-    # Now decide primary model based on cross-arch mode
+    # Now decide primary model: prefer SDXL/Flux/Pony as shape reference
     if cmn.is_cross_arch:
-        # Find first SDXL/Flux/Pony model → use as shape reference
         modern_models = [
             cp for cp in checkpoints
             if cp and mutil.id_checkpoint(cp)[0] in ('SDXL', 'Flux', 'Pony', 'Aurora')
         ]
         if modern_models:
             primary_cp = modern_models[0]
-            if checkpoints[0] != primary_cp:
-                idx = checkpoints.index(primary_cp)
-                checkpoints[0], checkpoints[idx] = checkpoints[idx], checkpoints[0]
-                progress(f"Cross-Arch → Using {os.path.basename(primary_cp)} as primary shape reference")
+            idx = checkpoints.index(primary_cp)
+            checkpoints[0], checkpoints[idx] = checkpoints[idx], checkpoints[0]
+            progress(f"Cross-Arch → Using {os.path.basename(primary_cp)} as primary shape reference")
             cmn.primary = checkpoints[0]
         else:
-            progress("Warning: Cross-Arch enabled but no SDXL/Flux model found — falling back to Model A")
-            cmn.primary = model_a or checkpoints[0] if checkpoints else None
+            cmn.primary = model_a or checkpoints[0]
+            progress("Cross-Arch enabled but no modern model found — using Model A")
     else:
-        # Same-arch: just use Model A
-        cmn.primary = model_a or checkpoints[0] if checkpoints else None
+        cmn.primary = model_a or checkpoints[0]
         progress("Same-arch merge — using Model A as primary")
-
     # ——————————————————————————————————————————————
     # 3. Unload current model
     # ——————————————————————————————————————————————

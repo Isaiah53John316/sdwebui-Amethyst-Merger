@@ -287,7 +287,7 @@ CALCMODES_LIST.append(SelfCalc)
 class InterpDifferenceCalc(CalcMode):
     name = 'Comparative Interp'
     description = 'Interpolates between values depending on their difference relative to other values'
-    compatible_modes = ['Weight-Sum']
+    compatible_modes = ['All']
     input_models = 2
     slid_a_info = "concave - convex"
     slid_a_config = (0, 1, 0.01)
@@ -356,27 +356,6 @@ class AutoEnhInterpDifferenceCalc(CalcMode):
 CALCMODES_LIST.append(AutoEnhInterpDifferenceCalc)
 
 
-class DARECalc(CalcMode):
-    name = 'DARE (2025)'
-    description = 'State-of-the-art: Dropout + Rescale (2025 paper)'
-    compatible_modes = ['Weight-Sum', 'Add Difference']
-    input_models = 3
-    slid_a_info = "Density (keep %) – try 0.10–0.25"
-    slid_a_config = (0.01, 0.5, 0.01)
-    slid_b_info = "Dropout probability – try 0.2–0.5"
-    slid_b_config = (0.0, 0.7, 0.05)
-
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.15, beta=0.3, gamma=0, **kwargs):
-        a = opr.LoadTensor(key, model_a)
-        b = opr.LoadTensor(key, model_b)
-        density = alpha
-        dropout_p = beta
-        seed = cmn.last_merge_seed or 42
-        return opr.DARE(key, density=density, dropout_p=dropout_p, seed=seed, a=a, b=b)
-
-CALCMODES_LIST.append(DARECalc)
-
-
 class DARE3CalcAlt(CalcMode):
     name = 'DARE (3-model) — 2025 SOTA Gamma'
     description = 'True 3-way DARE - WS Add Diff'
@@ -397,31 +376,45 @@ class DARE3CalcAlt(CalcMode):
 CALCMODES_LIST.append(DARE3CalcAlt)
 
 
-class DARE3Calc(CalcMode):
-    name = 'DARE (3-model)'
-    description = 'True 3-model DARE — current SOTA for triple fusions (A + DARE(B-A) + DARE(C-A))'
-    compatible_modes = ['Weight-Sum']
-    input_models = 3
-    slid_a_info = "Density for Model B (0.10–0.30)"
-    slid_a_config = (0.01, 0.5, 0.01)
-    slid_b_info = "Dropout for Model B (0.2–0.5)"
-    slid_b_config = (0.0, 0.7, 0.05)
-    slid_c_info = "Density for Model C (0.10–0.30)"
-    slid_c_config = (0.01, 0.5, 0.01)
-    slid_d_info = "Dropout for Model C (0.2–0.5)"
-    slid_d_config = (0.0, 0.7, 0.05)
+class DARECalc(CalcMode):
+    name = 'DARE (N-Way 2025 SOTA)'
+    description = 'True N-way DARE — strongest signal from ANY model wins. Works with 2, 3, 4+ models.'
+    compatible_modes = ['all']
+    input_models = 4
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.18, beta=0.35, gamma=0.15, delta=0.40, **kwargs):
+    slid_a_info = "Density (0.10–0.30)"
+    slid_a_config = (0.01, 0.50, 0.01)
+    slid_b_info = "Dropout (0.2–0.5)"
+    slid_b_config = (0.0, 0.8, 0.01)
+    slid_c_info = "Unused"
+    slid_c_config = (0.0, 0.0, 0.01)
+    slid_d_info = "Unused"
+    slid_d_config = (0.0, 0.0, 0.01)
+
+    @staticmethod
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                     alpha=0.20, beta=0.35, gamma=0.0, delta=0.0, **kwargs):
         a = opr.LoadTensor(key, model_a)
-        b = opr.LoadTensor(key, model_b)
-        c = opr.LoadTensor(key, model_c)
+
+        sources = [model_a]
+        if model_b:
+            sources.append(model_b)
+        if model_c:
+            sources.append(model_c)
+        if model_d:
+            sources.append(model_d)
 
         seed = cmn.last_merge_seed or 42
-        intermediate = opr.DARE(key, density=alpha, dropout_p=beta, seed=seed, a=a, b=b)
-        result = opr.DARE(key, density=gamma, dropout_p=delta, seed=seed + 1, a=intermediate, b=c)
-        return result
 
-CALCMODES_LIST.append(DARE3Calc)
+        return opr.DARE(
+            key,
+            density=alpha,
+            dropout_p=beta,
+            seed=seed,
+            *sources
+        )
+
+CALCMODES_LIST.append(DARECalc)
 
 
 class SmoothMixCalc(CalcMode):
@@ -489,56 +482,73 @@ CALCMODES_LIST.append(AddDissimilarityCalc)
 
 
 class TIESCalc(CalcMode):
-    name = 'TIES-Merging'
-    description = 'State-of-the-art merging: Trim + Sign resolution + Disjoint (2024 paper)'
-    compatible_modes = ['Weight-Sum', 'Add Difference']
-    input_models = 3
-    slid_a_info = "Density (keep %) – try 0.10–0.25"
-    slid_a_config = (0.01, 0.5, 0.01)
+    name = 'TIES (N-Way 2024 SOTA)'
+    description = 'Task-Integrated Enhancement System — strongest coherent signal wins'
+    compatible_modes = ['all']
+    input_models = 4
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0, beta=0, gamma=0, **kwargs):
-        a = opr.LoadTensor(key, model_a)
-        b = opr.LoadTensor(key, model_b)
-        density = alpha
+    slid_a_info = "Density (0.10–0.40)"
+    slid_a_config = (0.01, 0.70, 0.01)
+    slid_b_info = "Unused"
+    slid_b_config = (0.0, 0.0, 0.01)
+    slid_c_info = "Unused"
+    slid_c_config = (0.0, 0.0, 0.01)
+    slid_d_info = "Unused"
+    slid_d_config = (0.0, 0.0, 0.01)
+
+    @staticmethod
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                     alpha=0.25, beta=0, gamma=0, delta=0, **kwargs):
+        sources = [model_a]
+        if model_b: sources.append(model_b)
+        if model_c: sources.append(model_c)
+        if model_d: sources.append(model_d)
+
         seed = cmn.last_merge_seed or 42
-        return opr.TIES(key, density=density, seed=seed, a=a, b=b)
+        return opr.TIES(key, density=alpha, seed=seed, *sources)
 
 CALCMODES_LIST.append(TIESCalc)
 
 
 class SLERPCalc(CalcMode):
-    name = 'SLERP (Spherical)'
-    description = 'True spherical linear interpolation — best for cross-family merges'
-    compatible_modes = ['Weight-Sum', 'Add Difference']
-    input_models = 2
-    slid_a_info = "Blend ratio (0 = Model A, 1 = Model B)"
-    slid_a_config = (0.0, 1.0, 0.01)
+    name = 'SLERP (N-Way Spherical)'
+    description = 'True spherical interpolation — 2, 3, or 4 models (weights sum ≤1, rest to Model A)'
+    compatible_modes = ['all']
+    input_models = 4
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, gamma=0, **kwargs):
+    slid_a_info = "Weight for Model B"
+    slid_a_config = (0.0, 1.0, 0.01)
+    slid_b_info = "Weight for Model C"
+    slid_b_config = (0.0, 1.0, 0.01)
+    slid_c_info = "Weight for Model D"
+    slid_c_config = (0.0, 1.0, 0.01)
+    slid_d_info = "Unused"
+    slid_d_config = (0.0, 0.0, 0.01)
+
+    @staticmethod
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                     alpha=0.0, beta=0.0, gamma=0.0, delta=0.0, **kwargs):
         a = opr.LoadTensor(key, model_a)
-        b = opr.LoadTensor(key, model_b)
-        return opr.SLERP(key, alpha=alpha, a=a, b=b)
+
+        sources = [model_a]
+        weights = []
+
+        if alpha > 0.0 and model_b:
+            weights.append(alpha)
+            sources.append(model_b)
+        if beta > 0.0 and model_c:
+            weights.append(beta)
+            sources.append(model_c)
+        if gamma > 0.0 and model_d:
+            weights.append(gamma)
+            sources.append(model_d)
+
+        if len(sources) == 1:
+            return a
+
+        return opr.SLERP(key, weights=weights, *sources)
 
 CALCMODES_LIST.append(SLERPCalc)
-
-
-class SLERP3Calc(CalcMode):
-    name = 'SLERP (3-model Spherical)'
-    description = 'True 3-point spherical interpolation — perfect for triple fusions'
-    compatible_modes = ['Weight-Sum', 'Add Difference']
-    input_models = 3
-    slid_a_info = "Weight for Model B (0-1)"
-    slid_a_config = (0.0, 1.0, 0.01)
-    slid_b_info = "Weight for Model C (0-1, total B+C ≤1)"
-    slid_b_config = (0.0, 1.0, 0.01)
-
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0.3, gamma=0, **kwargs):
-        a = opr.LoadTensor(key, model_a)
-        b = opr.LoadTensor(key, model_b)
-        c = opr.LoadTensor(key, model_c)
-        return opr.SLERP3(key, alpha, beta, a, b, c)
-
-CALCMODES_LIST.append(SLERP3Calc)
 
 class ReBasinCalc(CalcMode):
     name = 'Git Re-Basin'
@@ -593,15 +603,83 @@ class ToMeCalc(CalcMode):
     description = 'Inference speedup — up to 60% faster generation'
     compatible_modes = ['all']
     input_models = 1
+
     slid_a_info = "Merge ratio (0.4 = 60% speedup)"
     slid_a_config = (0.0, 0.8, 0.05)
+    slid_b_info = "Unused"
+    slid_b_config = (0.0, 0.0, 0.01)
+    slid_c_info = "Unused"
+    slid_c_config = (0.0, 0.0, 0.01)
+    slid_d_info = "Unused"
+    slid_d_config = (0.0, 0.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.6, beta=0, gamma=0, **kwargs):
+    @staticmethod
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                     alpha=0.6, beta=0, gamma=0, delta=0, **kwargs):
         a = opr.LoadTensor(key, model_a)
         return opr.ToMe(key, alpha, a)
 
 CALCMODES_LIST.append(ToMeCalc)
 
+class SmoothConvCalc(CalcMode):
+    name = 'SmoothConv (2D+1D)'
+    description = '2D Gaussian on Conv weights, 1D on Linear/Attention — cleans noise perfectly'
+    compatible_modes = ['all']
+    input_models = 1
+
+    slid_a_info = "Smoothing sigma (strength)"
+    slid_a_config = (0.0, 3.0, 0.05)
+    slid_b_info = "Kernel size (0 = auto)"
+    slid_b_config = (0, 15, 1)
+    slid_c_info = "Unused"
+    slid_c_config = (0.0, 0.0, 0.01)
+    slid_d_info = "Unused"
+    slid_d_config = (0.0, 0.0, 0.01)
+
+    @staticmethod
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                     alpha=1.0, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+
+        # ← CRITICAL FIX: DO NOT CALL .numel() ON LoadTensor
+        # Skip critical text encoder keys
+        if any(skip in key for skip in [
+            'cond_stage_model.transformer.text_model.embeddings',
+            'conditioner.embedders.0.transformer.text_model.embeddings',
+            'conditioner.embedders.1.model.token_embedding',
+            'position_ids',
+            'position_embedding'
+        ]):
+            return a
+
+        kernel_size = int(beta) if beta > 0 else None
+        return opr.SmoothConv(key, sigma=alpha, kernel_size=kernel_size, tensor=a)
+
+CALCMODES_LIST.append(SmoothConvCalc)
+
+
+class Smooth1DCalc(CalcMode):
+    name = 'Smooth (1D Classic)'
+    description = 'Classic 1D Gaussian smoothing — great for attention & linear layers'
+    compatible_modes = ['all']
+    input_models = 1
+
+    slid_a_info = "Smoothing strength"
+    slid_a_config = (0.0, 3.0, 0.05)
+    slid_b_info = "Unused"
+    slid_b_config = (0.0, 0.0, 0.01)
+    slid_c_info = "Unused"
+    slid_c_config = (0.0, 0.0, 0.01)
+    slid_d_info = "Unused"
+    slid_d_config = (0.0, 0.0, 0.01)
+
+    @staticmethod
+    def modify_recipe(self, recipe, key, model_a, model_b, model_c, model_d,
+                     alpha=1.0, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        return opr.Smooth(key, tensor=a)
+
+CALCMODES_LIST.append(Smooth1DCalc)
 
 class AttentionMergeCalc(CalcMode):
     name = 'Attention-Only Merge'
