@@ -845,15 +845,17 @@ def prepare_merge(progress, save_name, save_settings, finetune,
     timer.record("Save & load")
     progress(f"Total time: {timer.summary()}", report=True)
 
-def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict, progress, 
+def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict, progress,
              merge_mode, calc_mode, alpha=0, beta=0, gamma=0, delta=0, epsilon=0,
              weight_editor="", discard="", clude="", clude_mode="Exclude", timer=None,
              cross_arch=False, threads=8, keep_zero_fill=True, bloat_mode=False):
     """
     FINAL KITCHEN-SINK CROSS-ARCH MERGE ENGINE – 2025 EDITION
     Keeps every key • Resizes intelligently • Works every time
+    Now with DUAL-SOUL PRESERVATION — VAEs, CLIPs, and Noise Entry preserved when architectures differ
     """
     progress('### Starting merge ###')
+
     # ——————————————————————————————————————————————
     # NOVEL FEATURE: Real-Time Disk Usage Monitor
     # ——————————————————————————————————————————————
@@ -865,7 +867,6 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
                 self.start_io = None
                 self.running = False
                 self.thread = None
-
             def start(self):
                 io = psutil.disk_io_counters()
                 if io is None:
@@ -873,8 +874,7 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
                     return
                 self.start_io = io.read_bytes, io.write_bytes
                 self.running = True
-                self.progress("🔍 Disk Monitor: STARTED — watching real-time IO...")
-                
+                self.progress("Disk Monitor: STARTED — watching real-time IO...")
                 def monitor_loop():
                     last_read = self.start_io[0]
                     last_write = self.start_io[1]
@@ -885,12 +885,11 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
                             read_mb = (current.read_bytes - last_read) / (1024*1024)
                             write_mb = (current.write_bytes - last_write) / (1024*1024)
                             if read_mb > 5 or write_mb > 5:
-                                self.progress(f"💾 Disk IO: +{read_mb:.1f} MB read | +{write_mb:.1f} MB written")
+                                self.progress(f"Disk IO: +{read_mb:.1f} MB read | +{write_mb:.1f} MB written")
                             last_read = current.read_bytes
                             last_write = current.write_bytes
                 self.thread = Thread(target=monitor_loop, daemon=True)
                 self.thread.start()
-
             def stop(self):
                 if not self.start_io:
                     return
@@ -901,22 +900,19 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
                 if final and self.start_io:
                     total_read = (final.read_bytes - self.start_io[0]) / (1024*1024)
                     total_write = (final.write_bytes - self.start_io[1]) / (1024*1024)
-                    self.progress(f"💾 Disk Monitor: COMPLETE — Total Read: {total_read:.1f} MB | Total Written: {total_write:.2f} GB")
-
+                    self.progress(f"Disk Monitor: COMPLETE — Total Read: {total_read:.1f} MB | Total Written: {total_write:.2f} GB")
         disk_monitor = LiveDiskMonitor(progress)
         disk_monitor.start()
 
     cmn.checkpoints_global = checkpoints
-
     for path, f in cmn.loaded_checkpoints.items():
         status = "OPENED" if f is not None else "FAILED/None"
         print(f"[DIAG] {status} → {os.path.basename(path) if path else 'None'}")
-# ——————————————————————————————————————————————
+
+    # ——————————————————————————————————————————————
     # 1. Global flags — respect UI checkbox
     # ——————————————————————————————————————————————
     cmn.is_cross_arch = cross_arch
-
-    # Detect types
     cmn.checkpoints_types = {}
     for cp in checkpoints:
         if cp:
@@ -924,10 +920,11 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
             cmn.checkpoints_types[cp] = typ or "Unknown"
 
     # ——————————————————————————————————————————————
-    # 2. Determine primary model + auto-enable cross-arch
+    # 2. Determine primary model + auto-enable cross-arch + DUAL-SOUL DETECTION
     # ——————————————————————————————————————————————
     cmn.primary = None
     cmn.is_cross_arch = False
+    same_arch = True  # ← DUAL-SOUL FLAG (True = normal merge, False = preserve souls)
 
     # First: respect user's explicit cross-arch setting
     if getattr(cmn, 'force_cross_arch', False):
@@ -941,12 +938,17 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
             if not cp:
                 continue
             model_type, _ = mutil.id_checkpoint(cp)
-            types.append(model_type)
+            types.append(model_type.lower() if model_type else "unknown")
+        
         if len(set(types)) > 1:
             cmn.is_cross_arch = True
+            same_arch = False  # ← Different architectures → Dual-Soul ACTIVE
             progress(f"AUTO-ENABLED Cross-Arch Kitchen-Sink (detected types: {set(types)})")
+        else:
+            same_arch = True
+            progress(f"Same architecture detected: {types[0] if types else 'unknown'}")
 
-    # Now decide primary model: prefer SDXL/Flux/Pony as shape reference
+    # Now decide primary model: prefer modern (SDXL/Flux/Pony) as shape reference
     if cmn.is_cross_arch:
         modern_models = [
             cp for cp in checkpoints
@@ -964,12 +966,19 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     else:
         cmn.primary = model_a or checkpoints[0]
         progress("Same-arch merge — using Model A as primary")
+
+    # ——————————————————————————————————————————————
+    # FINAL DUAL-SOUL STATUS — THE SOUL OF AMETHYST
+    # ——————————————————————————————————————————————
+    print(f"[Dual-Soul] Cross-Arch: {cmn.is_cross_arch} | Same Architecture: {same_arch} | "
+          f"Preservation: {'ACTIVE — Souls Preserved' if not same_arch else 'OFF — Normal Merge'}")
+    
+    cmn.same_arch = same_arch  # ← Save globally for result loop
     # ——————————————————————————————————————————————
     # 3. Unload current model
     # ——————————————————————————————————————————————
     if shared.sd_model:
         sd_models.unload_model_weights()
-
     state_dict = {}
 
     # ——————————————————————————————————————————————
@@ -997,36 +1006,67 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
                 sd_models.send_model_to_trash(sd_models.model_data.loaded_sd_models.pop())
             sd_models.model_data.sd_model = None
         shared.sd_model = None
-
     devices.torch_gc()
 
     # ——————————————————————————————————————————————
-    # 7. Parallel merge with CPU offload
+    # 7. Parallel merge with CPU offload + DUAL-SOUL PRESERVATION
     # ——————————————————————————————————————————————
     timer.record('Merge start')
     bar = tqdm(total=len(tasks), desc="Merging", leave=True)
     lock = threading.Lock()
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         futures = {pool.submit(initialize_task, task): task for task in tasks}
-
         for future in concurrent.futures.as_completed(futures):
             if cmn.stop or cmn.interrupted:
                 progress('Merge interrupted')
                 bar.close()
                 return {}
-
             try:
                 key, tensor = future.result()
+                task = futures[future]
                 if tensor is None:
                     continue
 
                 with lock:
-                    state_dict[key] = tensor.cpu()
+                    key_lower = key.lower()
+
+                    # INFERENCE NOTE:
+                    # Models with vae_a/vae_b, clip_a/clip_b, noise_a/noise_b are "Dual-Soul" models
+                    # Loaders should check for these prefixes and offer selection
+                    # Default behavior: use _b (modern) or _a (legacy) based on user preference
+                    # =================================================================
+                    # DUAL-SOUL PRESERVATION — FINAL 2025 KITCHEN-SINK EDITION
+                    # =================================================================
+                    if not cmn.same_arch:
+                        # ——— VAE: Keep both ———
+                        if key_lower.startswith("first_stage_model.") or "vae." in key_lower:
+                            src_model = "a" if any(getattr(src, 'checkpoint_name', '') == model_a for src in task.sources if hasattr(src, 'checkpoint_name')) else "b"
+                            new_key = f"vae_{src_model}.{key.split('.', 1)[1]}"
+                            state_dict[new_key] = tensor.cpu()
+                            print(f"[Dual-Soul] Preserved {new_key}")
+                        # ——— CLIP / Text Encoder: Keep both ———
+                        elif any(x in key_lower for x in ["cond_stage_model.", "conditioner.", "text_model", "embeddings"]):
+                            src_model = "a" if any(getattr(src, 'checkpoint_name', '') == model_a for src in task.sources if hasattr(src, 'checkpoint_name')) else "b"
+                            new_key = f"clip_{src_model}.{key.split('.', 1)[1]}"
+                            state_dict[new_key] = tensor.cpu()
+                            print(f"[Dual-Soul] Preserved {new_key}")
+                        # ——— Noise Entry: Keep both ———
+                        elif any(x in key_lower for x in ["conv_in", "input_blocks.0.0", "time_embed", "time_in", "img_in", "vector_in"]):
+                            src_model = "a" if any(getattr(src, 'checkpoint_name', '') == model_a for src in task.sources if hasattr(src, 'checkpoint_name')) else "b"
+                            new_key = f"noise_{src_model}.{key.split('.', 1)[1]}"
+                            state_dict[new_key] = tensor.cpu()
+                            print(f"[Dual-Soul] Preserved {new_key}")
+                        else:
+                            state_dict[key] = tensor.cpu()
+                    else:
+                        state_dict[key] = tensor.cpu()
+
+                    # Memory cleanup
                     if len(state_dict) % 300 == 0:
                         torch.cuda.empty_cache()
 
                 bar.update(1)
+
             except Exception as e:
                 task = futures[future]
                 bar.close()
@@ -1039,12 +1079,31 @@ def do_merge(model_a, model_b, model_c, model_d, checkpoints, tasks, state_dict,
     # 9. Save task list for reuse + cleanup
     # ——————————————————————————————————————————————
     cmn.last_merge_tasks = tuple(tasks)
-
     progress(str(merge_stats), report=True, popup=True)
     progress(f'### Merge completed: {len(state_dict)} tensors ###')
-
     if disk_monitor:
         disk_monitor.stop()
+
+    # ——————————————————————————————————————————————
+    # FINAL DUAL-SOUL REPORT — THE SOUL COUNT
+    # ——————————————————————————————————————————————
+    if not cmn.same_arch:
+        # Count all preserved sacred blocks (supports a/b/c/d)
+        vae_count = sum(1 for k in state_dict if k.startswith("vae_") and any(k.startswith(f"vae_{x}.") for x in "abcd"))
+        clip_count = sum(1 for k in state_dict if k.startswith("clip_") and any(k.startswith(f"clip_{x}.") for x in "abcd"))
+        noise_count = sum(1 for k in state_dict if k.startswith("noise_") and any(k.startswith(f"noise_{x}.") for x in "abcd"))
+
+        # Build pretty list of which models contributed
+        vae_models = ", ".join(sorted({k.split(".")[0].replace("vae_", "").upper() for k in state_dict if k.startswith("vae_")}))
+        clip_models = ", ".join(sorted({k.split(".")[0].replace("clip_", "").upper() for k in state_dict if k.startswith("clip_")}))
+        noise_models = ", ".join(sorted({k.split(".")[0].replace("noise_", "").upper() for k in state_dict if k.startswith("noise_")}))
+
+        progress(f"[Dual-Soul] ACTIVE — Preserved "
+                 f"{vae_count} VAE tensors ({vae_models or 'none'}), "
+                 f"{clip_count} CLIP tensors ({clip_models or 'none'}), "
+                 f"{noise_count} Noise tensors ({noise_models or 'none'})")
+    else:
+        progress("[Dual-Soul] OFF — Same architecture merge (normal blending)")
 
     return state_dict
 

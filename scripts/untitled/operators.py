@@ -8,6 +8,41 @@ from functools import wraps
 import re
 from scripts.untitled.common import cmn
 
+SACRED_SANCTUARY = {
+    # === NOISE & TIME ENTRY (breaks sampling if touched) ===
+    "conv_in.weight", "conv_in.bias",
+    "input_blocks.0.0.weight", "input_blocks.0.0.bias",      # SDXL noise entry
+    "time_embed.0.weight", "time_embed.0.bias",
+    "time_embed.2.weight", "time_embed.2.bias",
+    "time_embedding", "timestep_embed", "timestep_embedding",
+    "time_in.weight", "time_in.bias",
+    "vector_in.weight", "vector_in.bias",
+    "img_in.weight", "img_in.bias",
+
+    # === VAE — NEVER TOUCH (different latent scaling) ===
+    "first_stage_model.", "encoder.", "decoder.",
+    "quant_conv.", "post_quant_conv.", "vae.",
+
+    # === TEXT ENCODERS — semantics live here ===
+    "cond_stage_model.transformer.text_model.embeddings",
+    "conditioner.embedders.0.transformer.text_model.embeddings",
+    "conditioner.embedders.1.transformer.text_model.embeddings",
+    "token_embedding", "position_embedding", "positional_embedding",
+    "text_projection", "logit_scale",
+
+    # === FLUX / SD3 / MODERN BLOCKS ===
+    "single_blocks", "double_blocks",
+    "x_embedder", "context_embedder", "t_embedder",
+    "img_proj", "txt_proj",
+
+    # === NOISE AUGMENTORS & OFFSETS ===
+    "offset_noise", "noise_offset", "noise_augmentor",
+    "learned_sigma", "sigma_embed",
+
+    # === POSITIONAL EMBEDDINGS (any model) ===
+    "pos_embed", "position_emb", "position_ids",
+}
+
 def tensor_size(t):
     """Return tensor size in bytes — safely handles non-floating point tensors"""
     return t.element_size() * t.nelement() if t.is_floating_point() or t.is_complex() else 0
@@ -67,7 +102,7 @@ class CopyPrimary(Operation):
         self.stats = stats
         self.keep_zero_fill = keep_zero_fill
         self.bloat_mode = bloat_mode
-        self.operation = "CopyPrimary"   # fixes task reuse crash
+        self.operation = "CopyPrimary"  # fixes task reuse crash
 
     @multi_cache_operation
     def oper(self, *args):
@@ -79,8 +114,8 @@ class CopyPrimary(Operation):
             try:
                 t = file.get_tensor(self.key)
 
-                # Resize only when NOT in bloat mode
-                if cmn.is_cross_arch and not self.bloat_mode:
+                # CROSS-ARCH: Resize to target shape
+                if cmn.is_cross_arch:
                     target_shape = cmn.cross_arch_target_shapes.get(self.key)
                     if target_shape and t.shape != target_shape:
                         t = SmartResize(f"CopyPrimary_{self.key}", target_shape, t).oper(t)
@@ -88,25 +123,30 @@ class CopyPrimary(Operation):
                             self.stats.smart_resized += 1
                         print(f"[FinalCopy] {self.key} ← RESIZED ({model_name})")
 
-                # BLOAT MODE: pad EVERY tensor
+                # BLOAT MODE: Now works in cross-arch — SAFE and CHAOTIC
                 if self.bloat_mode:
                     pad_amount = 256
-                    pad = [pad_amount, pad_amount] * len(t.shape)
-                    pad = pad[::-1]  # reverse for torch.nn.functional.pad
-                    t = F.pad(t, pad, "constant", 0)
+                    current_shape = t.shape
+                    bloated_shape = tuple(s + 2 * pad_amount for s in current_shape)
+                    
+                    bloated = torch.zeros(bloated_shape, dtype=t.dtype, device=t.device)
+                    slices = tuple(slice(pad_amount, pad_amount + s) for s in current_shape)
+                    bloated[slices] = t
+                    
+                    t = bloated
+                    
                     if self.stats:
                         self.stats.zero_filled += 1
-                    print(f"[BloatMode] {self.key} ← PADDED ({pad_amount} per dim)")
+                    print(f"[BloatMode] {self.key} ← PADDED to {bloated_shape} (cross-arch SAFE)")
 
                 if self.stats:
                     self.stats.copied_primary += 1
-
                 return t.to(cmn.get_device(), dtype=cmn.get_dtype())
 
             except Exception as e:
                 print(f"[CopyPrimary] FAILED reading {self.key}: {e}")
 
-        # Missing key fallback
+        # KITCHEN-SINK ZERO-FILL
         if cmn.is_cross_arch and self.keep_zero_fill:
             target_shape = cmn.cross_arch_target_shapes.get(self.key)
             if target_shape:
@@ -116,6 +156,7 @@ class CopyPrimary(Operation):
                 print(f"[KitchenSink] {self.key} ← ZERO-FILLED")
                 return t
 
+        # Fallback
         if self.stats:
             self.stats.skipped += 1
         print(f"[LeanMode] {self.key} ← SKIPPED")
@@ -126,6 +167,7 @@ class LoadTensor(Operation):
         super().__init__(key)
         self.checkpoint_name = checkpoint_name or ''
         self._resolved_path = checkpoint_name
+        self.source_checkpoint = checkpoint_name
 
     def merge(self) -> torch.Tensor:
         """
@@ -145,34 +187,33 @@ class LoadTensor(Operation):
             except (OSError, FileNotFoundError):
                 continue
 
-        # Fallback to primary if not found
+        # Fallback hierarchy — THE SACRED ORDER
         if file is None:
-            # PRIMARY MODEL FIRST (the correct, safe order)
+            # 1. Primary model (set by cross-arch logic)
             if cmn.primary and cmn.primary in cmn.loaded_checkpoints:
                 file = cmn.loaded_checkpoints[cmn.primary]
-            # THEN fall back to the first loaded checkpoint (in global order)
+            # 2. First global checkpoint (original order)
             elif cmn.checkpoints_global:
                 first_cp = cmn.checkpoints_global[0]
                 file = cmn.loaded_checkpoints.get(first_cp)
-            # ABSOLUTE LAST RESORT: any loaded checkpoint
+            # 3. Any loaded checkpoint
             elif cmn.loaded_checkpoints:
                 file = next(iter(cmn.loaded_checkpoints.values()))
-            
+
             if file is None:
                 raise RuntimeError(f"No checkpoint available for tensor '{self.key}' (requested: {self.checkpoint_name})")
 
-        # Load the tensor (let initialize_task() handle any errors/reshaping)
+        # Load the tensor
         try:
             tensor = file.get_tensor(self.key)
         except SafetensorError:
-            # In kitchen-sink mode, we don't care if a key is missing here
-            # initialize_task() will find it in another model or SmartResize it
             raise RuntimeError(f"Key {self.key} missing from {self.checkpoint_name} — handled by recovery")
 
-        # Move to correct device (let initialize_task() handle dtype/shape)
-        tensor = tensor.to(device=cmn.get_device())
+        # ← FINAL FIX: Move to device + dtype
+        tensor = tensor.to(device=cmn.get_device(), dtype=cmn.get_dtype())
 
-        if tensor.ndim == 0:  # scalar tensor
+        # Scalar tensor handling
+        if tensor.ndim == 0:
             return tensor
 
         return tensor
@@ -181,16 +222,30 @@ class LoadTensor(Operation):
 class Add(Operation):
     @multi_cache_operation
     def oper(self, *tensors):
+        # Filter out empty / all-zero tensors (your original logic — keep it)
         valid = [t for t in tensors if t.numel() > 0 and torch.any(t != 0)]
         if len(valid) == 0:
             return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
         if len(valid) == 1:
             return valid[0]
-        result = valid[0]
-        for t in valid[1:]:
-            result = result + t
-        return result
 
+        # First valid tensor becomes the shape reference
+        result = valid[0].clone()           # ← clone so we don't modify cached tensor
+        target_shape = result.shape
+
+        for t in valid[1:]:
+            if t.shape == target_shape:
+                result = result + t
+            elif cmn.is_cross_arch:
+                # ← THIS IS THE MAGIC LINE THAT FIXES CROSS-ARCH
+                resized = SmartResize(self.key, target_shape, t).oper(t)
+                result = result + resized
+                merge_stats.smart_resized += 1
+            else:
+                # Same-arch mismatch = real bug → let it crash (old behavior)
+                result = result + t
+
+        return result.to(cmn.get_dtype())
 
 class Sub(Operation):
     @multi_cache_operation
@@ -200,10 +255,25 @@ class Sub(Operation):
             return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
         if len(valid) == 1:
             return valid[0]
-        result = valid[0]
+
+        # First valid tensor defines the target shape
+        result = valid[0].clone()           # ← clone to avoid modifying cached tensor
+        target_shape = result.shape
+
         for t in valid[1:]:
-            result = result - t
-        return result
+            if t.shape == target_shape:
+                result = result - t
+            elif cmn.is_cross_arch:
+                # ← AUTOMATIC SMART RESIZE FOR CROSS-ARCH
+                resized = SmartResize(self.key, target_shape, t).oper(t)
+                result = result - resized
+                merge_stats.smart_resized += 1
+                print(f"[Sub] SmartResize applied → {self.key} ({t.shape} → {target_shape})")
+            else:
+                # Same-arch shape mismatch = real error → let it fail loudly (original behavior)
+                result = result - t
+
+        return result.to(cmn.get_dtype())
 
 
 class Multiply(Operation):
@@ -214,10 +284,25 @@ class Multiply(Operation):
             return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
         if len(valid) == 1:
             return valid[0]
-        result = valid[0]
+
+        result = valid[0].clone()           # Clone to prevent in-place mutation of cache
+        target_shape = result.shape
+
         for t in valid[1:]:
-            result = result * t
-        return result
+            if t.shape == target_shape:
+                result = result * t
+            elif cmn.is_cross_arch:
+                # Auto-resize mismatched tensor to target shape
+                resized = SmartResize(self.key, target_shape, t).oper(t)
+                result = result * resized
+                merge_stats.smart_resized += 1
+                # Optional debug (remove if too verbose)
+                # print(f"[Multiply] SmartResize applied → {self.key} ({t.shape} → {target_shape})")
+            else:
+                # Same-arch mismatch = real bug → crash loudly (original behavior)
+                result = result * t
+
+        return result.to(cmn.get_dtype())
 
 
 class MultiplyTensors(Operation):
@@ -228,10 +313,21 @@ class MultiplyTensors(Operation):
             return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
         if len(valid) == 1:
             return valid[0]
-        result = valid[0]
+
+        result = valid[0].clone()
+        target_shape = result.shape
+
         for t in valid[1:]:
-            result = result * t
-        return result
+            if t.shape == target_shape:
+                result = result * t
+            elif cmn.is_cross_arch:
+                resized = SmartResize(self.key, target_shape, t).oper(t)
+                result = result * resized
+                merge_stats.smart_resized += 1
+            else:
+                result = result * t
+
+        return result.to(cmn.get_dtype())
 
 class Extract(Operation):
     def __init__(self, key, alpha, beta, gamma, *sources):
@@ -242,31 +338,32 @@ class Extract(Operation):
 
     @multi_cache_operation
     def oper(self, *tensors):
-        # ← ONE TRUE FILTER — filter out zero/empty tensors
         valid = [t for t in tensors if t.numel() > 0 and torch.any(t != 0)]
         if len(valid) == 0:
             return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
         if len(valid) == 1:
             return valid[0]
 
-        # ← Extract logic: base can be None → first valid is base, or use 0
         base = valid[0] if len(valid) >= 1 else None
         a = valid[1] if len(valid) >= 2 else valid[0]
         b = valid[2] if len(valid) >= 3 else valid[0]
 
-        # Determine target shape (base wins if present)
+        # Determine target shape — base wins, otherwise first tensor
         target_shape = base.shape if base is not None else a.shape
-
-        # Resize a and b to target
-        if a.shape != target_shape:
-            a = SmartResize("extract_a", target_shape, a).oper(a)
-        if b.shape != target_shape:
-            b = SmartResize("extract_b", target_shape, b).oper(b)
-
         dtype = base.dtype if base is not None else a.dtype
-        base_val = base.float() if base is not None else torch.zeros_like(a.float())
 
-        # Core Extract math — 100% unchanged
+        # Auto-resize with SmartResize + stat tracking
+        def resize_if_needed(tensor, name):
+            if tensor.shape != target_shape:
+                resized = SmartResize(f"{name}_{self.key}", target_shape, tensor).oper(tensor)
+                merge_stats.smart_resized += 1
+                return resized
+            return tensor
+
+        a = resize_if_needed(a, "extract_a")
+        b = resize_if_needed(b, "extract_b")
+
+        base_val = base.float() if base is not None else torch.zeros_like(a.float())
         a_f = (a.float() - base_val).contiguous()
         b_f = (b.float() - base_val).contiguous()
 
@@ -283,17 +380,19 @@ class Similarities(Extract):
 
     @multi_cache_operation
     def oper(self, *tensors):
-        # ← ONE TRUE FILTER — safe for any number of inputs
+        # ONE TRUE FILTER — keep your excellent filtering
         valid = [t for t in tensors if t.numel() > 0 and torch.any(t != 0)]
         if len(valid) == 0:
             return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
         if len(valid) == 1:
             return valid[0]
 
-        # ← Always use None as base → pure similarity mode
+        # Pure similarity mode → no base model
         a = valid[0]
         b = valid[1] if len(valid) > 1 else valid[0]
 
+        # Let Extract handle everything — including SmartResize
+        # We pass None as base → forces pure similarity logic + correct target shape from a
         return super().oper(None, a, b)
 
 
@@ -1147,6 +1246,7 @@ class SmartResize(Operation):
         self.target_shape = target_shape
         self.source_tensor = source_tensor
 
+    @multi_cache_operation
     def oper(self, *tensors):
         if not tensors:
             return torch.zeros(self.target_shape, dtype=cmn.get_dtype(), device=cmn.get_device())
@@ -1155,87 +1255,142 @@ class SmartResize(Operation):
         device = t.device
         dtype = t.dtype
 
-        # Safety: Safety: if target is invalid or insane, return original
+        # === SAFETY FIRST ===
         if not self.target_shape or len(self.target_shape) == 0 or any(s > 100000 for s in self.target_shape):
-            return t  # refuse OOM
+            return t
+        if t.numel() == 0:
+            return torch.zeros(self.target_shape, device=device, dtype=dtype)
 
         target = self.target_shape
+        key = self.key.lower()
 
-        # ← CHANGE 2: Add this safety (optional but recommended)
-        if t.numel() == 0:
-            return torch.zeros(target, device=device, dtype=dtype)
+        # ===================================================================
+        # SACRED SANCTUARY — These must NEVER be resized or interpolated
+        # ===================================================================
+        SANCTUARY = {
+            # ——— NOISE & TIME ENTRY (breaks first step, haze, refiner death) ———
+            "conv_in.weight", "conv_in.bias",
+            "input_blocks.0.0.weight", "input_blocks.0.0.bias",
+            "time_embed.0.weight", "time_embed.0.bias",
+            "time_embed.2.weight", "time_embed.2.bias",
+            "time_embedding", "timestep_embed", "timestep_embedding",
+            "time_in.weight", "time_in.bias",
+            "vector_in.weight", "vector_in.bias",
+            "img_in.weight", "img_in.bias",
+            "offset_noise", "noise_offset", "noise_augmentor",
+            "learned_sigma", "sigma_embed",
 
-        # 1D tensors
+            # ——— VAE (encoder/decoder) — NEVER interpolate latents ———
+            "first_stage_model.", "encoder.", "decoder.", "quant_conv.", "post_quant_conv.",
+            "vae.",
+
+            # ——— CLIP / TEXT ENCODERS — Token embeddings & positional ———
+            "cond_stage_model.transformer.text_model.embeddings",
+            "conditioner.embedders.0.transformer.text_model.embeddings",
+            "conditioner.embedders.1.transformer.text_model.embeddings",
+            "token_embedding", "position_embedding", "positional_embedding",
+            "text_projection", "logit_scale",
+
+            # ——— FLUX / SD3 / SPECIAL BLOCKS ———
+            "single_blocks", "double_blocks", "img_proj", "txt_proj",
+            "x_embedder", "context_embedder", "t_embedder",
+
+            # ——— POS EMBEDDINGS (any model) ———
+            "pos_embed", "position_emb", "position_ids",
+        }
+
+        # Fast prefix/suffix check
+        if any(pat in key for pat in SANCTUARY):
+            # Sacred tensor — preserve exactly
+            if t.shape == target:
+                return t.to(dtype)
+            else:
+                # Pad or truncate — NEVER interpolate
+                pad_total = [max(0, tgt - src) for tgt, src in zip(target, t.shape)]
+                if any(pad_total):
+                    pad_before = [p // 2 for p in pad_total]
+                    pad_after = [p - p//2 for p in pad_total]
+                    pad_tuple = tuple(p for pair in zip(pad_before[::-1], pad_after[::-1]) for p in pair)
+                    t = F.pad(t, pad_tuple)
+                slices = tuple(slice(0, s) for s in target)
+                result = t[slices]
+                merge_stats.smart_resized += 1
+                print(f"[SANCTUARY] Preserved sacred tensor: {self.key} → {result.shape}")
+                return result.to(dtype)
+
+        # ===================================================================
+        # NORMAL SMART RESIZE — Everything else gets full treatment
+        # ===================================================================
+
+        # 1D tensors (e.g. biases, norms)
         if t.ndim == 1:
             if len(target) >= 1 and t.shape[0] != target[0]:
-                t = F.interpolate(t.unsqueeze(0).unsqueeze(0), size=(target[0],), mode='linear')[0, 0]
+                t = F.interpolate(t.unsqueeze(0).unsqueeze(0), size=(target[0],), mode='linear', align_corners=False)[0, 0]
             return t.to(dtype)
 
-        # 2D tensors — THE CRITICAL FIX FOR CROSS-ARCH (SD1.5 ↔ SDXL)
+        # 2D tensors — Linear layers, attention, FFN
         if t.ndim == 2:
             if len(target) < 2 or target[0] >= 100000 or target[1] >= 100000:
-                return t  # insane size, skip
+                return t
 
-            # Memory-safe path: large first dim = likely token embedding (49408, 768) → (49408, 1280)
-            if target[0] > 20000:  # vocab-sized first dim
+            # Token embeddings (e.g. 49408,768 → 49408,1280)
+            if target[0] > 20000:
                 new_t = torch.zeros(target, device=device, dtype=dtype)
                 min_rows = min(t.shape[0], target[0])
                 for i in range(min_rows):
-                    row = t[i:i+1]  # (1, old_dim)
-                    resized_row = F.interpolate(
-                        row.unsqueeze(0).unsqueeze(0),  # (1, 1, 1, old_dim)
-                        size=(target[1],),
-                        mode='linear',
-                        align_corners=False
-                    )[0, 0]  # → (1, new_dim)
-                    new_t[i] = resized_row
-                # Extra rows stay zero (safe padding)
+                    row = t[i:i+1]
+                    resized = F.interpolate(row.unsqueeze(0).unsqueeze(0), size=(target[1],), mode='linear', align_corners=False)[0, 0]
+                    new_t[i] = resized
+                merge_stats.smart_resized += 1
                 return new_t.to(dtype)
             else:
-                # Fast path for normal layers (e.g., attention QKV, FFN)
-                return F.interpolate(
-                    t.unsqueeze(0).unsqueeze(0),
-                    size=target,
-                    mode='bilinear',
-                    align_corners=False
-                )[0, 0].to(dtype)
+                result = F.interpolate(t.unsqueeze(0).unsqueeze(0), size=target, mode='bilinear', align_corners=False)[0, 0]
+                merge_stats.smart_resized += 1
+                return result.to(dtype)
 
-        # 3D tensors (rare, e.g., positional embeddings)
+        # 3D tensors (positional embeddings, etc.)
         if t.ndim == 3:
             if len(target) >= 3 and all(s < 100000 for s in target):
-                t = F.interpolate(t.unsqueeze(0), size=target, mode='trilinear').squeeze(0)
-            return t.to(dtype)
+                result = F.interpolate(t.unsqueeze(0), size=target, mode='trilinear', align_corners=False).squeeze(0)
+                merge_stats.smart_resized += 1
+                return result.to(dtype)
 
-        # 4D tensors (Conv2d weights)
+        # 4D tensors — Conv2d weights
         if t.ndim == 4:
-            cout, cin, h, w = (target + t.shape[2:])[:4] if len(target) >= 4 else (t.shape[0], t.shape[1], t.shape[2], t.shape[3])
+            cout = target[0] if len(target) >= 4 else t.shape[0]
+            cin = target[1] if len(target) >= 4 else t.shape[1]
+            h, w = target[2:4] if len(target) >= 4 else t.shape[2:]
 
             if h > 1000 or w > 1000 or cout > 10000 or cin > 10000:
-                return t  # refuse dangerous resize
+                return t
 
             if (h, w) != t.shape[2:]:
                 t = F.interpolate(t, size=(h, w), mode='bilinear', align_corners=False)
 
             if t.shape[0] != cout or t.shape[1] != cin:
-                if t.shape[0] > cout:
-                    t = t[:cout]
-                elif t.shape[0] < cout:
-                    pad = torch.zeros((cout - t.shape[0], t.shape[1], h, w), device=device, dtype=dtype)
-                    t = torch.cat([t, pad], dim=0)
-
-                if t.shape[1] > cin:
-                    t = t[:, :cin]
-                elif t.shape[1] < cin:
-                    pad = torch.zeros((t.shape[0], cin - t.shape[1], h, w), device=device, dtype=dtype)
-                    t = torch.cat([t, pad], dim=1)
-
+                if t.shape[0] != cout:
+                    if t.shape[0] > cout:
+                        t = t[:cout]
+                    else:
+                        pad = torch.zeros((cout - t.shape[0], t.shape[1], h, w), device=device, dtype=dtype)
+                        t = torch.cat([t, pad], dim=0)
+                if t.shape[1] != cin:
+                    if t.shape[1] > cin:
+                        t = t[:, :cin]
+                    else:
+                        pad = torch.zeros((t.shape[0], cin - t.shape[1], h, w), device=device, dtype=dtype)
+                        t = torch.cat([t, pad], dim=1)
+            merge_stats.smart_resized += 1
             return t.to(dtype)
 
-        # Fallback: pad + slice (safe but less accurate)
-        pad = []
-        for s, tgt in zip(t.shape[::-1], target[::-1]):
-            diff = tgt - s
-            pad.extend([diff//2, diff - diff//2] if diff > 0 else [0, 0])
-        t = F.pad(t, pad[::-1])
+        # Final fallback — pad + slice
+        pad_total = [max(0, tgt - src) for tgt, src in zip(target, t.shape)]
+        if any(pad_total):
+            pad_before = [p // 2 for p in pad_total]
+            pad_after = [p - p//2 for p in pad_total]
+            pad_tuple = tuple(p for pair in zip(pad_before[::-1], pad_after[::-1]) for p in pair)
+            t = F.pad(t, pad_tuple)
         slices = tuple(slice(0, s) for s in target)
-        return t[slices].to(dtype)
+        result = t[slices]
+        merge_stats.smart_resized += 1
+        return result.to(dtype)

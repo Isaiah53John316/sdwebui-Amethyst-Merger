@@ -92,7 +92,6 @@ class AddDifference(MergeMode):
         diff = opr.Sub(key, b, c)
         if beta == 1:
             diff = opr.Smooth(key, diff)
-        diff.cache()
         diffm = opr.Multiply(key, alpha, diff)
         return opr.Add(key, a, diffm)
 
@@ -219,7 +218,6 @@ class TrainDifferenceCalc(CalcMode):
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
         diff = opr.TrainDiff(key, a, b, c)
-        diff.cache()
         diffm = opr.Multiply(key, alpha, diff)
         return opr.Add(key, a, diffm)
 
@@ -245,7 +243,6 @@ class ExtractCalc(CalcMode):
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
         extracted = opr.Extract(key, alpha, beta, gamma*15, a, b, c)
-        extracted.cache()
         multiplied = opr.Multiply(key, delta, extracted)
         return opr.Add(key, a, multiplied)
 
@@ -430,7 +427,6 @@ class SmoothMixCalc(CalcMode):
         b = opr.LoadTensor(key, model_b)
         diff = opr.Sub(key, b, a)
         diff = opr.Smooth(key, diff)
-        diff.cache()
         diffm = opr.Multiply(key, alpha, diff)
         return opr.Add(key, a, diffm)
 
@@ -450,7 +446,6 @@ class SmoothTrainDiffCalc(CalcMode):
         c = opr.LoadTensor(key, model_c)
         diff = opr.Sub(key, b, c)
         diff = opr.Smooth(key, diff)
-        diff.cache()
         diffm = opr.Multiply(key, alpha, diff)
         return opr.Add(key, a, diffm)
 
@@ -474,7 +469,6 @@ class AddDissimilarityCalc(CalcMode):
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
         extracted = opr.Similarities(key, alpha, 1, gamma*15, b, c)
-        extracted.cache()
         multiplied = opr.Multiply(key, beta, extracted)
         return opr.Add(key, a, multiplied)
 
