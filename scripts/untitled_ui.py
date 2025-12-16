@@ -659,11 +659,6 @@ def on_ui_tabs():
                         )
 
                         with gr.Row():
-                            cross_arch_mode = gr.Checkbox(
-                                label="Enable Cross-Arch Merge (SD1.5 / Pony / Flux to SDXL)",
-                                value=False,
-                                info="Resizes intelligently"
-                            )
                             keep_zero_fill = gr.Checkbox(
                                 label="Kitchen-Sink Mode (Preserve All Keys)",
                                 value=True,
@@ -674,13 +669,6 @@ def on_ui_tabs():
                                 value=False,
                                 info="Pad tensors for max file size (~7.5GB+) — like old mergers"
                             )
-
-                        # Cross-Arch handler
-                        cross_arch_mode.change(
-                            fn=lambda x: setattr(cmn, 'is_cross_arch', x),
-                            inputs=cross_arch_mode,
-                            outputs=None
-                        )
 
                         # Kitchen-Sink Mode (zero-fill) — save to options
 
@@ -1063,8 +1051,8 @@ def on_ui_tabs():
                     weight_editor = gr.Textbox(
                         label="Weight Editor (JSON)",
                         lines=10,
-                        placeholder='.*:alpha,beta,gamma,delta,epsilon',
-                        value=".*:alpha,beta,gamma,delta,epsilon"
+                        placeholder='all: slider_a, slider_b, slider_c, slider_d',
+                        value="all: slider_a, slider_b, slider_c, slider_d"
                     )
                     # Validation output
                     validation_output = gr.Textbox(

@@ -5,11 +5,110 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from modules import shared
 
+
+# common.py
+
+SACRED_PATTERNS = (
+    # ── Noise & timestep entry (sampling-critical) ──
+    "conv_in.",
+    "input_blocks.0.0.",
+    "time_embed.",
+    "time_embedding",
+    "timestep_embed",
+    "timestep_embedding",
+    "time_in.",
+    "vector_in.",
+    "img_in.",
+    "offset_noise",
+    "noise_offset",
+    "noise_augmentor",
+    "learned_sigma",
+    "sigma_embed",
+
+    # ── VAE (latent scaling differs per model) ──
+    "first_stage_model.",
+    "vae.",
+    "encoder.",
+    "decoder.",
+    "quant_conv.",
+    "post_quant_conv.",
+
+    # ── Text encoders / CLIP (semantic space) ──
+    "cond_stage_model.",
+    "conditioner.",
+    "text_model.",
+    "text_model.embeddings",
+    "token_embedding",
+    "position_embedding",
+    "positional_embedding",
+    "text_projection",
+    "logit_scale",
+
+    # ── Flux / SD3 / modern blocks ──
+    "single_blocks",
+    "double_blocks",
+    "img_proj",
+    "txt_proj",
+    "x_embedder",
+    "context_embedder",
+    "t_embedder",
+
+    # ── Positional embeddings (any architecture) ──
+    "pos_embed",
+    "position_emb",
+    "position_ids",
+)
+
+def is_sacred_key(key: str) -> bool:
+    """
+    Returns True if a tensor key must never be interpolated or mixed.
+    Sacred keys may be padded/truncated only.
+    """
+    k = (key or "").lower()
+    return any(p in k for p in SACRED_PATTERNS)
+
+
+# === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
+class MergeStats:
+    def __init__(self):
+        self.custom_merges     = 0   # Real merges from rules or global sliders
+        self.copied_primary    = 0   # Keys copied from primary (metadata, missing keys, etc.)
+        self.smart_resized     = 0   # Tensors that were resized (SmartResize called)
+        self.zero_filled       = 0   # Missing keys filled with zeros (kitchen-sink)
+        self.skipped           = 0   # Should always be 0 — true failure
+        self.smart_merge       = 0   # Sparse merges with multiple sources
+
+    def __str__(self):
+        total = (self.custom_merges +
+                 self.copied_primary +
+                 self.smart_resized +
+                 self.zero_filled +
+                 self.skipped +
+                 self.smart_merge)
+
+        kitchen_sink = "YES" if self.skipped == 0 else "ALMOST"
+        resize_active = "YES" if self.smart_resized > 0 else "NO"
+
+        return (
+            f"### AMETHYST MERGE COMPLETE ###\n"
+            f"  • Custom merges          : {self.custom_merges:,}\n"
+            f"  • Copied from Primary     : {self.copied_primary:,}  (metadata, missing keys)\n"
+            f"  • Smart-resized           : {self.smart_resized:,}  ({resize_active})\n"
+            f"  • Zero-filled (kitchen-sink): {self.zero_filled:,}\n"
+            f"  • Smart sparse merges     : {self.smart_merge:,}\n"
+            f"  • Skipped (truly missing) : {self.skipped:,}\n"
+            f"  • Total keys processed    : {total:,}\n"
+            f"  • True Kitchen-Sink       : {kitchen_sink}"
+        )
+
+
+# Global instance
+merge_stats = MergeStats()
+
 class MergerContext:
     def __init__(self):
         self.device = None
         self.dtype = torch.float32
-        self.is_cross_arch = False
         self.primary = None
 
         # ✅ MUST start as None
@@ -18,9 +117,14 @@ class MergerContext:
         # ✅ used by LoadTensor fallback
         self.checkpoints_global = []
 
+        # Target shapes for SmartResize and zero-fill — ALWAYS useful
         self.cross_arch_target_shapes = {}
+
         self.last_merge_tasks = None
         self.opts = {}
+
+        # Dual-Soul state — now the only architecture flag that matters
+        self.same_arch = True
 
     def get_device(self):
         return self.device
@@ -137,6 +241,17 @@ def get_dtype(self) -> torch.dtype:
     else:
         # Default: float16 (fastest on modern GPUs)
         return torch.float16
+    
+def safe_apply(op, base, other, key=None):
+    """
+    Apply a binary tensor op safely.
+    Prevents broadcasting and catastrophic allocation.
+    """
+    if base.shape != other.shape:
+        if key:
+            print(f"[SafeOp] Shape mismatch skipped: {key} {base.shape} vs {other.shape}")
+        return base
+    return op(base, other)
 
 # =============================================================================
 # GLOBAL STATE — Clean and Minimal
