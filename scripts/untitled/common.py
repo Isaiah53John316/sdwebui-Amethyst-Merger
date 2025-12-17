@@ -25,6 +25,15 @@ SACRED_PATTERNS = (
     "learned_sigma",
     "sigma_embed",
 
+    # ── Input stems / patch embeddings ──
+    "patch_embed",
+    "patch_embedding",
+    "input_proj",
+    "input_projection",
+    "stem.",
+    "image_embed",
+    "image_embedding",
+
     # ── VAE (latent scaling differs per model) ──
     "first_stage_model.",
     "vae.",
@@ -44,6 +53,22 @@ SACRED_PATTERNS = (
     "text_projection",
     "logit_scale",
 
+    # ── Cross-modal gating & modulation ──
+    "gate",
+    "gating",
+    "modulator",
+    "modulation",
+    "scale_shift",
+    "scale_and_shift",
+    "affine",
+
+    # ── Adaptive / conditional normalization ──
+    "adaptive_norm",
+    "conditional_norm",
+    "ada_norm",
+    "ada_layernorm",
+    "ada_ln",
+
     # ── Flux / SD3 / modern blocks ──
     "single_blocks",
     "double_blocks",
@@ -58,14 +83,6 @@ SACRED_PATTERNS = (
     "position_emb",
     "position_ids",
 )
-
-def is_sacred_key(key: str) -> bool:
-    """
-    Returns True if a tensor key must never be interpolated or mixed.
-    Sacred keys may be padded/truncated only.
-    """
-    k = (key or "").lower()
-    return any(p in k for p in SACRED_PATTERNS)
 
 
 # === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===

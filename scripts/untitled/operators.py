@@ -788,9 +788,9 @@ class TIES(Operation):
 
         return result.to(base.dtype)
 
-class DARE(Operation):
+class WISE(Operation):
     """
-    N-way DARE:
+    N-way WISE:
       - Select per-element strongest delta among contributors
       - Top-k mask with optional dropout
       - Random scaling on masked entries
@@ -871,6 +871,272 @@ class DARE(Operation):
             dared_delta = dared_delta * (total_energy / (dd_norm + 1e-8))
 
         return (base + dared_delta).to(base.dtype)
+
+class DARE_Nway(Operation):
+    """
+    True N-way DARE:
+      - Symmetric contributors
+      - Per-source sparse deltas
+      - Additive (non-competitive)
+      - Direction-preserving
+      - Energy-stable
+    """
+    def __init__(self, key, density, dropout_p=0.0, seed=42, base_mode="mean", *sources):
+        super().__init__(key, *sources)
+        self.density = float(density)
+        self.dropout_p = float(dropout_p)
+        self.seed = int(seed)
+        self.base_mode = base_mode
+
+    @multi_cache_operation
+    def oper(self, *tensors):
+        valid = [t for t in tensors if t.numel() > 0 and torch.any(t != 0)]
+        if not valid:
+            return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
+        if len(valid) == 1:
+            return valid[0]
+
+        # Base selection
+        if self.base_mode == "mean":
+            base = torch.mean(torch.stack(valid), dim=0)
+        elif self.base_mode == "first":
+            base = valid[0]
+        else:
+            raise ValueError("Unknown base_mode")
+
+        torch.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
+
+        merged_delta = torch.zeros_like(base)
+        total_energy = 0.0
+
+        for t in valid:
+            delta = t - base
+            if torch.all(delta == 0):
+                continue
+
+            # Per-source sparsity
+            k = max(1, int(self.density * delta.numel()))
+            mags = delta.abs().flatten()
+            threshold = torch.topk(mags, k).values[-1]
+            mask = delta.abs() >= threshold
+
+            # Optional dropout
+            if self.dropout_p > 0.0:
+                keep = 1.0 - self.dropout_p
+                drop = torch.bernoulli(
+                    torch.full_like(mask.float(), keep)
+                ).bool()
+                mask &= drop
+
+            sparse_delta = delta * mask.to(delta.dtype)
+
+            merged_delta += sparse_delta
+            total_energy += delta.norm(p=2)
+
+        # Energy normalization
+        md_norm = merged_delta.norm(p=2)
+        if md_norm > 1e-8:
+            merged_delta *= total_energy / (md_norm + 1e-8)
+
+        return (base + merged_delta).to(base.dtype)
+
+class DAREWISE(Operation):
+    """
+    DARE+WISE Hybrid:
+      - DARE provides sparse, additive, energy-stable structure
+      - WISE provides competitive, high-contrast detail
+      - Key-based or block-based gating decides which dominates
+      - Optional soft blending between the two
+    """
+    def __init__(
+        self,
+        key,
+        dare_density,
+        dare_dropout,
+        wise_density,
+        wise_dropout,
+        mix=0.5,                 # 0 = pure DARE, 1 = pure WISE
+        seed=42,
+        *sources
+    ):
+        super().__init__(key, *sources)
+        self.dare_density = float(dare_density)
+        self.dare_dropout = float(dare_dropout)
+        self.wise_density = float(wise_density)
+        self.wise_dropout = float(wise_dropout)
+        self.mix = float(mix)
+        self.seed = int(seed)
+
+    @multi_cache_operation
+    def oper(self, *tensors):
+        valid = [t for t in tensors if t.numel() > 0 and torch.any(t != 0)]
+        if not valid:
+            return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
+        if len(valid) == 1:
+            return valid[0]
+
+        # --- Step 1: Compute both candidate merges ---
+        dare = Operation.DARE_Nway(
+            self.key,
+            self.dare_density,
+            self.dare_dropout,
+            self.seed,
+            *valid
+        ).oper(*valid)
+
+        wise = Operation.WISE(
+            self.key,
+            self.wise_density,
+            self.wise_dropout,
+            self.seed + 1337,
+            *valid
+        ).oper(*valid)
+
+        # --- Step 2: Decide which philosophy dominates ---
+        # Attention & projections are fragile → favor DARE
+        key_lower = self.key.lower()
+        attention_safe = any(
+            s in key_lower
+            for s in ("attn", "attention", "to_q", "to_k", "to_v", "proj")
+        )
+
+        if attention_safe:
+            gate = 0.0   # pure DARE
+        else:
+            gate = self.mix
+
+        # --- Step 3: Blend ---
+        if gate <= 0.0:
+            out = dare
+        elif gate >= 1.0:
+            out = wise
+        else:
+            out = torch.lerp(dare, wise, gate)
+
+        return out.to(dare.dtype)
+
+class AdaptiveDAREWISE(Operation):
+    """
+    Adaptive DARE+WISE:
+      - Computes both DARE and WISE candidates
+      - Builds an internal 'aggression field' A ∈ [0, 1]
+      - A decides how much WISE is allowed per tensor
+      - Attention layers hard-lock to DARE
+    """
+    def __init__(
+        self,
+        key,
+        dare_density,
+        dare_dropout,
+        wise_density,
+        wise_dropout,
+        aggression_bias=0.5,   # user-facing control
+        seed=42,
+        *sources
+    ):
+        super().__init__(key, *sources)
+        self.dare_density = float(dare_density)
+        self.dare_dropout = float(dare_dropout)
+        self.wise_density = float(wise_density)
+        self.wise_dropout = float(wise_dropout)
+        self.bias = float(aggression_bias)
+        self.seed = int(seed)
+
+    @multi_cache_operation
+    def oper(self, *tensors):
+        valid = [t for t in tensors if t.numel() > 0 and torch.any(t != 0)]
+        if not valid:
+            return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
+        if len(valid) == 1:
+            return valid[0]
+
+        # -------------------------
+        # Step 1: compute deltas
+        # -------------------------
+        base = torch.mean(torch.stack(valid), dim=0)
+        deltas = [t - base for t in valid]
+
+        # -------------------------
+        # Step 2: aggression signals
+        # -------------------------
+
+        # (a) Delta agreement (cosine similarity)
+        if len(deltas) >= 2:
+            flat = [d.flatten() for d in deltas]
+            sims = []
+            for i in range(len(flat) - 1):
+                num = torch.dot(flat[i], flat[i + 1])
+                den = flat[i].norm() * flat[i + 1].norm() + 1e-8
+                sims.append((num / den).clamp(-1, 1))
+            agreement = torch.mean(torch.stack(sims))
+            A_similarity = ((agreement + 1) * 0.5).item()
+        else:
+            A_similarity = 0.0
+
+        # (b) Variance safety
+        stacked = torch.stack(deltas)
+        var = stacked.var(dim=0).mean().item()
+        A_variance = float(torch.exp(-var))  # high variance → low aggression
+
+        # (c) Block-depth heuristic (cheap, key-based)
+        depth_scale = 1.0
+        if "down_blocks" in self.key:
+            depth_scale = 0.3
+        elif "mid_block" in self.key:
+            depth_scale = 0.6
+        elif "up_blocks" in self.key:
+            depth_scale = 1.0
+
+        # -------------------------
+        # Step 3: attention override
+        # -------------------------
+        key_lower = self.key.lower()
+        attention_safe = any(
+            s in key_lower
+            for s in ("attn", "attention", "to_q", "to_k", "to_v", "proj")
+        )
+
+        if attention_safe:
+            A = 0.0
+        else:
+            # Combine signals
+            A = (
+                0.45 * A_similarity +
+                0.35 * A_variance
+            )
+            A *= depth_scale
+            A = float(torch.clamp(torch.tensor(A * self.bias), 0.0, 1.0))
+
+        # -------------------------
+        # Step 4: compute candidates
+        # -------------------------
+        dare = Operation.DARE_Nway(
+            self.key,
+            self.dare_density,
+            self.dare_dropout,
+            self.seed,
+            *valid
+        ).oper(*valid)
+
+        wise = Operation.WISE(
+            self.key,
+            self.wise_density,
+            self.wise_dropout,
+            self.seed + 1337,
+            *valid
+        ).oper(*valid)
+
+        # -------------------------
+        # Step 5: adaptive blend
+        # -------------------------
+        if A <= 0.0:
+            out = dare
+        elif A >= 1.0:
+            out = wise
+        else:
+            out = torch.lerp(dare, wise, A)
+
+        return out.to(dare.dtype)
 
 
 class SLERP(Operation):
@@ -1384,7 +1650,9 @@ class SmartResize(Operation):
         super().__init__(key)
         self.target_shape = tuple(target_shape) if target_shape is not None else None
         self.source_tensor = source_tensor
-        self.orig_key = orig_key or key  # real tensor key for sacred checks
+
+        # 🔧 CHANGE 1: always preserve the *true* tensor key for policy checks
+        self.orig_key = orig_key if orig_key is not None else key
 
     @multi_cache_operation
     def oper(self, *tensors):
@@ -1409,29 +1677,23 @@ class SmartResize(Operation):
         if t.numel() == 0:
             return torch.zeros(target, device=device, dtype=dtype)
 
-        key_l = (self.orig_key or "").lower()
+        # 🔧 CHANGE 2: sacred check uses canonical key only
+        # (no local lowercase copies, no prefixed keys)
+        is_sacred = cmn.is_sacred_key(self.orig_key)
 
         # --------------------------
         # Helpers
         # --------------------------
         def _pad_slice_to_target(x: torch.Tensor, tgt_shape: tuple) -> torch.Tensor:
-            """
-            Safe pad/slice for arbitrary ndim:
-              - Creates zeros(tgt_shape)
-              - Copies overlapping region
-            """
-            # If rank mismatch, we can only safely handle if we can broadcast by adding/removing
             if x.ndim != len(tgt_shape):
-                # Try trivial scalar case
                 if x.ndim == 0 and len(tgt_shape) == 0:
                     return x
-                # Otherwise: safest is "return x" (policy: don't fabricate structure)
                 return x
 
             out = torch.zeros(tgt_shape, device=x.device, dtype=x.dtype)
             slices_out = []
             slices_in = []
-            for dim, (src, tgt) in enumerate(zip(x.shape, tgt_shape)):
+            for src, tgt in zip(x.shape, tgt_shape):
                 n = min(src, tgt)
                 slices_out.append(slice(0, n))
                 slices_in.append(slice(0, n))
@@ -1439,13 +1701,8 @@ class SmartResize(Operation):
             return out
 
         def _interp_last_dim(block: torch.Tensor, new_last: int) -> torch.Tensor:
-            """
-            Linear interpolate along last dimension only.
-            Expects float tensor; caller can cast.
-            """
             if block.shape[-1] == new_last:
                 return block
-            # reshape to (N, C, L) for 1D interpolate
             flat = block.reshape(-1, 1, block.shape[-1])
             resized = F.interpolate(flat, size=new_last, mode="linear", align_corners=False)
             return resized.reshape(*block.shape[:-1], new_last)
@@ -1456,11 +1713,10 @@ class SmartResize(Operation):
         # ===============================================================
         # SACRED: NEVER interpolate, only pad/slice
         # ===============================================================
-        if cmn.is_sacred_key(key_l):
+        if is_sacred:
             if t.shape == target:
                 return t.to(dtype)
 
-            # If rank mismatch, safest is pad/slice only when ranks match; else return as-is
             if t.ndim != len(target):
                 return t.to(dtype)
 
@@ -1473,102 +1729,82 @@ class SmartResize(Operation):
         # NORMAL: interpolation allowed
         # ===============================================================
 
-        # Rank mismatch: safest non-destructive behavior
         if t.ndim != len(target):
-            # If it’s safe to pad/slice (same rank), it would have passed above.
-            # Here: return as-is to avoid inventing structure.
             return t.to(dtype)
 
-        # Non-float tensors: do NOT interpolate; pad/slice only
         if not _is_floatish(t):
             result = _pad_slice_to_target(t, target)
             merge_stats.smart_resized += 1
             return result.to(dtype)
 
-        # 1D tensors
+        # 1D
         if t.ndim == 1:
             if t.shape == target:
                 return t.to(dtype)
-            # linear interpolate to new length
             tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
             tmp = F.interpolate(tmp[None, None, :], size=target[0], mode="linear", align_corners=False)[0, 0]
             merge_stats.smart_resized += 1
             return tmp.to(dtype)
 
-        # 2D tensors
+        # 2D
         if t.ndim == 2:
             if t.shape == target:
                 return t.to(dtype)
 
-            # "huge vocab" heuristic: preserve rows, resize only feature dim
             if target[0] > 20_000:
                 rows = min(t.shape[0], target[0])
                 tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-
                 new_t = torch.zeros(target, device=device, dtype=tmp.dtype)
-                # Resize each row along the feature dimension
+
                 for i in range(rows):
-                    row = tmp[i:i + 1]                       # (1, D)
-                    row = row.unsqueeze(0).unsqueeze(0)      # (1, 1, 1, D)
+                    row = tmp[i:i + 1].unsqueeze(0).unsqueeze(0)
                     resized = F.interpolate(
                         row,
                         size=(1, target[1]),
                         mode="bilinear",
                         align_corners=False
-                    )[0, 0, 0]                                # (D_new,)
+                    )[0, 0, 0]
                     new_t[i] = resized
 
                 merge_stats.smart_resized += 1
                 return new_t.to(dtype)
 
-            # General 2D: resize both dims (treat as an image)
             tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
             out = F.interpolate(tmp[None, None, :, :], size=target, mode="bilinear", align_corners=False)[0, 0]
             merge_stats.smart_resized += 1
             return out.to(dtype)
 
-        # 3D tensors: SAFE strategy
-        # - pad/slice first two dims
-        # - interpolate last dim only (linear)
+        # 3D
         if t.ndim == 3:
             if t.shape == target:
                 return t.to(dtype)
 
             tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-
-            # create padded/sliced container for first two dims
             out = torch.zeros(target, device=device, dtype=tmp.dtype)
 
             a = min(tmp.shape[0], target[0])
             b = min(tmp.shape[1], target[1])
-            block = tmp[:a, :b, :]  # (..., old_last)
-
-            # resize last dim only
+            block = tmp[:a, :b, :]
             block = _interp_last_dim(block, target[2])
-
             out[:a, :b, :] = block
+
             merge_stats.smart_resized += 1
             return out.to(dtype)
 
-        # 4D tensors: Conv weights are OIHW. Resize spatial only.
+        # 4D (OIHW conv)
         if t.ndim == 4:
             if t.shape == target:
                 return t.to(dtype)
 
             tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-
             tgt_o, tgt_i, tgt_h, tgt_w = target
             src_o, src_i, src_h, src_w = tmp.shape
 
-            # 1) pad/slice channels (O and I) first
-            # create intermediate with target O/I but source H/W for now
             inter = torch.zeros((tgt_o, tgt_i, src_h, src_w), device=device, dtype=tmp.dtype)
-
             o = min(src_o, tgt_o)
             i = min(src_i, tgt_i)
             inter[:o, :i, :, :] = tmp[:o, :i, :, :]
 
-            # 2) resize spatial per-kernel: reshape to (N, C, H, W) with N = O*I, C=1
             if (src_h, src_w) != (tgt_h, tgt_w):
                 flat = inter.reshape(-1, 1, src_h, src_w)
                 flat = F.interpolate(flat, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
@@ -1577,7 +1813,6 @@ class SmartResize(Operation):
             merge_stats.smart_resized += 1
             return inter.to(dtype)
 
-        # Fallback: safe pad/slice
         result = _pad_slice_to_target(t, target)
         merge_stats.smart_resized += 1
         return result.to(dtype)

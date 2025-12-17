@@ -1078,7 +1078,6 @@ def initialize_task(task):
     """
 
     key = task.key
-    key_l = key.lower()
     target_shape = cmn.cross_arch_target_shapes.get(key)
 
     task_type = task.__class__.__name__
@@ -1087,6 +1086,7 @@ def initialize_task(task):
 
     # =====================================================
     # 1. FAST PATH — custom operator owns everything
+    #    (ALLOWED: sacred only matters cross-arch)
     # =====================================================
     try:
         tensor = task.merge()
@@ -1111,7 +1111,8 @@ def initialize_task(task):
                     t = SmartResize(
                         f"dual_soul_{key}",
                         target_shape,
-                        source_tensor=t
+                        source_tensor=t,
+                        orig_key=key          # 🔧 FIX
                     ).oper(t)
 
                 merge_stats.copied_primary += 1
@@ -1121,7 +1122,6 @@ def initialize_task(task):
             except Exception as e:
                 print(f"[DualSoul] FAILED preserving {key}: {e}")
 
-        # Sacred but unavailable anywhere → do not fabricate
         merge_stats.skipped += 1
         print(f"[DualSoul] Sacred key missing — SKIPPED: {key}")
         return key, None
@@ -1143,17 +1143,16 @@ def initialize_task(task):
         try:
             t = f.get_tensor(key)
 
-            # Shape enforcement only
             if target_shape and t.shape != target_shape:
                 t = SmartResize(
                     f"sparse_{key}",
                     target_shape,
-                    source_tensor=t
+                    source_tensor=t,
+                    orig_key=key          # 🔧 FIX
                 ).oper(t)
-                merge_stats.smart_resized += 1
 
             if target_shape and t.shape != target_shape:
-                continue  # still unsafe → skip contributor
+                continue
 
             tensors.append(t.to(cmn.get_device(), dtype=cmn.get_dtype()))
             sources.append(os.path.basename(cp_path))
@@ -1165,7 +1164,6 @@ def initialize_task(task):
     # 4. FINAL DECISION TREE
     # =====================================================
     if not tensors:
-        # Primary fallback (non-sacred only)
         primary = cmn.primary
         f = cmn.loaded_checkpoints.get(primary)
 
@@ -1177,9 +1175,9 @@ def initialize_task(task):
                     t = SmartResize(
                         f"finalcopy_{key}",
                         target_shape,
-                        source_tensor=t
+                        source_tensor=t,
+                        orig_key=key          # 🔧 FIX
                     ).oper(t)
-                    merge_stats.smart_resized += 1
 
                 merge_stats.copied_primary += 1
                 print(f"[FinalCopy] {key} ← primary")
@@ -1188,7 +1186,6 @@ def initialize_task(task):
             except Exception as e:
                 print(f"[FinalCopy] FAILED {key}: {e}")
 
-        # Absolute fallback — zero-fill only if shape known
         if target_shape:
             merge_stats.zero_filled += 1
             print(f"[Emergency] {key} ← ZERO-FILLED")
@@ -1213,16 +1210,16 @@ def initialize_task(task):
     merge_stats.smart_merge += 1
 
     result = tensors[0].clone()
+    count = 1                         # 🔧 FIX
     for t in tensors[1:]:
         if t.shape == result.shape:
             result += t
+            count += 1
 
-    result /= len(tensors)
+    result /= count                   # 🔧 FIX
 
     print(f"[SmartMerge] {key} ← {', '.join(sources)}")
     return key, result.to(cmn.get_dtype())
-
-
 
 
 def get_tensors_from_loaded_model(state_dict: dict, tasks: list) -> tuple[dict, list]:

@@ -353,9 +353,9 @@ class AutoEnhInterpDifferenceCalc(CalcMode):
 CALCMODES_LIST.append(AutoEnhInterpDifferenceCalc)
 
 
-class DARECalc(CalcMode):
-    name = 'DARE (2025)'
-    description = 'Dropout-Aware REweighting — current SOTA for interference-free merges'
+class WISECalc(CalcMode):
+    name = 'WISE'
+    description = 'Winner-Indexed Sparse Energy merge'
     compatible_modes = ['Weight-Sum', 'Add Difference']
     input_models = 2
 
@@ -371,14 +371,14 @@ class DARECalc(CalcMode):
         density = alpha
         dropout_p = beta
         seed = cmn.last_merge_seed or 42
-        return opr.DARE(key, density, dropout_p, seed, a, b)
+        return opr.WISE(key, density, dropout_p, seed, a, b)
 
-CALCMODES_LIST.append(DARECalc)
+CALCMODES_LIST.append(WISECalc)
 
 
-class DARE3Calc(CalcMode):
-    name = 'DARE (3-model)'
-    description = 'True 3-model DARE — current SOTA for triple fusions (A + DARE(B-A) + DARE(C-A))'
+class WISE3Calc(CalcMode):
+    name = 'WISE (3-model)'
+    description = '3-model WISE'
     compatible_modes = ['Weight-Sum']
     input_models = 3
     slid_a_info = "Density for Model B (0.10–0.30)"
@@ -396,11 +396,11 @@ class DARE3Calc(CalcMode):
         c = opr.LoadTensor(key, model_c)
 
         seed = cmn.last_merge_seed or 42
-        intermediate = opr.DARE(key, alpha, beta, seed, a, b)
-        result = opr.DARE(key, gamma, delta, seed + 1, intermediate, c)
+        intermediate = opr.WISE(key, alpha, beta, seed, a, b)
+        result = opr.WISE(key, gamma, delta, seed + 1, intermediate, c)
         return result
 
-CALCMODES_LIST.append(DARE3Calc)
+CALCMODES_LIST.append(WISE3Calc)
 
 class SmoothMixCalc(CalcMode):
     name = 'Smooth Mix (legacy)'
@@ -484,38 +484,53 @@ CALCMODES_LIST.append(TIESCalc)
 class SLERPCalc(CalcMode):
     name = 'SLERP (Spherical)'
     description = 'True spherical linear interpolation — best for cross-family merges'
-    compatible_modes = ['Weight-Sum', 'Add Difference']  # works best with Weight-Sum
+    compatible_modes = ['Weight-Sum', 'Add Difference']
     input_models = 2
 
     slid_a_info = "Blend ratio (0 = Model A, 1 = Model B)"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    # NO self — this fork calls statically!
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0, **kwargs):
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5, beta=0, gamma=0, **kwargs
+    ):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
 
-        return opr.SLERP(key, alpha, a, b)
+        # weights = [Model B], base = Model A
+        return opr.SLERP(key, [alpha], a, b)
 
 CALCMODES_LIST.append(SLERPCalc)
+
+
 
 class SLERP3Calc(CalcMode):
     name = 'SLERP (3-model Spherical)'
     description = 'True 3-point spherical interpolation — perfect for triple fusions'
     compatible_modes = ['Weight-Sum', 'Add Difference']
     input_models = 3
-    slid_a_info = "Weight for Model B (0-1)"
+
+    slid_a_info = "Weight for Model B (0–1)"
     slid_a_config = (0.0, 1.0, 0.01)
-    slid_b_info = "Weight for Model C (0-1, total B+C ≤1)"
+
+    slid_b_info = "Weight for Model C (0–1, total B+C ≤ 1)"
     slid_b_config = (0.0, 1.0, 0.01)
 
-    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.5, beta=0.3, gamma=0, **kwargs):
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5, beta=0.3, gamma=0, **kwargs
+    ):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
         c = opr.LoadTensor(key, model_c)
-        return opr.SLERP(key, alpha, beta, a, b, c)
+
+        # weights = [Model B, Model C], base = Model A
+        return opr.SLERP(key, [alpha, beta], a, b, c)
 
 CALCMODES_LIST.append(SLERP3Calc)
+
 
 class ReBasinCalc(CalcMode):
     name = 'Git Re-Basin'
@@ -680,3 +695,234 @@ class SVDDeNoiseCalc(CalcMode):
         return opr.SingularValueDeOperator(key, alpha, beta, seed, a, b)
 
 CALCMODES_LIST.append(SVDDeNoiseCalc)
+
+class DARECalc(CalcMode):
+    name = 'DARE'
+    description = 'Sparse delta merging with per-source density (DARE)'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Density (keep %) — 0.10–0.25"
+    slid_a_config = (0.01, 0.5, 0.01)
+
+    slid_b_info = "Dropout probability — 0.2–0.5"
+    slid_b_config = (0.0, 0.7, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.15, beta=0.3, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        density = alpha
+        dropout_p = beta
+        seed = cmn.last_merge_seed or 42
+        return opr.DARE_Nway(key, density, dropout_p, seed, a, b)
+
+CALCMODES_LIST.append(DARECalc)
+
+
+class DARE3Calc(CalcMode):
+    name = 'DARE (3-model)'
+    description = '3-model DARE'
+    compatible_modes = ['Weight-Sum']
+    input_models = 3
+    slid_a_info = "Density for Model B (0.10–0.30)"
+    slid_a_config = (0.01, 0.5, 0.01)
+    slid_b_info = "Dropout for Model B (0.2–0.5)"
+    slid_b_config = (0.0, 0.7, 0.05)
+    slid_c_info = "Density for Model C (0.10–0.30)"
+    slid_c_config = (0.01, 0.5, 0.01)
+    slid_d_info = "Dropout for Model C (0.2–0.5)"
+    slid_d_config = (0.0, 0.7, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d, alpha=0.18, beta=0.35, gamma=0.15, delta=0.40, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        seed = cmn.last_merge_seed or 42
+        intermediate = opr.DARE_Nway(key, alpha, beta, seed, a, b)
+        result = opr.DARE_Nway(key, gamma, delta, seed + 1, intermediate, c)
+        return result
+
+CALCMODES_LIST.append(DARE3Calc)
+
+class DAREWISECalc(CalcMode):
+    name = 'DAREWISE'
+    description = 'Hybrid merge: DARE (structure) + WISE (style)'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "DARE density (structure)"
+    slid_a_config = (0.01, 0.5, 0.01)
+    slid_b_info = "DARE dropout"
+    slid_b_config = (0.0, 0.7, 0.05)
+    slid_c_info = "WISE density (style)"
+    slid_c_config = (0.01, 0.5, 0.01)
+    slid_d_info = "WISE dropout"
+    slid_d_config = (0.0, 0.7, 0.05)
+    slid_e_info = "Style mix (0 = DARE, 1 = WISE)"
+    slid_e_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.15, beta=0.3, gamma=0.15, delta=0.3, epsilon=0.5, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        seed = cmn.last_merge_seed or 42
+        return opr.DAREWISE(key, alpha, beta, gamma, delta, epsilon, seed, a, b)
+
+CALCMODES_LIST.append(DAREWISECalc)
+
+
+class AdaptiveDAREWISECalc(CalcMode):
+    name = 'DAREWISE (Adaptive)'
+    description = 'Self-regulating hybrid merge — structure-safe by default'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Aggression bias (0 = safe, 1 = expressive)"
+    slid_a_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.5, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        seed = cmn.last_merge_seed or 42
+        return opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+
+CALCMODES_LIST.append(AdaptiveDAREWISECalc)
+
+
+class AdaptiveDAREWISE3Calc(CalcMode):
+    name = 'DAREWISE (Adaptive, 3-model)'
+    description = '3-model adaptive hybrid merge — structure-safe by default'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Aggression bias (0 = safe, 1 = expressive)"
+    slid_a_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.5, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+        seed = cmn.last_merge_seed or 42
+        ab = opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+        return opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed + 1, ab, c)
+
+CALCMODES_LIST.append(AdaptiveDAREWISE3Calc)
+
+class ProgressiveDAREWISEBalancedCalc(CalcMode):
+    name = 'DAREWISE (Progressive – Balanced)'
+    description = 'Structure → adaptive → balanced style (safe default)'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Style bias (global)"
+    slid_a_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.5, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        seed = cmn.last_merge_seed or 42
+        k = key.lower()
+
+        if any(s in k for s in ('attn', 'attention', 'to_q', 'to_k', 'to_v', 'proj')):
+            return opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        if 'down_blocks' in k or 'input_blocks' in k:
+            return opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        if 'mid_block' in k:
+            return opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+
+        return opr.DAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+
+CALCMODES_LIST.append(ProgressiveDAREWISEBalancedCalc)
+
+
+class ProgressiveDAREWISEBalanced3Calc(CalcMode):
+    name = 'DAREWISE (Progressive – Balanced, 3-model)'
+    description = '3-model structure → adaptive → balanced style'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Style bias (global)"
+    slid_a_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.5, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+        seed = cmn.last_merge_seed or 42
+        k = key.lower()
+
+        if any(s in k for s in ('attn', 'attention', 'to_q', 'to_k', 'to_v', 'proj')):
+            ab = opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        elif 'down_blocks' in k or 'input_blocks' in k:
+            ab = opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        elif 'mid_block' in k:
+            ab = opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+        else:
+            ab = opr.DAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+
+        return opr.DAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed + 1, ab, c)
+
+CALCMODES_LIST.append(ProgressiveDAREWISEBalanced3Calc)
+
+
+class ProgressiveDAREWISEAggressiveCalc(CalcMode):
+    name = 'DAREWISE (Progressive – Aggressive)'
+    description = 'Structure → adaptive → pure style (maximum takeover)'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Style bias (global)"
+    slid_a_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.5, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        seed = cmn.last_merge_seed or 42
+        k = key.lower()
+
+        if any(s in k for s in ('attn', 'attention', 'to_q', 'to_k', 'to_v', 'proj')):
+            return opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        if 'down_blocks' in k or 'input_blocks' in k:
+            return opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        if 'mid_block' in k:
+            return opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+
+        return opr.WISE(key, 0.18, 0.35, seed, a, b)
+
+CALCMODES_LIST.append(ProgressiveDAREWISEAggressiveCalc)
+
+class ProgressiveDAREWISEAggressive3Calc(CalcMode):
+    name = 'DAREWISE (Progressive – Aggressive, 3-model)'
+    description = '3-model structure → adaptive → pure style'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Style bias (global)"
+    slid_a_config = (0.0, 1.0, 0.05)
+
+    def modify_recipe(recipe, key, model_a, model_b, model_c, model_d,
+                      alpha=0.5, beta=0, gamma=0, delta=0, **kwargs):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+        seed = cmn.last_merge_seed or 42
+        k = key.lower()
+
+        if any(s in k for s in ('attn', 'attention', 'to_q', 'to_k', 'to_v', 'proj')):
+            ab = opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        elif 'down_blocks' in k or 'input_blocks' in k:
+            ab = opr.DARE_Nway(key, 0.15, 0.25, seed, a, b)
+        elif 'mid_block' in k:
+            ab = opr.AdaptiveDAREWISE(key, 0.15, 0.25, 0.18, 0.35, alpha, seed, a, b)
+        else:
+            ab = opr.WISE(key, 0.18, 0.35, seed, a, b)
+
+        return opr.WISE(key, 0.18, 0.35, seed + 1, ab, c)
+
+CALCMODES_LIST.append(ProgressiveDAREWISEAggressive3Calc)
