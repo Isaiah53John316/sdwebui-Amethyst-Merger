@@ -14,6 +14,14 @@ import torch
 import safetensors.torch
 from safetensors.torch import save_file, load_file
 from safetensors import safe_open as safetensors_open
+from safetensors.torch import safe_open
+from modules import sd_models
+
+from scripts.untitled.common import extract_submodel
+from scripts.untitled import merger
+from scripts.untitled.misc_util import save_state_dict
+from scripts.untitled.common import is_vae_key, is_clip_key
+
 
 warnings.filterwarnings("ignore", message=".*UniPC.*")  # Harmless sampler spam
 
@@ -98,33 +106,47 @@ def save_extracted(
     target_dtype=torch.float16,
 ):
     """
-    Save an extracted submodel (VAE / CLIP / etc) with optional metadata.
+    Save an extracted submodel (VAE / CLIP / etc) as a standalone safetensors file.
     """
+
     if not state_dict:
         if progress:
             progress("[Extract WARNING] Nothing to save")
         return None
 
-    # Normalize dtype
+    # --------------------------------------------------
+    # Normalize tensors (CPU + dtype-safe)
+    # --------------------------------------------------
     out = {}
     for k, v in state_dict.items():
-        if v.is_floating_point():
-            out[k] = v.to(dtype=target_dtype)
+        if hasattr(v, "is_floating_point") and v.is_floating_point():
+            out[k] = v.detach().cpu().to(dtype=target_dtype)
         else:
-            out[k] = v
+            out[k] = v.detach().cpu()
 
-    # Safetensors requires metadata values to be strings
+    # --------------------------------------------------
+    # Metadata (safetensors requires string values)
+    # --------------------------------------------------
     meta = {}
     if metadata:
-        meta = {str(k): str(v) for k, v in metadata.items()}
+        meta.update({str(k): str(v) for k, v in metadata.items()})
 
+    # Optional provenance (safe + helpful)
+    meta.setdefault("amethyst:component_tensors", str(len(out)))
+    meta.setdefault("amethyst:format", "component_extract")
+
+    # --------------------------------------------------
+    # Resolve filename
+    # --------------------------------------------------
     filename = name if name.endswith(".safetensors") else f"{name}.safetensors"
 
-    save_file(
-        out,
-        filename,
-        metadata=meta
-    )
+    # --------------------------------------------------
+    # Save
+    # --------------------------------------------------
+    from safetensors.torch import save_file
+    import os
+
+    save_file(out, filename, metadata=meta)
 
     if progress:
         progress(
@@ -132,6 +154,7 @@ def save_extracted(
         )
 
     return filename
+
 
 def target_to_regex(target_input: str | list) -> str:
     """
@@ -710,3 +733,200 @@ def save_metadata(filename: str, metadata: dict):
         "Safetensors metadata must be written during initial save."
     )
     print(f"[Merger] Metadata ignored for {filename}")
+
+def inject_checkpoint_components(
+    target_checkpoint_name,
+    vae_path,
+    clip_path,
+    inject_mode,
+):
+    """
+    Inject external VAE / CLIP into a checkpoint.
+    Creates a NEW checkpoint file.
+    """
+
+    import os
+    import torch
+    import traceback
+    from safetensors.torch import safe_open
+    from modules import sd_models
+
+    from scripts.untitled import merger
+    from scripts.untitled.misc_util import save_state_dict
+    from scripts.untitled.common import is_vae_key, is_clip_key
+
+    logs = []
+
+    def log(msg):
+        logs.append(msg)
+
+    try:
+        if not target_checkpoint_name:
+            return "❌ No target checkpoint selected"
+
+        if not vae_path and not clip_path:
+            return "❌ No components selected for injection"
+
+        ckpt_info = merger.get_checkpoint_match(target_checkpoint_name)
+        if not ckpt_info:
+            return "❌ Target checkpoint not found"
+
+        target_path = ckpt_info.filename
+        log(f"📦 Target checkpoint: {os.path.basename(target_path)}")
+
+        # --------------------------------------------------
+        # Load target checkpoint
+        # --------------------------------------------------
+        with safe_open(target_path, framework="pt", device="cpu") as f:
+            target_state = {k: f.get_tensor(k) for k in f.keys()}
+            metadata = f.metadata()
+
+        injected_vae = 0
+        injected_clip = 0
+
+        replace_existing = inject_mode == "Replace existing"
+        only_missing = inject_mode == "Only if missing"
+
+        # --------------------------------------------------
+        # Inject VAE
+        # --------------------------------------------------
+        if vae_path:
+            log(f"🧠 Loading VAE: {os.path.basename(vae_path)}")
+            with safe_open(vae_path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if not is_vae_key(k):
+                        continue
+                    if only_missing and k in target_state:
+                        continue
+                    target_state[k] = f.get_tensor(k)
+                    injected_vae += 1
+
+        # --------------------------------------------------
+        # Inject CLIP
+        # --------------------------------------------------
+        if clip_path:
+            log(f"🧠 Loading CLIP: {os.path.basename(clip_path)}")
+            with safe_open(clip_path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if not is_clip_key(k):
+                        continue
+                    if only_missing and k in target_state:
+                        continue
+                    target_state[k] = f.get_tensor(k)
+                    injected_clip += 1
+
+        # --------------------------------------------------
+        # Summary
+        # --------------------------------------------------
+        log(f"✅ Injected VAE tensors : {injected_vae}")
+        log(f"✅ Injected CLIP tensors: {injected_clip}")
+
+        if injected_vae == 0 and injected_clip == 0:
+            log("⚠️ Nothing injected (all keys already present)")
+
+        # --------------------------------------------------
+        # Save new checkpoint
+        # --------------------------------------------------
+        base = os.path.splitext(os.path.basename(target_path))[0]
+        out_name = f"{base}_injected"
+
+        save_state_dict(
+            target_state,
+            save_path=out_name,
+            settings=[],
+            discard_keys=set(),
+            target_dtype=torch.float16,
+            metadata=metadata,
+        )
+
+        sd_models.list_models()
+        log(f"💾 Saved new checkpoint: {out_name}.safetensors")
+
+        return "\n".join(logs)
+
+    except Exception as e:
+        return (
+            "❌ Injection failed:\n"
+            + str(e)
+            + "\n\n"
+            + traceback.format_exc()
+        )
+
+
+def extract_checkpoint_components(
+    ckpt_name,
+    do_vae,
+    do_clip,
+    out_name,
+    dtype_name,
+):
+    import torch
+    import safetensors.torch
+    from modules import sd_models
+
+    from scripts.untitled.common import (
+        extract_submodel,
+        is_vae_key,
+        is_clip_key,
+    )
+    from scripts.untitled.misc_util import save_extracted
+
+    if not ckpt_name:
+        return "Error: No checkpoint selected"
+    if not (do_vae or do_clip):
+        return "Error: Nothing selected to extract"
+
+    getter = (
+        getattr(sd_models, "get_closet_checkpoint_match", None)
+        or getattr(sd_models, "get_closest_checkpoint_match", None)
+    )
+    ckpt = getter(ckpt_name) if getter else None
+    if not ckpt:
+        return "Error: Checkpoint not found"
+
+    target_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[dtype_name]
+
+    logs = []
+
+    with safetensors.torch.safe_open(ckpt.filename, framework="pt", device="cpu") as f:
+        state = {k: f.get_tensor(k) for k in f.keys()}
+
+    if do_vae:
+        vae = extract_submodel(
+            state,
+            key_filter=is_vae_key,
+            progress=lambda m: logs.append(m),
+            label="VAE",
+        )
+        if vae:
+            save_extracted(
+                vae,
+                name=f"{out_name}_vae",
+                progress=lambda m: logs.append(m),
+                target_dtype=target_dtype,
+            )
+        else:
+            logs.append("[VAE WARNING] No VAE keys found")
+
+    if do_clip:
+        clip = extract_submodel(
+            state,
+            key_filter=is_clip_key,
+            progress=lambda m: logs.append(m),
+            label="CLIP",
+        )
+        if clip:
+            save_extracted(
+                clip,
+                name=f"{out_name}_clip",
+                progress=lambda m: logs.append(m),
+                target_dtype=target_dtype,
+            )
+        else:
+            logs.append("[CLIP WARNING] No CLIP keys found")
+
+    return "\n".join(logs) or "Extraction complete"

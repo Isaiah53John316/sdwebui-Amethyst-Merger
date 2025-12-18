@@ -16,6 +16,7 @@ from modules.processing import StableDiffusionProcessingTxt2Img  # ← ADD THIS
 from scripts.untitled import merger,misc_util
 from scripts.untitled.operators import weights_cache
 from scripts.untitled import lora_merge
+from scripts.untitled.misc_util import inject_checkpoint_components, extract_checkpoint_components, get_component_list
 
 from scripts.untitled.common import cmn
 
@@ -1750,6 +1751,146 @@ SUMMARY
                     fn=lambda: (gr.update(choices=get_lora_list_with_info()), gr.update(choices=get_lora_list_with_info())),
                     outputs=[lora_checkbox_group, lora_merge_checkbox]
                 )
+                # === SECTION 3: Checkpoint Components (Extract / Inject) ===
+                with gr.Accordion("Checkpoint Components (VAE / CLIP)", open=False):
+                    gr.Markdown(
+                        "### Extract or reuse VAE / CLIP components\n"
+                        "Export components as standalone `.safetensors` for reuse or inspection.\n"
+                        "**Does not modify the original checkpoint.**"
+                    )
+
+                    # ---------- EXTRACT ----------
+                    with gr.Row():
+                        extract_checkpoint = gr.Dropdown(
+                            label="Source Checkpoint",
+                            choices=[cp.title for cp in sd_models.checkpoints_list.values()],
+                            value=lambda: next(
+                                (cp.title for cp in sd_models.checkpoints_list.values()), None
+                            ),
+                        )
+                        create_refresh_button(
+                            extract_checkpoint,
+                            lambda: None,
+                            lambda: {"choices": [cp.title for cp in sd_models.checkpoints_list.values()]},
+                            "refresh_checkpoint_extract",
+                        )
+
+                    with gr.Row():
+                        extract_vae = gr.Checkbox(
+                            label="Extract VAE",
+                            value=True,
+                            info="Latent decoder (color, contrast, stability)",
+                        )
+                        extract_clip = gr.Checkbox(
+                            label="Extract CLIP / Text Encoders",
+                            value=False,
+                            info="Prompt understanding & conditioning",
+                        )
+
+                    with gr.Row():
+                        extract_name = gr.Textbox(
+                            label="Output Name",
+                            placeholder="my_model_component",
+                            value="extracted_component",
+                        )
+                        extract_dtype = gr.Radio(
+                            label="Save Precision",
+                            choices=["fp16", "bf16", "fp32"],
+                            value="fp16",
+                            horizontal=True,
+                        )
+
+                    extract_btn = gr.Button("EXTRACT COMPONENTS", variant="primary")
+                    extract_status = gr.Textbox(
+                        label="Status",
+                        lines=10,
+                        interactive=False,
+                        show_copy_button=True,
+                    )
+
+                    extract_btn.click(
+                        fn=extract_checkpoint_components,
+                        inputs=[
+                            extract_checkpoint,
+                            extract_vae,
+                            extract_clip,
+                            extract_name,
+                            extract_dtype,
+                        ],
+                        outputs=extract_status,
+                    )
+
+                    gr.Markdown("### Inject External VAE / CLIP into a Checkpoint")
+
+                    # ---------- INJECT ----------
+                    with gr.Row():
+                        inject_checkpoint = gr.Dropdown(
+                            label="Target Checkpoint",
+                            choices=[cp.title for cp in sd_models.checkpoints_list.values()],
+                            value=lambda: next(
+                                (cp.title for cp in sd_models.checkpoints_list.values()), None
+                            ),
+                        )
+                        create_refresh_button(
+                            inject_checkpoint,
+                            lambda: None,
+                            lambda: {"choices": [cp.title for cp in sd_models.checkpoints_list.values()]},
+                            "refresh_checkpoint_inject",
+                        )
+
+                    with gr.Row():
+                        inject_vae = gr.Dropdown(
+                            label="VAE to Inject (optional)",
+                            choices=get_external_vae_list(),
+                            value=None,
+                            allow_custom_value=False,
+                        )
+                        create_refresh_button(
+                            inject_vae,
+                            lambda: None,
+                            lambda: {"choices": get_external_vae_list()},
+                            "refresh_external_vae",
+                        )
+
+                    with gr.Row():
+                        inject_clip = gr.Dropdown(
+                            label="CLIP / Text Encoder to Inject (optional)",
+                            choices=get_external_clip_list(),
+                            value=None,
+                            allow_custom_value=False,
+                        )
+                        create_refresh_button(
+                            inject_clip,
+                            lambda: None,
+                            lambda: {"choices": get_external_clip_list()},
+                            "refresh_external_clip",
+                        )
+
+                    inject_replace = gr.Radio(
+                        label="Injection Mode",
+                        choices=["Replace existing", "Only if missing"],
+                        value="Replace existing",
+                        horizontal=True,
+                    )
+
+                    inject_btn = gr.Button("INJECT COMPONENTS", variant="primary")
+                    inject_status = gr.Textbox(
+                        label="Status",
+                        lines=10,
+                        interactive=False,
+                        show_copy_button=True,
+                    )
+
+                    inject_btn.click(
+                        fn=inject_checkpoint_components,
+                        inputs=[
+                            inject_checkpoint,
+                            inject_vae,
+                            inject_clip,
+                            inject_replace,
+                        ],
+                        outputs=inject_status,
+                    )
 
         # ================================================
         # PRESETS & HISTORY TAB — Elite UX (2025 Edition)
@@ -2277,3 +2418,32 @@ def validate_merge_config(model_a, model_b, weight_editor, merge_mode):
     if errors:
         return False, '\n'.join(errors)
     return True, "✓ Configuration valid"
+
+
+def get_external_vae_list():
+    base = paths.models_path
+    dirs = [os.path.join(base, "VAE"), os.path.join(base, "vae")]
+    out = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.lower().endswith(".safetensors"):
+                out.append(os.path.join(d, f))
+    return out
+
+
+def get_external_clip_list():
+    base = paths.models_path
+    dirs = [
+        os.path.join(base, "CLIP"),
+        os.path.join(base, "TextEncoders"),
+    ]
+    out = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.lower().endswith(".safetensors"):
+                out.append(os.path.join(d, f))
+    return out
