@@ -669,6 +669,17 @@ def on_ui_tabs():
                                 value=False,
                                 info="Pad tensors for max file size (~7.5GB+) — like old mergers"
                             )
+                            copy_vae = gr.Checkbox(
+                                label="Copy VAE from Primary (Recommended)",
+                                value=True,
+                                info="Preserve decoding stability and color fidelity"
+                            )
+
+                            copy_clip = gr.Checkbox(
+                            label="Copy CLIP from Primary (Recommended)",
+                            value=True,
+                            info="Preserve prompt semantics and text understanding"
+                            )
 
                         # Kitchen-Sink Mode (zero-fill) — save to options
 
@@ -683,6 +694,16 @@ def on_ui_tabs():
                             outputs=None
                         )
 
+                        copy_vae.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=copy_vae,        
+                            outputs=None
+                        )
+                        copy_clip.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=copy_clip,
+                            outputs=None
+                        )
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
 
                     # MAIN SLIDERS - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
@@ -912,6 +933,26 @@ def on_ui_tabs():
                             {"label": "Legacy Bloat Mode (Max File Size)"},
                             False
                         )
+                        cmn.opts.create_option(
+                            'copy_vae_from_primary',
+                            gr.Checkbox,
+                        {
+                            "label": "Copy VAE from Primary (Recommended)",
+                            "info": "Preserve decoding stability and color fidelity"
+                        },
+                            True
+                        )
+
+                        cmn.opts.create_option(
+                            'copy_clip_from_primary',
+                            gr.Checkbox,
+                        {
+                            "label": "Copy CLIP from Primary (Recommended)",
+                            "info": "Preserve prompt semantics and text understanding"
+                        },
+                            True
+                        )
+
 
                         def update_cache_size(value):
                             weights_cache.__init__(max(0, int(value)))
@@ -1142,10 +1183,11 @@ def on_ui_tabs():
                             clude_mode,
                             merge_seed,
                             enable_sliders,
-                            slider_slider,         
+                            slider_slider, 
                             *custom_sliders,
-                            keep_zero_fill,      # Kitchen-Sink Mode
-                            bloat_mode,          # Legacy Bloat Mode
+                            keep_zero_fill,    
+                            bloat_mode,
+                                 
                         ],
                         outputs=status
                     )
@@ -1830,12 +1872,16 @@ def start_merge(save_name, save_settings, finetune,
                 alpha, beta, gamma, delta, epsilon,
                 weight_editor, preset_output,          # ← Preset JSON
                 discard, clude, clude_mode,
-                merge_seed, enable_sliders, *custom_sliders,):
+                merge_seed, enable_sliders, copy_vae_from_primary,
+                copy_clip_from_primary, *custom_sliders,):
     
     progress = Progress()
     
     keep_zero_fill = cmn.opts.get('keep_zero_fill', True)
     bloat_mode = cmn.opts.get('bloat_mode', False)
+
+    copy_vae_from_primary  = cmn.opts.get('copy_vae_from_primary', True)
+    copy_clip_from_primary = cmn.opts.get('copy_clip_from_primary', True)
 
     try:
         # ENHANCEMENT 2: Real-time ETA tracking
@@ -1856,10 +1902,13 @@ def start_merge(save_name, save_settings, finetune,
             clude or "",
             clude_mode,
             merge_seed,
-            enable_sliders,         
-            *custom_sliders,
+            enable_sliders,
+            *custom_sliders,         
             keep_zero_fill,
             bloat_mode,
+            copy_vae_from_primary,
+            copy_clip_from_primary,
+            
         ]
 
         # Main merge

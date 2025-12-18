@@ -442,7 +442,7 @@ def create_tasks(
     progress, mergemode, calcmode, keys, assigned_keys, discard_keys,
     checkpoints, merge_stats,
     alpha, beta, gamma, delta, epsilon,
-    keep_zero_fill=False, bloat_mode=False
+    keep_zero_fill=True, bloat_mode=False
 ):
     """
     2025 KITCHEN-SINK MAXIMALISM — FINAL FORM
@@ -527,11 +527,16 @@ def prepare_merge(
     discard, clude, clude_mode,
     merge_seed, enable_sliders,
     *custom_sliders,
-    keep_zero_fill=False,
-    bloat_mode=False
+    keep_zero_fill=True,
+    bloat_mode=False,
+    copy_vae_from_primary=True,
+    copy_clip_from_primary=True
 ):
     progress("\n### Preparing merge ###")
-
+    print(
+    f"[Policy] copy_vae={copy_vae_from_primary} | "
+    f"copy_clip={copy_clip_from_primary}"
+    )
     timer = Timer()
     cmn.interrupted = False
     cmn.stop = False
@@ -699,7 +704,9 @@ def prepare_merge(
             timer,
             threads=cmn.opts.get("threads", 8),
             keep_zero_fill=keep_zero_fill,
-            bloat_mode=bloat_mode
+            bloat_mode=bloat_mode,
+            copy_vae_from_primary=copy_vae_from_primary,     # ← ADD
+            copy_clip_from_primary=copy_clip_from_primary 
         )
 
     # ─────────────────────────────────────────────
@@ -858,7 +865,8 @@ def do_merge(
     merge_mode, calc_mode,
     alpha=0, beta=0, gamma=0, delta=0, epsilon=0,
     weight_editor="", discard="", clude="", clude_mode="Exclude",
-    timer=None, threads=8, keep_zero_fill=False, bloat_mode=False
+    timer=None, threads=8, keep_zero_fill=True, bloat_mode=False,
+    copy_vae_from_primary=True,copy_clip_from_primary=True
 ):
     """
     2025 KITCHEN-SINK MERGE ENGINE
@@ -1051,6 +1059,73 @@ def do_merge(
     bar.close()
     if timer:
         timer.record("Merge complete")
+
+    # ------------------------------------------------------------
+    # 6.5 Post-merge component policy (VAE / CLIP / Flux encoders)
+    # ------------------------------------------------------------
+    if cmn.primary and (copy_vae_from_primary or copy_clip_from_primary):
+        pf = cmn.loaded_checkpoints.get(cmn.primary)
+        progress(
+            f"[Policy] Post-merge overrides: "
+            f"copy_vae={copy_vae_from_primary}, copy_clip={copy_clip_from_primary}"
+        )
+
+        if pf is None:
+            progress("[Policy WARNING] Primary checkpoint not loaded; cannot copy VAE/CLIP")
+        else:
+            copied_vae = 0
+            copied_clip = 0
+
+            # -------------------------
+            # VAE / latent decoder
+            # -------------------------
+            if copy_vae_from_primary:
+                for k in pf.keys():
+                    if k.startswith((
+                        "first_stage_model.",  # SD1.5
+                        "vae.",                # SDXL / some Flux
+                    )):
+                        state_dict[k] = pf.get_tensor(k).cpu()
+                        copied_vae += 1
+
+                if copied_vae > 0:
+                    progress(f"[Policy] Copied VAE from primary ({copied_vae} tensors)")
+                else:
+                    progress(
+                        "[Policy WARNING] copy_vae enabled, "
+                        "but no VAE keys matched in primary"
+                    )
+
+            # -------------------------
+            # Text / conditioning encoders
+            # -------------------------
+            if copy_clip_from_primary:
+                for k in pf.keys():
+                    if k.startswith((
+                        # SD1.5
+                        "cond_stage_model.",
+                        # SDXL
+                        "conditioner.",
+                        "text_model.",
+                        # Flux / SD3 style
+                        "txt_proj.",
+                        "context_embedder.",
+                        "x_embedder.",
+                        "t_embedder.",
+                    )):
+                        state_dict[k] = pf.get_tensor(k).cpu()
+                        copied_clip += 1
+
+                if copied_clip > 0:
+                    progress(
+                        f"[Policy] Copied text encoders from primary "
+                        f"({copied_clip} tensors)"
+                    )
+                else:
+                    progress(
+                        "[Policy WARNING] copy_clip enabled, "
+                        "but no text encoder keys matched in primary"
+                    )
 
     # ------------------------------------------------------------
     # 7. Save task list + cleanup

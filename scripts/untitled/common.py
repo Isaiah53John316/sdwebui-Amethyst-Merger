@@ -4,9 +4,7 @@ import os
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from modules import shared
-
-
-# common.py
+from safetensors.torch import safe_open
 
 SACRED_PATTERNS = (
     # ── Noise & timestep entry (sampling-critical) ──
@@ -84,6 +82,33 @@ SACRED_PATTERNS = (
     "position_ids",
 )
 
+# ============================================================
+# MODEL COMPONENT PREFIXES
+# ============================================================
+
+VAE_PREFIXES = (
+    "first_stage_model.",  # SD1.5
+    "vae.",                # SDXL / Flux
+)
+
+CLIP_PREFIXES = (
+    # SD1.5
+    "cond_stage_model.",
+    # SDXL
+    "conditioner.",
+    "text_model.",
+    # Flux / SD3 / modern
+    "txt_proj.",
+    "context_embedder.",
+    "x_embedder.",
+    "t_embedder.",
+)
+
+def is_vae_key(key: str) -> bool:
+    return key.startswith(VAE_PREFIXES)
+
+def is_clip_key(key: str) -> bool:
+    return key.startswith(CLIP_PREFIXES)
 
 # === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
 class MergeStats:
@@ -269,6 +294,139 @@ def safe_apply(op, base, other, key=None):
             print(f"[SafeOp] Shape mismatch skipped: {key} {base.shape} vs {other.shape}")
         return base
     return op(base, other)
+
+def bake_component_into_state_dict(
+    target_state_dict: dict,
+    component_state_dict: dict,
+    *,
+    key_filter,                 # callable(key:str)->bool (ex: is_vae_key)
+    progress=None,
+    label="BAKE",
+    overwrite=True,
+    strict_shapes=True,
+):
+    """
+    Bake a component (VAE/CLIP/etc) into an existing state_dict.
+
+    - overwrite=True: replace existing keys if present
+    - strict_shapes=True: skip mismatched shapes instead of injecting nonsense
+    """
+    if not target_state_dict:
+        raise ValueError("target_state_dict is empty")
+    if not component_state_dict:
+        if progress:
+            progress(f"[{label} WARNING] component_state_dict is empty")
+        return target_state_dict
+
+    injected = 0
+    replaced = 0
+    skipped_shape = 0
+    skipped_missing = 0
+
+    for k, v in component_state_dict.items():
+        if not key_filter(k):
+            continue
+
+        if k in target_state_dict:
+            if strict_shapes and hasattr(target_state_dict[k], "shape") and hasattr(v, "shape"):
+                if target_state_dict[k].shape != v.shape:
+                    skipped_shape += 1
+                    continue
+
+            if overwrite:
+                target_state_dict[k] = v
+                replaced += 1
+            else:
+                skipped_missing += 1
+        else:
+            # allow injecting missing keys if you want “baked VAE even if absent”
+            target_state_dict[k] = v
+            injected += 1
+
+    if progress:
+        progress(
+            f"[{label}] replaced={replaced} injected={injected} "
+            f"skipped_shape={skipped_shape}"
+        )
+
+    return target_state_dict
+
+def load_safetensors_state_dict(path: str, *, device="cpu"):
+    sd = {}
+    meta = {}
+    with safe_open(path, framework="pt", device=device) as f:
+        meta = f.metadata() or {}
+        for k in f.keys():
+            sd[k] = f.get_tensor(k)
+    return sd, meta
+
+
+def bake_vae_from_file(
+    target_state_dict: dict,
+    vae_path: str,
+    *,
+    key_filter,          # is_vae_key from common.py
+    progress=None,
+    label="BAKE:VAE",
+    strict_shapes=True,
+):
+    vae_sd, vae_meta = load_safetensors_state_dict(vae_path, device="cpu")
+
+    if progress:
+        src = vae_meta.get("source_checkpoint", "Unknown")
+        progress(f"[{label}] Loaded VAE file: {vae_path} (source={src})")
+
+    return bake_component_into_state_dict(
+        target_state_dict,
+        vae_sd,
+        key_filter=key_filter,
+        progress=progress,
+        label=label,
+        overwrite=True,
+        strict_shapes=strict_shapes,
+    ), vae_meta
+
+
+def extract_submodel(
+    source_state_dict,
+    *,
+    key_filter,
+    component_name,
+    arch=None,
+    source_checkpoint=None,
+    progress=None,
+):
+    """
+    Extract a submodel (VAE / CLIP / etc) from a state_dict.
+
+    key_filter: callable(key: str) -> bool
+    Returns: (extracted_state_dict, metadata_dict)
+    """
+    extracted = {}
+
+    for k, v in source_state_dict.items():
+        if key_filter(k):
+            extracted[k] = v
+
+    metadata = {
+        "component": component_name,
+        "arch": arch or "Unknown",
+        "source_checkpoint": (
+            os.path.basename(source_checkpoint)
+            if source_checkpoint else "Unknown"
+        ),
+        "extracted_by": "Amethyst Merger",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "tensor_count": len(extracted),
+    }
+
+    if progress:
+        progress(
+            f"[Extract:{component_name}] "
+            f"{len(extracted)} tensors | arch={metadata['arch']}"
+        )
+
+    return extracted, metadata
 
 # =============================================================================
 # GLOBAL STATE — Clean and Minimal

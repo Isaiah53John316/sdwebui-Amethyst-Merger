@@ -10,7 +10,6 @@ import warnings
 import time
 from collections import OrderedDict
 from modules.timer import Timer
-
 import torch
 import safetensors.torch
 from safetensors.torch import save_file, load_file
@@ -90,6 +89,49 @@ BASE_SELECTORS = {
     "text":     r"(text_model|transformer)\.",
 }
 
+def save_extracted(
+    state_dict,
+    name,
+    *,
+    metadata=None,
+    progress=None,
+    target_dtype=torch.float16,
+):
+    """
+    Save an extracted submodel (VAE / CLIP / etc) with optional metadata.
+    """
+    if not state_dict:
+        if progress:
+            progress("[Extract WARNING] Nothing to save")
+        return None
+
+    # Normalize dtype
+    out = {}
+    for k, v in state_dict.items():
+        if v.is_floating_point():
+            out[k] = v.to(dtype=target_dtype)
+        else:
+            out[k] = v
+
+    # Safetensors requires metadata values to be strings
+    meta = {}
+    if metadata:
+        meta = {str(k): str(v) for k, v in metadata.items()}
+
+    filename = name if name.endswith(".safetensors") else f"{name}.safetensors"
+
+    save_file(
+        out,
+        filename,
+        metadata=meta
+    )
+
+    if progress:
+        progress(
+            f"[Extract] Saved {len(out)} tensors → {os.path.basename(filename)}"
+        )
+
+    return filename
 
 def target_to_regex(target_input: str | list) -> str:
     """
