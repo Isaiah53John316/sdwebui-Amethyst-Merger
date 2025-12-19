@@ -16,7 +16,7 @@ from modules.processing import StableDiffusionProcessingTxt2Img  # ← ADD THIS
 from scripts.untitled import merger,misc_util
 from scripts.untitled.operators import weights_cache
 from scripts.untitled import lora_merge
-from scripts.untitled.misc_util import inject_checkpoint_components, extract_checkpoint_components, get_component_list
+from scripts.untitled.misc_util import inject_checkpoint_components, extract_checkpoint_components
 
 from scripts.untitled.common import cmn
 

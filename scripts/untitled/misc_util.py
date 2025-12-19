@@ -17,9 +17,8 @@ from safetensors import safe_open as safetensors_open
 from safetensors.torch import safe_open
 from modules import sd_models
 
+from scripts.untitled import merger,misc_util
 from scripts.untitled.common import extract_submodel
-from scripts.untitled import merger
-from scripts.untitled.misc_util import save_state_dict
 from scripts.untitled.common import is_vae_key, is_clip_key
 
 
