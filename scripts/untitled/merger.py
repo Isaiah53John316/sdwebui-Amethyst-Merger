@@ -378,14 +378,40 @@ def parse_arguments(
 
     return parsed_targets, checkpoints, mergemode, calcmode, seed
 
-def assign_weights_to_keys(targets, keys, already_assigned=None):
-    """
-    Assign weights to keys using regex selectors — FINAL 2025 KITCHEN-SINK EDITION
-    • Deterministic
-    • Fast on 3k+ keys
-    • No accidental overwrites
-    • Regex-based, model-agnostic
-    """
+def assign_weights_to_keys(
+    targets,
+    keys,
+    already_assigned=None,
+    specific_selectors_first=False
+):
+    #Selector precedence policy:
+    #------------------------------------------------------------
+    #specific_selectors_first = False (DEFAULT, safer)
+        #• Broad selectors (e.g. "model.*", ".*attn.*") apply first
+        #• Narrow selectors only fill gaps
+        #• Produces more uniform, conservative merges
+        #• Best when:
+            #- Copy VAE from Primary = ON
+            #- Copy CLIP from Primary = ON
+            #- User wants structural stability and re-merge safety
+
+    #specific_selectors_first = True (style-forward)
+        #• Narrow selectors apply first (block- or layer-specific)
+        #• Broad selectors act as fallback
+        #• Stronger stylistic and attention-level transfer
+        #• Especially impacts:
+            #- UNet attention blocks (composition, texture, style)
+            #- CLIP-related weights *when CLIP merging is enabled*
+            #- Cross-model stylistic dominance
+
+    #IMPORTANT CLARIFICATION:
+        #• This toggle does NOT force copying or merging of VAE or CLIP
+        #• VAE and CLIP behavior is controlled separately by user options
+        #• When VAE / CLIP are merged (not copied), this toggle
+          #directly affects how strongly their associated weights dominate
+        #• When VAE / CLIP are copied from primary (default),
+          #this toggle influences how the UNet aligns stylistically with them
+
 
     if not targets or not keys:
         return already_assigned or {}
@@ -398,7 +424,7 @@ def assign_weights_to_keys(targets, keys, already_assigned=None):
         try:
             regex = mutil.target_to_regex(selector)
             pattern = re.compile(regex)
-            assigners.append((pattern, weights))
+            assigners.append((pattern, weights, selector))
         except re.error as e:
             print(f"[Merger] Invalid selector regex '{selector}': {e}")
 
@@ -406,37 +432,47 @@ def assign_weights_to_keys(targets, keys, already_assigned=None):
         return already_assigned or {}
 
     # ─────────────────────────────────────────────
-    # Match selectors against keys
-    #
-    # IMPORTANT FIX:
-    # - Do NOT use findall on a giant joined string
-    # - That can return partial matches and duplicates
-    # - Always test key-by-key
+    # Match selectors against keys (key-by-key only)
     # ─────────────────────────────────────────────
     matches = []
-    for pattern, weights in assigners:
+    for pattern, weights, selector in assigners:
         matched_keys = [k for k in keys if pattern.search(k)]
         if matched_keys:
-            matches.append((matched_keys, weights))
-
-    # Most specific selectors first (more matches = more specific)
-    matches.sort(key=lambda x: len(x[0]), reverse=True)
+            matches.append((matched_keys, weights, selector))
 
     # ─────────────────────────────────────────────
-    # Build assignment map
+    # Selector precedence policy
+    # ─────────────────────────────────────────────
+    if specific_selectors_first:
+        # Narrow selectors first → stronger style control
+        matches.sort(key=lambda x: len(x[0]))
+        policy = "SPECIFIC → BROAD (style-forward)"
+    else:
+        # Broad selectors first → safer, more uniform merges
+        matches.sort(key=lambda x: len(x[0]), reverse=True)
+        policy = "BROAD → SPECIFIC (safe-default)"
+
+    print(f"[Merger] Selector precedence policy: {policy}")
+
+    # ─────────────────────────────────────────────
+    # Build assignment map (first-wins, never overwritten)
     # ─────────────────────────────────────────────
     result = already_assigned.copy() if already_assigned else {}
     assigned_count = 0
 
-    for key_list, weights in matches:
+    for key_list, weights, selector in matches:
         for key in key_list:
-            # Only assign if this key has NOT already been assigned
             if key not in result:
                 result[key] = dict(weights)
                 assigned_count += 1
 
-    print(f"[Merger] Weight assignment → {assigned_count}/{len(keys)} keys matched")
+    print(
+        f"[Merger] Weight assignment → {assigned_count}/{len(keys)} keys matched "
+        f"(specific_first={specific_selectors_first})"
+    )
+
     return result
+
 
 def create_tasks(
     progress, mergemode, calcmode, keys, assigned_keys, discard_keys,
@@ -530,7 +566,11 @@ def prepare_merge(
     keep_zero_fill=True,
     bloat_mode=False,
     copy_vae_from_primary=True,
-    copy_clip_from_primary=True
+    copy_clip_from_primary=True,
+    dual_soul_toggle=False,
+    sacred_keys_toggle=False,
+    smartresize_toggle=False,
+    specific_selectors_first=False,
 ):
     progress("\n### Preparing merge ###")
     print(
@@ -646,19 +686,12 @@ def prepare_merge(
         progress(f"Merge running on {cmn.device.type.upper()} with {dtype_name}")
 
         # ─────────────────────────────────────────────
-        # 7. Target shape map (no silent failure)
-        # ─────────────────────────────────────────────
-        cmn.cross_arch_target_shapes.clear()
-
-        if cmn.primary and cmn.primary in cmn.loaded_checkpoints:
-            pf = cmn.loaded_checkpoints[cmn.primary]
-            if pf is None:
-                raise gr.Error("Primary checkpoint failed to open — cannot build shape map")
-
-            for k in pf.keys():
-                t = pf.get_tensor(k)
-                if t is not None and t.shape:
-                    cmn.cross_arch_target_shapes[k] = t.shape
+        # 7. Selector priority policy
+        # ────────────────────────────────────────────
+        cmn.opts.set(
+            "specific_selectors_first",
+            bool(specific_selectors_first)
+        )
 
         # ─────────────────────────────────────────────
         # 8. Create tasks
@@ -706,7 +739,11 @@ def prepare_merge(
             keep_zero_fill=keep_zero_fill,
             bloat_mode=bloat_mode,
             copy_vae_from_primary=copy_vae_from_primary,     # ← ADD
-            copy_clip_from_primary=copy_clip_from_primary 
+            copy_clip_from_primary=copy_clip_from_primary,
+            dual_soul_toggle=dual_soul_toggle,
+            sacred_keys_toggle=sacred_keys_toggle,
+            smartresize_toggle=smartresize_toggle,
+            specific_selectors_first=False, 
         )
 
     # ─────────────────────────────────────────────
@@ -866,7 +903,8 @@ def do_merge(
     alpha=0, beta=0, gamma=0, delta=0, epsilon=0,
     weight_editor="", discard="", clude="", clude_mode="Exclude",
     timer=None, threads=8, keep_zero_fill=True, bloat_mode=False,
-    copy_vae_from_primary=True,copy_clip_from_primary=True
+    copy_vae_from_primary=True, copy_clip_from_primary=True,
+    dual_soul_toggle=False, sacred_keys_toggle=False, smartresize_toggle=False,
 ):
     """
     2025 KITCHEN-SINK MERGE ENGINE
@@ -982,30 +1020,90 @@ def do_merge(
         progress(f"Same architecture family detected: {next(iter(types)) if types else 'unknown'}")
 
     # ------------------------------------------------------------
-    # 3. Choose primary (shape reference + metadata)
+    # 3. Choose primary
     # ------------------------------------------------------------
     cmn.primary = None
-    modern = [cp for cp in cmn.checkpoints_global if mutil.id_checkpoint(cp)[0] in ("SDXL", "Flux", "Pony", "Aurora")]
+
+    modern = [
+        cp for cp in cmn.checkpoints_global
+        if mutil.id_checkpoint(cp)[0] in ("SDXL", "Flux", "Pony", "Aurora")
+    ]
 
     if modern:
-        primary_cp = modern[0]
-        idx = cmn.checkpoints_global.index(primary_cp)
+        idx = cmn.checkpoints_global.index(modern[0])
         cmn.checkpoints_global[0], cmn.checkpoints_global[idx] = (
             cmn.checkpoints_global[idx],
             cmn.checkpoints_global[0],
         )
         cmn.primary = cmn.checkpoints_global[0]
-        progress(f"Using {os.path.basename(cmn.primary)} as primary (shape reference + metadata)")
     else:
-        cmn.primary = (model_a if model_a else (cmn.checkpoints_global[0] if cmn.checkpoints_global else None))
-        progress(f"Using {os.path.basename(cmn.primary) if cmn.primary else 'None'} as primary")
+        cmn.primary = model_a or (cmn.checkpoints_global[0] if cmn.checkpoints_global else None)
 
-    print(
-        f"[Dual-Soul] Same Architecture: {cmn.same_arch} | "
-        f"Preservation: {'OFF — Full Merge' if cmn.same_arch else 'ACTIVE — Sacred preserved in initialize_task()'}"
+    progress(
+        f"Using {os.path.basename(cmn.primary) if cmn.primary else 'None'} as primary"
     )
 
     # ------------------------------------------------------------
+    # 3.25 Policy toggles
+    # ------------------------------------------------------------
+    cmn.dual_soul_enabled   = not cmn.same_arch
+    cmn.sacred_enabled      = not cmn.same_arch
+    cmn.smartresize_enabled = not cmn.same_arch
+
+    force_cross_arch  = bool(dual_soul_toggle)
+    force_sacred_keys = bool(sacred_keys_toggle)
+    force_smartresize = bool(smartresize_toggle)
+
+    cmn.opts.set("force_cross_arch", force_cross_arch)
+    cmn.opts.set("force_sacred_keys", force_sacred_keys)
+    cmn.opts.set("force_smartresize", force_smartresize)
+
+
+    if force_cross_arch:
+        cmn.same_arch = False
+        cmn.dual_soul_enabled = True
+        progress("[Policy Override] Cross-arch FORCED")
+
+    if force_sacred_keys:
+        cmn.sacred_enabled = True
+        progress("[Policy Override] Sacred FORCED")
+
+    if force_smartresize:
+        cmn.smartresize_enabled = True
+        progress("[Policy Override] SmartResize FORCED")
+
+    print(
+        f"[Policy] same_arch={cmn.same_arch} | "
+        f"dual_soul={'ON' if cmn.dual_soul_enabled else 'OFF'} | "
+        f"sacred={'ON' if cmn.sacred_enabled else 'OFF'} | "
+        f"smartresize={'ON' if cmn.smartresize_enabled else 'OFF'}"
+    )
+
+    # ------------------------------------------------------------
+    # 3.5 Target shape map
+    # ------------------------------------------------------------
+    cmn.cross_arch_target_shapes.clear()
+
+    if cmn.smartresize_enabled and cmn.primary in cmn.loaded_checkpoints:
+        pf = cmn.loaded_checkpoints[cmn.primary]
+        if pf is None:
+            raise RuntimeError("Primary checkpoint failed to open")
+
+        for k in pf.keys():
+            try:
+                t = pf.get_tensor(k)
+                if t is not None and hasattr(t, "shape"):
+                    cmn.cross_arch_target_shapes[k] = tuple(t.shape)
+            except Exception as e:
+                print(f"[ShapeMap] Skipped {k}: {e}")
+
+        print(
+            f"[ShapeMap] Built {len(cmn.cross_arch_target_shapes)} shapes "
+            f"from {os.path.basename(cmn.primary)}"
+        )
+    else:
+        print("[ShapeMap] SmartResize disabled by policy")
+
     # 4. Unload current model
     # ------------------------------------------------------------
     if shared.sd_model is not None:
@@ -1142,63 +1240,79 @@ def do_merge(
 
 def initialize_task(task):
     """
-    2025 DUAL-SOUL ELIGIBILITY INITIALIZER — FINAL
+    2025 DUAL-SOUL ELIGIBILITY INITIALIZER — POLICY-AWARE
 
     Guarantees:
     • No silent exclusions
-    • Sacred keys preserved only in cross-arch
-    • Full merging in same-arch (including attention & projections)
-    • SmartResize enforces shape only, never policy
-    • Zero-fill only as last-resort fallback
+    • Sacred keys preserved only when enabled
+    • Full merging in same-arch
+    • SmartResize only when explicitly enabled
+    • Zero-fill only as last resort
     """
+
+    print(
+        f"[INIT] initialize_task | "
+        f"dual_soul={cmn.dual_soul_enabled} "
+        f"sacred={cmn.sacred_enabled} "
+        f"smartresize={cmn.smartresize_enabled}"
+    )
 
     key = task.key
     target_shape = cmn.cross_arch_target_shapes.get(key)
 
     task_type = task.__class__.__name__
     if task_type != "CopyPrimary":
-        print(f"[TaskStart] {key} ← using {task_type}")
+        print(f"[TaskStart] {key} ← {task_type}")
 
     # =====================================================
     # 1. FAST PATH — custom operator owns everything
-    #    (ALLOWED: sacred only matters cross-arch)
     # =====================================================
     try:
         tensor = task.merge()
         merge_stats.custom_merges += 1
-        print(f"[CustomMerge] {key} ← merged via {task_type}")
+        print(f"[CustomMerge] {key}")
         return key, tensor.to(cmn.get_device(), dtype=cmn.get_dtype())
     except Exception as e:
-        print(f"[CustomMerge] Fast path failed for {key}: {e} — falling back")
+        print(f"[CustomMerge] FAILED {key}: {e}")
 
     # =====================================================
-    # 2. DUAL-SOUL SACRED PRESERVATION (CROSS-ARCH ONLY)
+    # 2. DUAL-SOUL SACRED PRESERVATION (POLICY-GATED)
     # =====================================================
-    if not cmn.same_arch and cmn.is_sacred_key(key):
-        primary = cmn.primary
-        f = cmn.loaded_checkpoints.get(primary)
+    if (
+        cmn.dual_soul_enabled
+        and cmn.sacred_enabled
+        and cmn.is_sacred_key(key)
+    ):
+        f = cmn.loaded_checkpoints.get(cmn.primary)
 
         if f and key in f.keys():
             try:
                 t = f.get_tensor(key)
 
-                if target_shape and t.shape != target_shape:
+                if (
+                    cmn.smartresize_enabled
+                    and target_shape is not None
+                    and t.shape != target_shape
+                ):
+                    print(
+                        f"[SmartResize][Sacred] {key} "
+                        f"{tuple(t.shape)} → {tuple(target_shape)}"
+                    )
                     t = SmartResize(
                         f"dual_soul_{key}",
                         target_shape,
                         source_tensor=t,
-                        orig_key=key          # 🔧 FIX
+                        orig_key=key
                     ).oper(t)
 
                 merge_stats.copied_primary += 1
-                print(f"[DualSoul] Preserved sacred key from primary: {key}")
                 return key, t.to(cmn.get_device(), dtype=cmn.get_dtype())
 
             except Exception as e:
-                print(f"[DualSoul] FAILED preserving {key}: {e}")
+                print(f"[DualSoul] FAILED {key}: {e}")
 
         merge_stats.skipped += 1
-        print(f"[DualSoul] Sacred key missing — SKIPPED: {key}")
+        print(f"[DualSoul] SKIPPED missing sacred key: {key}")
         return key, None
 
     # =====================================================
@@ -1208,9 +1322,6 @@ def initialize_task(task):
     sources = []
 
     for cp_path in cmn.checkpoints_global:
-        if not cp_path:
-            continue
-
         f = cmn.loaded_checkpoints.get(cp_path)
         if not f or key not in f.keys():
             continue
@@ -1218,52 +1329,65 @@ def initialize_task(task):
         try:
             t = f.get_tensor(key)
 
-            if target_shape and t.shape != target_shape:
+            if (
+                cmn.smartresize_enabled
+                and target_shape is not None
+                and t.shape != target_shape
+            ):
+                print(
+                    f"[SmartResize][Sparse] {key} "
+                    f"{tuple(t.shape)} → {tuple(target_shape)}"
+                )
                 t = SmartResize(
                     f"sparse_{key}",
                     target_shape,
                     source_tensor=t,
-                    orig_key=key          # 🔧 FIX
+                    orig_key=key
                 ).oper(t)
 
-            if target_shape and t.shape != target_shape:
+            # If SmartResize is OFF and shape mismatches, reject
+            if target_shape is not None and t.shape != target_shape:
                 continue
 
             tensors.append(t.to(cmn.get_device(), dtype=cmn.get_dtype()))
             sources.append(os.path.basename(cp_path))
 
         except Exception as e:
-            print(f"[Sparse] Skipped {key} from {cp_path}: {e}")
+            print(f"[Sparse] FAILED {key} from {cp_path}: {e}")
 
     # =====================================================
     # 4. FINAL DECISION TREE
     # =====================================================
     if not tensors:
-        primary = cmn.primary
-        f = cmn.loaded_checkpoints.get(primary)
+        f = cmn.loaded_checkpoints.get(cmn.primary)
 
         if f and key in f.keys():
             try:
                 t = f.get_tensor(key)
 
-                if target_shape and t.shape != target_shape:
+                if (
+                    cmn.smartresize_enabled
+                    and target_shape is not None
+                    and t.shape != target_shape
+                ):
                     t = SmartResize(
                         f"finalcopy_{key}",
                         target_shape,
                         source_tensor=t,
-                        orig_key=key          # 🔧 FIX
+                        orig_key=key
                     ).oper(t)
 
                 merge_stats.copied_primary += 1
-                print(f"[FinalCopy] {key} ← primary")
+                print(f"[FinalCopy] {key}")
                 return key, t.to(cmn.get_device(), dtype=cmn.get_dtype())
 
             except Exception as e:
                 print(f"[FinalCopy] FAILED {key}: {e}")
 
-        if target_shape:
+        # Zero-fill ONLY if shape exists AND kitchen-sink policy allows it
+        if target_shape is not None and cmn.opts.get("keep_zero_fill", True):
             merge_stats.zero_filled += 1
-            print(f"[Emergency] {key} ← ZERO-FILLED")
+            print(f"[ZeroFill] {key}")
             return key, torch.zeros(
                 target_shape,
                 device=cmn.get_device(),
@@ -1271,28 +1395,26 @@ def initialize_task(task):
             )
 
         merge_stats.skipped += 1
-        print(f"[CRITICAL] {key} ← SKIPPED (no contributors, no shape)")
+        print(f"[SKIPPED] {key} (no contributors)")
         return key, None
 
+    # =====================================================
+    # 5. SINGLE OR SAFE LINEAR MERGE
+    # =====================================================
     if len(tensors) == 1:
         merge_stats.copied_primary += 1
-        print(f"[SingleSource] {key} ← {sources[0]}")
         return key, tensors[0]
 
-    # =====================================================
-    # 5. SAFE LINEAR MERGE (NO BROADCAST)
-    # =====================================================
     merge_stats.smart_merge += 1
-
     result = tensors[0].clone()
-    count = 1                         # 🔧 FIX
+    count = 1
+
     for t in tensors[1:]:
         if t.shape == result.shape:
             result += t
             count += 1
 
-    result /= count                   # 🔧 FIX
-
+    result /= count
     print(f"[SmartMerge] {key} ← {', '.join(sources)}")
     return key, result.to(cmn.get_dtype())
 

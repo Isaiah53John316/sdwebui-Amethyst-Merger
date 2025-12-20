@@ -7,7 +7,7 @@ from modules import shared
 from safetensors.torch import safe_open
 
 SACRED_PATTERNS = (
-    # ── Noise & timestep entry (sampling-critical) ──
+    # ── Sampling-critical (noise / timestep math) ──
     "conv_in.",
     "input_blocks.0.0.",
     "time_embed.",
@@ -32,7 +32,7 @@ SACRED_PATTERNS = (
     "image_embed",
     "image_embedding",
 
-    # ── VAE (latent scaling differs per model) ──
+    # ── Latent space (VAE scale & decode stability) ──
     "first_stage_model.",
     "vae.",
     "encoder.",
@@ -40,7 +40,7 @@ SACRED_PATTERNS = (
     "quant_conv.",
     "post_quant_conv.",
 
-    # ── Text encoders / CLIP (semantic space) ──
+    # ── Semantic space (CLIP / text encoders) ──
     "cond_stage_model.",
     "conditioner.",
     "text_model.",
@@ -67,7 +67,7 @@ SACRED_PATTERNS = (
     "ada_layernorm",
     "ada_ln",
 
-    # ── Flux / SD3 / modern blocks ──
+    # ── Flux / SD3 / modern transformer stems ──
     "single_blocks",
     "double_blocks",
     "img_proj",
@@ -76,11 +76,12 @@ SACRED_PATTERNS = (
     "context_embedder",
     "t_embedder",
 
-    # ── Positional embeddings (any architecture) ──
+    # ── Positional embeddings (architecture-agnostic) ──
     "pos_embed",
     "position_emb",
     "position_ids",
 )
+
 
 # ============================================================
 # MODEL COMPONENT PREFIXES
@@ -105,10 +106,16 @@ CLIP_PREFIXES = (
 )
 
 def is_vae_key(key: str) -> bool:
+    # VAE keys are structurally stable → startswith is safe
     return key.startswith(VAE_PREFIXES)
 
 def is_clip_key(key: str) -> bool:
-    return key.startswith(CLIP_PREFIXES)
+    # CLIP stacks are more fragmented across architectures
+    return (
+        key.startswith(CLIP_PREFIXES)
+        or any(p in key for p in CLIP_PREFIXES)
+    )
+
 
 # === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
 class MergeStats:

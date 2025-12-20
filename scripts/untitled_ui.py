@@ -670,12 +670,34 @@ def on_ui_tabs():
                                 value=False,
                                 info="Pad tensors for max file size (~7.5GB+) — like old mergers"
                             )
+                            
+                            dual_soul_toggle = gr.Checkbox(
+                                label="Dual-Soul Mode (Cross-Arch Safety)",
+                                value=False,
+                                info="Force cross-architecture protection logic even if detection fails"
+                            )
+
+                            sacred_keys_toggle = gr.Checkbox(
+                                label="Preserve Sacred Keys",
+                                value=False,
+                                info="Force preservation of noise / timestep / input layers"
+                            )
+
+                            smartresize_toggle = gr.Checkbox(
+                                label="Force SmartResize",
+                                value=False,
+                                info="Force tensor resizing to primary shapes when mismatched"
+                            )
+                            specific_selectors_first = gr.Checkbox(
+                                label="Style-First Weight Matching",
+                                value=False,
+                                info="Apply narrow regex rules before broad ones. Stronger style transfer; safer OFF by default."
+                            )
                             copy_vae = gr.Checkbox(
                                 label="Copy VAE from Primary (Recommended)",
                                 value=True,
                                 info="Preserve decoding stability and color fidelity"
                             )
-
                             copy_clip = gr.Checkbox(
                             label="Copy CLIP from Primary (Recommended)",
                             value=True,
@@ -695,6 +717,28 @@ def on_ui_tabs():
                             outputs=None
                         )
 
+                        dual_soul_toggle.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=dual_soul_toggle,
+                            outputs=None
+                        )
+
+                        sacred_keys_toggle.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=sacred_keys_toggle,
+                            outputs=None
+                        )
+
+                        smartresize_toggle.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=smartresize_toggle,
+                            outputs=None
+                        )
+                        specific_selectors_first.change(
+                            fn=lambda: cmn.opts.save(),
+                            inputs=specific_selectors_first,
+                            outputs=None
+                        )
                         copy_vae.change(
                             fn=lambda: cmn.opts.save(),
                             inputs=copy_vae,        
@@ -932,6 +976,44 @@ def on_ui_tabs():
                             'bloat_mode',
                             gr.Checkbox,
                             {"label": "Legacy Bloat Mode (Max File Size)"},
+                            False
+                        )
+                        cmn.opts.create_option(
+                            'force_cross_arch',
+                            gr.Checkbox,
+                        {
+                            "label": "Force Dual-Soul Mode",
+                            "info": "Override detection and force cross-architecture merge logic"
+                        },
+                            False
+                        )
+
+                        cmn.opts.create_option(
+                            'force_sacred_keys',
+                            gr.Checkbox,
+                        {
+                            "label": "Force Sacred Key Preservation",
+                            "info": "Always preserve noise & timestep layers from primary"
+                        },
+                            False
+                        )
+
+                        cmn.opts.create_option(
+                            'force_smartresize',
+                            gr.Checkbox,
+                        {
+                            "label": "Force SmartResize",
+                            "info": "Always resize tensors to primary shape when mismatched"
+                        },
+                            False
+                        )
+                        cmn.opts.create_option(
+                            'specific_selectors_first',
+                            gr.Checkbox,
+                        {
+                            "label": "Style-First Weight Matching",
+                            "info": "Apply narrow regex rules before broad ones. Stronger style transfer."
+                        },
                             False
                         )
                         cmn.opts.create_option(
@@ -1188,7 +1270,10 @@ def on_ui_tabs():
                             *custom_sliders,
                             keep_zero_fill,    
                             bloat_mode,
-                                 
+                            dual_soul_toggle,
+                            sacred_keys_toggle,
+                            smartresize_toggle,
+                            specific_selectors_first,
                         ],
                         outputs=status
                     )
@@ -2013,13 +2098,19 @@ def start_merge(save_name, save_settings, finetune,
                 alpha, beta, gamma, delta, epsilon,
                 weight_editor, preset_output,          # ← Preset JSON
                 discard, clude, clude_mode,
-                merge_seed, enable_sliders, copy_vae_from_primary,
-                copy_clip_from_primary, *custom_sliders,):
+                merge_seed, enable_sliders, *custom_sliders, copy_vae_from_primary,
+                copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle, specific_selectors_first,):
     
     progress = Progress()
     
     keep_zero_fill = cmn.opts.get('keep_zero_fill', True)
     bloat_mode = cmn.opts.get('bloat_mode', False)
+
+    cmn.opts.set("force_cross_arch", bool(dual_soul_toggle))
+    cmn.opts.set("force_sacred_keys", bool(sacred_keys_toggle))
+    cmn.opts.set("force_smartresize", bool(smartresize_toggle))
+    cmn.opts.set("specific_selectors_first", bool(specific_selectors_first))
+
 
     copy_vae_from_primary  = cmn.opts.get('copy_vae_from_primary', True)
     copy_clip_from_primary = cmn.opts.get('copy_clip_from_primary', True)
@@ -2049,6 +2140,10 @@ def start_merge(save_name, save_settings, finetune,
             bloat_mode,
             copy_vae_from_primary,
             copy_clip_from_primary,
+            dual_soul_toggle,
+            sacred_keys_toggle,
+            smartresize_toggle,
+            specific_selectors_first,
             
         ]
 

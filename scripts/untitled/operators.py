@@ -144,10 +144,15 @@ class Operation:
 class CopyPrimary(Operation):
     """
     Authoritative primary fallback.
-    No Dual-Soul logic.
-    No SmartResize policy.
-    No caching (intentional).
+
+    Guarantees:
+    • No Dual-Soul logic
+    • No SmartResize logic
+    • No device / dtype normalization
+    • No silent shape violations
+    • Zero-fill only if explicitly allowed
     """
+
     def __init__(self, key, primary_path, stats=None, keep_zero_fill=False, bloat_mode=False):
         super().__init__(key)
         self.primary_path = primary_path
@@ -186,7 +191,7 @@ class CopyPrimary(Operation):
             try:
                 t = file.get_tensor(self.key)
 
-                # Bloat mode — NEVER for sacred keys
+                # Optional bloat mode (never for sacred keys)
                 if self.bloat_mode and not cmn.is_sacred_key(self.key):
                     pad = 256
                     shape = t.shape
@@ -203,20 +208,38 @@ class CopyPrimary(Operation):
 
                     print(f"[BloatMode] {self.key} ← PADDED to {bloated_shape}")
 
+                # --------------------------------------------------
+                # SHAPE AUTHORITY GUARD
+                # --------------------------------------------------
+                target_shape = cmn.cross_arch_target_shapes.get(self.key)
+
+                if (
+                    cmn.smartresize_enabled
+                    and target_shape is not None
+                    and t.shape != target_shape
+                ):
+                    # ❗ Never resize here — initialize_task owns that
+                    raise RuntimeError(
+                        f"[CopyPrimary] Shape mismatch for '{self.key}': "
+                        f"{tuple(t.shape)} vs target {tuple(target_shape)}"
+                    )
+
                 if self.stats:
                     self.stats.copied_primary += 1
 
-                t = t.to(device=cmn.get_device())
-                if t.is_floating_point():
-                    t = t.to(dtype=cmn.get_dtype())
-
+                # NOTE:
+                # Do NOT move to device or dtype here.
+                # initialize_task is the only normalization point.
                 return t
 
             except Exception as e:
-                print(f"[CopyPrimary] FAILED reading {self.key} from {model_name}: {e}")
+                print(
+                    f"[CopyPrimary] FAILED reading '{self.key}' "
+                    f"from {model_name}: {e}"
+                )
 
         # --------------------------------------------------
-        # 2. Explicit zero-fill (only if allowed)
+        # 2. Explicit zero-fill (Kitchen-Sink only)
         # --------------------------------------------------
         target_shape = cmn.cross_arch_target_shapes.get(self.key)
         if target_shape and self.keep_zero_fill:
@@ -243,9 +266,18 @@ class CopyPrimary(Operation):
 class LoadTensor(Operation):
     """
     Pure tensor loader.
-    No resize, no zero-fill, no policy.
-    Shape, sacred handling, Dual-Soul logic live in initialize_task().
+
+    Guarantees:
+    • No resize
+    • No zero-fill
+    • No Dual-Soul or sacred logic
+    • No device / dtype normalization
+    • No silent shape violations
+
+    Shape enforcement, SmartResize, sacred handling, and normalization
+    live exclusively in initialize_task().
     """
+
     def __init__(self, key, checkpoint_name):
         super().__init__(key)
         self.checkpoint_name = checkpoint_name or ""
@@ -269,7 +301,9 @@ class LoadTensor(Operation):
         file = None
         used_path = None
 
-        # Normalize paths robustly (Windows-safe)
+        # --------------------------------------------------
+        # Path normalization (Windows-safe)
+        # --------------------------------------------------
         def norm(p):
             try:
                 return os.path.normcase(os.path.realpath(os.path.abspath(p)))
@@ -312,7 +346,7 @@ class LoadTensor(Operation):
             )
 
         # --------------------------------------------------
-        # 3. Load tensor (no policy here)
+        # 3. Load tensor (policy-free)
         # --------------------------------------------------
         if self.key not in file:
             raise RuntimeError(
@@ -320,16 +354,29 @@ class LoadTensor(Operation):
                 f"{os.path.basename(used_path) if used_path else 'unknown'}"
             )
 
-        tensor = file.get_tensor(self.key)
+        t = file.get_tensor(self.key)
 
         # --------------------------------------------------
-        # 4. Device + dtype normalization (safe)
+        # SHAPE AUTHORITY GUARD
         # --------------------------------------------------
-        tensor = tensor.to(device=cmn.get_device())
-        if tensor.is_floating_point():
-            tensor = tensor.to(dtype=cmn.get_dtype())
+        target_shape = cmn.cross_arch_target_shapes.get(self.key)
 
-        return tensor
+        if (
+            cmn.smartresize_enabled
+            and target_shape is not None
+            and t.shape != target_shape
+        ):
+            # ❗ Never resize here — initialize_task owns that
+            raise RuntimeError(
+                f"[LoadTensor] Shape mismatch for '{self.key}': "
+                f"{tuple(t.shape)} vs target {tuple(target_shape)}"
+            )
+
+        # NOTE:
+        # Do NOT move to device or dtype here.
+        # initialize_task is the single normalization point.
+        return t
+
 
 
 # === BASIC OPERATORS (fixed indentation) ===
@@ -461,6 +508,43 @@ class Similarities(Extract):
         # Delegate to Extract with no explicit base
         return super().oper(a, b)
 
+class Clamp(Operation):
+    def __init__(self, key, min_val=-1.0, max_val=1.0):
+        super().__init__(key)
+        self.min = min_val
+        self.max = max_val
+
+    @multi_cache_operation
+    def oper(self, *tensors):
+        valid = [t for t in tensors if t.numel() > 0]
+        if not valid:
+            return torch.zeros([], device=cmn.get_device(), dtype=cmn.get_dtype())
+
+        result = valid[0].clone()
+        return result.clamp(self.min, self.max).to(cmn.get_dtype())
+    
+class Mean(Operation):
+    @multi_cache_operation
+    def oper(self, *tensors):
+        valid = [t for t in tensors if t.numel() > 0]
+        if not valid:
+            return torch.zeros([], device=cmn.get_device(), dtype=cmn.get_dtype())
+
+        result = sum(valid) / len(valid)
+        return result.to(cmn.get_dtype())
+    
+class Normalize(Operation):
+    @multi_cache_operation
+    def oper(self, *tensors):
+        valid = [t for t in tensors if t.numel() > 0]
+        if not valid:
+            return torch.zeros([], device=cmn.get_device(), dtype=cmn.get_dtype())
+
+        t = valid[0].float()
+        norm = t.norm()
+        if norm == 0:
+            return t.to(cmn.get_dtype())
+        return (t / norm).to(cmn.get_dtype())
 
 class ReBasin(Operation):
     def __init__(self, key, alpha, a, b):

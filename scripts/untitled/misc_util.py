@@ -193,7 +193,7 @@ def target_to_regex(target_input: str | list) -> str:
         escaped = escaped.replace(r"\*", ".*").replace(r"\?", ".")
 
         # If user didn't anchor explicitly, allow weight/bias suffix
-        if not re.search(r"(\\\.weight|\\\.bias|\$)$", escaped):
+        if not escaped.endswith(("\\.weight", "\\.bias")) and not escaped.endswith("$"):
             escaped += r"(?:\.weight|\.bias)?"
 
         patterns.append(escaped)
@@ -211,15 +211,22 @@ def target_to_regex(target_input: str | list) -> str:
 def id_checkpoint(name):
     """
     Identify checkpoint architecture family and preferred dtype.
-    Deterministic, filename-hint first, key-based second.
-    Never throws.
+
+    • Deterministic
+    • Filename-hint first, key-based second
+    • Never throws
+    • Policy-neutral (overrides handled elsewhere)
+
+    Returns:
+        (arch_id: str, preferred_dtype: torch.dtype)
     """
+
     if not name:
-        return "Unknown", torch.float16
+        return "unknown", torch.float16
 
     info = sd_models.get_closet_checkpoint_match(name)
     if not info or not info.filename:
-        return "Unknown", torch.float16
+        return "unknown", torch.float16
 
     filename = info.filename
     lower = filename.lower()
@@ -228,26 +235,29 @@ def id_checkpoint(name):
     # 1. FAST PATH — filename hints (cheap, optional)
     # -------------------------------------------------
     if any(x in lower for x in ("fp8", "nf4", "q4", "q5", "q8")):
-        return "Flux (Quantized)", torch.bfloat16
+        return "flux_quantized", torch.bfloat16
 
     if "bf16" in lower or "bfp16" in lower:
-        return "Flux", torch.bfloat16
+        return "flux", torch.bfloat16
 
     if "fp32" in lower or "f32" in lower:
-        return "SD (FP32)", torch.float32
+        return "sd_fp32", torch.float32
 
     # -------------------------------------------------
     # 2. AUTHORITATIVE PATH — inspect safetensors
     # -------------------------------------------------
     try:
-        with safetensors.torch.safe_open(filename, framework="pt", device="cpu") as f:
+        with safetensors.torch.safe_open(
+            filename, framework="pt", device="cpu"
+        ) as f:
             keys = list(f.keys())
             if not keys:
-                return "Unknown", torch.float16
+                return "unknown", torch.float16
 
-            # ── Determine dtype (metadata preferred)
+            # ── Preferred dtype (metadata > tensor probe)
             tensor_dtype = torch.float16
             metadata = f.metadata()
+
             if metadata and "dtype" in metadata:
                 d = metadata["dtype"].lower()
                 if "bf16" in d:
@@ -260,33 +270,37 @@ def id_checkpoint(name):
                 except Exception:
                     pass
 
+            keyset = set(keys)
+
             # -------------------------------------------------
             # 3. ARCHITECTURE DETECTION (key-based, stable)
             # -------------------------------------------------
-            keyset = set(keys)
 
-            # Flux / SD3 / Aurora
+            # Flux / SD3 / Aurora family
             if any(k.startswith("denoiser.") for k in keyset):
-                return "Flux/SD3/Aurora", tensor_dtype
+                return "flux_sd3", tensor_dtype
 
-            # Flux / Pony blocks
-            if any(("single_blocks" in k or "double_blocks" in k) for k in keyset):
-                return "Pony/Flux", tensor_dtype
+            # Pony / Flux transformer blocks (tightened)
+            if any(
+                k.startswith(("model.single_blocks.", "model.double_blocks."))
+                for k in keyset
+            ):
+                return "pony_flux", tensor_dtype
 
             # SDXL family
             if any(k.startswith("conditioner.embedders.") for k in keyset):
-                return "SDXL", tensor_dtype
+                return "sdxl", tensor_dtype
 
-            # SD 1.5 family
+            # SD 1.x family
             if any(k.startswith("cond_stage_model.") for k in keyset):
-                return "SD1.5", tensor_dtype
+                return "sd15", tensor_dtype
 
-            # Fallback: still SD-like
-            return "SD (Unknown Variant)", tensor_dtype
+            # Fallback — SD-like but unknown variant
+            return "sd_unknown", tensor_dtype
 
     except Exception as e:
         print(f"[id_checkpoint] Failed to inspect {filename}: {e}")
-        return "Unknown", torch.float16
+        return "unknown", torch.float16
 
     
 class NoCaching:
