@@ -707,45 +707,45 @@ def on_ui_tabs():
                         # Kitchen-Sink Mode (zero-fill) — save to options
 
                         keep_zero_fill.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=keep_zero_fill,
                             outputs=None
                         )
                         bloat_mode.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=bloat_mode,
                             outputs=None
                         )
 
                         dual_soul_toggle.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=dual_soul_toggle,
                             outputs=None
                         )
 
                         sacred_keys_toggle.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=sacred_keys_toggle,
                             outputs=None
                         )
 
                         smartresize_toggle.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=smartresize_toggle,
                             outputs=None
                         )
                         specific_selectors_first.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=specific_selectors_first,
                             outputs=None
                         )
                         copy_vae.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=copy_vae,        
                             outputs=None
                         )
                         copy_clip.change(
-                            fn=lambda: cmn.opts.save(),
+                            fn=lambda _: cmn.opts.save(),
                             inputs=copy_clip,
                             outputs=None
                         )
@@ -1267,13 +1267,13 @@ def on_ui_tabs():
                             merge_seed,
                             enable_sliders,
                             slider_slider, 
-                            *custom_sliders,
                             keep_zero_fill,    
                             bloat_mode,
                             dual_soul_toggle,
                             sacred_keys_toggle,
                             smartresize_toggle,
                             specific_selectors_first,
+                            *custom_sliders,
                         ],
                         outputs=status
                     )
@@ -2098,21 +2098,18 @@ def start_merge(save_name, save_settings, finetune,
                 alpha, beta, gamma, delta, epsilon,
                 weight_editor, preset_output,          # ← Preset JSON
                 discard, clude, clude_mode,
-                merge_seed, enable_sliders, *custom_sliders, copy_vae_from_primary,
-                copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle, specific_selectors_first,):
+                merge_seed, enable_sliders, copy_vae_from_primary,
+                copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle, specific_selectors_first, *custom_sliders,):
     
     progress = Progress()
     
     keep_zero_fill = cmn.opts.get('keep_zero_fill', True)
     bloat_mode = cmn.opts.get('bloat_mode', False)
-
-    cmn.opts.set("force_cross_arch", bool(dual_soul_toggle))
-    cmn.opts.set("force_sacred_keys", bool(sacred_keys_toggle))
-    cmn.opts.set("force_smartresize", bool(smartresize_toggle))
-    cmn.opts.set("specific_selectors_first", bool(specific_selectors_first))
-
-
-    copy_vae_from_primary  = cmn.opts.get('copy_vae_from_primary', True)
+    dual_soul_toggle = cmn.opts.get("force_cross_arch", False)
+    sacred_keys_toggle = cmn.opts.get("force_sacred_keys", False)
+    smartresize_toggle = cmn.opts.get("force_smartresize", False)
+    specific_selectors_first = cmn.opts.get("specific_selectors_first", False)
+    copy_vae_from_primary = cmn.opts.get('copy_vae_from_primary', True)
     copy_clip_from_primary = cmn.opts.get('copy_clip_from_primary', True)
 
     try:
@@ -2134,8 +2131,7 @@ def start_merge(save_name, save_settings, finetune,
             clude or "",
             clude_mode,
             merge_seed,
-            enable_sliders,
-            *custom_sliders,         
+            enable_sliders,         
             keep_zero_fill,
             bloat_mode,
             copy_vae_from_primary,
@@ -2144,17 +2140,38 @@ def start_merge(save_name, save_settings, finetune,
             sacred_keys_toggle,
             smartresize_toggle,
             specific_selectors_first,
+            *custom_sliders,
             
         ]
 
-        # Main merge
+        # -------------------------------
+        # MAIN MERGE (runs once)
+        # -------------------------------
         merger.prepare_merge(progress, *merge_args)
 
-        # Success → save to history
-        save_to_history({
-            'models': str(merge_args[3:7]),
-            'modes': f"{merge_args[2]}+{merge_args[1]}"
-        }, "Success")
+        # -------------------------------
+        # 🔒 LOCK UI CHECKPOINT (CRITICAL)
+        # Lock to REAL base checkpoint title
+        # -------------------------------
+        try:
+            if cmn.primary:
+                base_title = os.path.splitext(os.path.basename(cmn.primary))[0]
+                shared.opts.sd_model_checkpoint = base_title
+                print(f"[Amethyst] UI checkpoint locked → {base_title}")
+        except Exception as e:
+            print(f"[Amethyst] UI lock warning: {e}")
+
+
+        # -------------------------------
+        # SUCCESS → SAVE HISTORY
+        # -------------------------------
+        save_to_history(
+            {
+                'models': str(merge_args[3:7]),
+                'modes': f"{merge_args[2]}+{merge_args[1]}"
+            },
+            "Success"
+        )
 
     except Exception as error:
         # Always clear cache on error
@@ -2171,9 +2188,11 @@ def start_merge(save_name, save_settings, finetune,
         if not isinstance(error, getattr(merger, 'MergeInterruptedError', Exception)):
             raise
 
-    # ← No finally block needed for the return
-    # Gradio expects this value, so we return it at the very end
+    # -------------------------------
+    # RETURN TO GRADIO (last line)
+    # -------------------------------
     return progress.get_report()
+
 
 def universal_model_reload():
     """

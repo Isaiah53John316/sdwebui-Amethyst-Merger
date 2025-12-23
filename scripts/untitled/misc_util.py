@@ -526,107 +526,81 @@ def save_state_dict(
         return None
 
 
-def load_merged_state_dict(state_dict, checkpoint_info=None):
+def load_merged_state_dict(state_dict, checkpoint_info):
     """
-    Load merged model fully in-memory.
-    Works with:
-      • Autosave ON/OFF
-      • A1111 dev
-      • reForge
+    TRUE in-memory load (NO DISK WRITES).
+    Inject weights into an already-constructed shared.sd_model
+    and lock A1111 to prevent fallback reloads.
     """
 
-    import os
     import gc
-    from safetensors.torch import save_file
-    from modules import sd_models, shared, paths_internal
+    import torch
+    import gradio as gr
+    import os
+    from modules import sd_models, shared
+    from modules import sd_hijack, script_callbacks, sd_unet
+
+    # --- Timer compatibility (A1111 expects .record()) ---
+    try:
+        from modules.timer import Timer
+        load_timer = Timer()
+    except Exception:
+        class _TimerStub:
+            def record(self, *args, **kwargs): 
+                return None
+            def summary(self, *args, **kwargs): 
+                return ""
+        load_timer = _TimerStub()
 
     if not state_dict:
         gr.Warning("Nothing to load — state_dict is empty")
         return
 
-    # Respect merge dtype
-    sample = next(iter(state_dict.values()))
-    target_dtype = sample.dtype
+    print("[DEBUG] shared.sd_model:", "SET" if shared.sd_model is not None else "NONE")
+    print("[DEBUG] checkpoint_info.filename:", getattr(checkpoint_info, "filename", None))
+    print("[DEBUG] tensors:", len(state_dict))
 
-    print(f"[Merger] Preparing {len(state_dict)} tensors ({target_dtype}) for in-memory load")
+    # Normalize dtype (match prior working behavior)
+    for k, v in state_dict.items():
+        if hasattr(v, "is_floating_point") and v.is_floating_point():
+            state_dict[k] = v.half()
 
-    state_dict = {
-        k: v.to(dtype=target_dtype, device="cpu")
-        for k, v in state_dict.items()
-    }
+    if shared.sd_model is None:
+        raise RuntimeError(
+            "In-memory merge requires an already-loaded model. "
+            "Load a base checkpoint first."
+        )
 
-    # -------------------------------------------------
-    # Ensure checkpoint_info has a REAL file path
-    # -------------------------------------------------
-    if checkpoint_info is None or not getattr(checkpoint_info, "filename", None):
-        base_dir = os.path.join(paths_internal.models_path, "Stable-diffusion")
-        os.makedirs(base_dir, exist_ok=True)
-
-        fake_name = "merged_in_memory.safetensors"
-        fake_path = os.path.join(base_dir, fake_name)
-
-        # Create tiny placeholder if needed
-        if not os.path.exists(fake_path):
-            save_file({}, fake_path, metadata={"placeholder": "true"})
-
-        checkpoint_info = sd_models.CheckpointInfo(fake_path)
-        checkpoint_info.filename = fake_path
-        checkpoint_info.title = "Merged (In-Memory)"
-        checkpoint_info.name = fake_name
-        checkpoint_info.hash = None
-        checkpoint_info.sha256 = None
-        checkpoint_info.shorthash = None
-        checkpoint_info.registered = True
-
-        sd_models.checkpoints_list[fake_name] = checkpoint_info
+    print("[Merger] Injecting merged weights into existing model (true in-memory)")
 
     # -------------------------------------------------
-    # Full unload (clean slate)
+    # Inject weights directly (NO checkpoint resolution)
     # -------------------------------------------------
-    if shared.sd_model is not None:
-        print("[Merger] Unloading current model...")
-        try:
-            sd_models.unload_model_weights(shared.sd_model)
-        except Exception:
-            pass
-        shared.sd_model = None
+    sd_models.load_model_weights(
+        shared.sd_model,
+        checkpoint_info,
+        state_dict,
+        load_timer,
+    )
+
+    # -------------------------------------------------
+    # Post-load hooks
+    # -------------------------------------------------
+    sd_hijack.model_hijack.hijack(shared.sd_model)
+    script_callbacks.model_loaded_callback(shared.sd_model)
+    sd_models.model_data.set_sd_model(shared.sd_model)
+
+    if hasattr(sd_unet, "apply_unet"):
+        sd_unet.apply_unet()
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    # -------------------------------------------------
-    # Load model using state_dict injection
-    # -------------------------------------------------
-    print("[Merger] Loading merged model (in-memory, registered)")
+    print("[Merger] ✅ Merged model loaded successfully (true in-memory)")
 
-    try:
-        sd_models.load_model(
-            checkpoint_info=checkpoint_info,
-            already_loaded_state_dict=state_dict,
-        )
-    except Exception as e:
-        print(f"[FATAL] In-memory load failed: {e}")
-        raise gr.Error(f"In-memory load failed: {e}")
 
-    # -------------------------------------------------
-    # Post-load hooks (critical)
-    # -------------------------------------------------
-    try:
-        from modules import sd_hijack, script_callbacks, sd_unet
-
-        sd_hijack.model_hijack.hijack(shared.sd_model)
-        script_callbacks.model_loaded_callback(shared.sd_model)
-        sd_models.model_data.set_sd_model(shared.sd_model)
-
-        if hasattr(sd_unet, "apply_unet"):
-            sd_unet.apply_unet("upcast")
-
-    except Exception as e:
-        print(f"[Merger] Post-load hooks warning (non-fatal): {e}")
-
-    print("[Merger] ✅ Merged model loaded successfully (in-memory)")
 
 
 

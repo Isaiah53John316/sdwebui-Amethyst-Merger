@@ -382,8 +382,12 @@ def assign_weights_to_keys(
     targets,
     keys,
     already_assigned=None,
-    specific_selectors_first=False
+    specific_selectors_first=None,
 ):
+    if specific_selectors_first is None:
+        specific_selectors_first = cmn.opts.get(
+            "specific_selectors_first", False
+        )
     #Selector precedence policy:
     #------------------------------------------------------------
     #specific_selectors_first = False (DEFAULT, safer)
@@ -562,7 +566,6 @@ def prepare_merge(
     weight_editor, preset_output,
     discard, clude, clude_mode,
     merge_seed, enable_sliders,
-    *custom_sliders,
     keep_zero_fill=True,
     bloat_mode=False,
     copy_vae_from_primary=True,
@@ -570,7 +573,7 @@ def prepare_merge(
     dual_soul_toggle=False,
     sacred_keys_toggle=False,
     smartresize_toggle=False,
-    specific_selectors_first=False,
+    *custom_sliders,
 ):
     progress("\n### Preparing merge ###")
     print(
@@ -686,14 +689,6 @@ def prepare_merge(
         progress(f"Merge running on {cmn.device.type.upper()} with {dtype_name}")
 
         # ─────────────────────────────────────────────
-        # 7. Selector priority policy
-        # ────────────────────────────────────────────
-        cmn.opts.set(
-            "specific_selectors_first",
-            bool(specific_selectors_first)
-        )
-
-        # ─────────────────────────────────────────────
         # 8. Create tasks
         # ─────────────────────────────────────────────
         assigned_keys = assign_weights_to_keys(targets, keys)
@@ -738,12 +733,11 @@ def prepare_merge(
             threads=cmn.opts.get("threads", 8),
             keep_zero_fill=keep_zero_fill,
             bloat_mode=bloat_mode,
-            copy_vae_from_primary=copy_vae_from_primary,     # ← ADD
+            copy_vae_from_primary=copy_vae_from_primary,     
             copy_clip_from_primary=copy_clip_from_primary,
             dual_soul_toggle=dual_soul_toggle,
             sacred_keys_toggle=sacred_keys_toggle,
             smartresize_toggle=smartresize_toggle,
-            specific_selectors_first=False, 
         )
 
     # ─────────────────────────────────────────────
@@ -767,12 +761,8 @@ def prepare_merge(
     # 11. SAVE + LOAD (UI-respecting, current API)
     # ─────────────────────────────────────────────
     from copy import deepcopy
-    from modules import sd_models
-    from scripts.untitled.misc_util import (
-        save_state_dict,
-        load_merged_state_dict,
-        NoCaching,
-    )
+    from modules import sd_models, shared
+    from scripts.untitled.misc_util import save_state_dict, load_merged_state_dict, NoCaching
     import gc, os, re
 
     settings = list(save_settings or [])
@@ -780,9 +770,7 @@ def prepare_merge(
     autosave = "Autosave" in settings
     load_in_memory = ("Load in Memory" in settings) or autosave
 
-    # -------------------------------------------------
     # Resolve target dtype from UI
-    # -------------------------------------------------
     if "fp32" in settings:
         target_dtype = torch.float32
         dtype_label = "FP32"
@@ -797,7 +785,6 @@ def prepare_merge(
     # Resolve merge name (filesystem + UI safe)
     # -------------------------------------------------
     merge_name = (save_name or "").strip()
-
     if not merge_name:
         try:
             merge_name = mutil.create_name(
@@ -808,33 +795,33 @@ def prepare_merge(
         except Exception:
             merge_name = "merged_model"
 
-    # sanitize for filesystem safety (Windows-safe)
     merge_name = re.sub(r"[^\w\-.~]", "_", merge_name)
 
     # -------------------------------------------------
-    # Prepare base checkpoint identity EARLY (old behavior)
+    # Prepare base checkpoint info (REAL primary) + merged identity (UI only)
     # -------------------------------------------------
-    checkpoint_info = None
+    base_ckpt_info = None
+    merged_ckpt_info = None
+
     try:
         getter = getattr(sd_models, "get_closet_checkpoint_match", None) \
               or getattr(sd_models, "get_closest_checkpoint_match", None)
 
         if getter and cmn.primary:
-            checkpoint_info = deepcopy(getter(os.path.basename(cmn.primary)))
-            checkpoint_info.short_title = (
-                hash(cmn.last_merge_tasks)
-                if cmn.last_merge_tasks is not None
-                else hash(merge_name)
-            )
-            checkpoint_info.name_for_extra = "_TEMP_MERGE_" + merge_name
-            checkpoint_info.title = merge_name
-            checkpoint_info.name = merge_name
+            base_ckpt_info = getter(os.path.basename(cmn.primary))
+            if base_ckpt_info:
+                merged_ckpt_info = deepcopy(base_ckpt_info)
+                merged_ckpt_info.title = merge_name
+                merged_ckpt_info.name = merge_name
     except Exception:
-        checkpoint_info = None
+        base_ckpt_info = None
+        merged_ckpt_info = None
 
     # -------------------------------------------------
-    # Autosave (optional)
+    # Autosave (optional) -- ONLY place we write a file
     # -------------------------------------------------
+    checkpoint_info = None
+
     if autosave:
         try:
             progress(f"Autosave enabled → saving ({dtype_label})…")
@@ -866,10 +853,21 @@ def prepare_merge(
         try:
             progress("Loading merged model into memory…")
 
+            # Ensure there is a REAL base model to inject into
+            if shared.sd_model is None:
+                if base_ckpt_info is None:
+                    raise RuntimeError("Base checkpoint_info is missing; cannot load a base model.")
+                progress("[Merger] Base model not loaded — loading primary checkpoint first…")
+                sd_models.load_model(checkpoint_info=base_ckpt_info)
+
+                shared.sd_model.sd_checkpoint_info = base_ckpt_info
+                sd_models.model_data.set_sd_model(shared.sd_model)
+
+            # IMPORTANT: for injection loads, NoCaching is optional; keep if you like.
             with NoCaching():
                 load_merged_state_dict(
                     merged_state_dict,
-                    checkpoint_info=checkpoint_info,
+                    checkpoint_info=base_ckpt_info,   # inject into this architecture
                 )
 
             gc.collect()
@@ -885,7 +883,7 @@ def prepare_merge(
         progress("Load in Memory disabled — model not loaded")
 
     # -------------------------------------------------
-    # Refresh model list if we wrote a real file
+    # Refresh model list only if we wrote a real file
     # -------------------------------------------------
     if autosave:
         try:
@@ -894,6 +892,8 @@ def prepare_merge(
             pass
 
     return merged_state_dict
+
+
 
 
 def do_merge(
@@ -1050,14 +1050,9 @@ def do_merge(
     cmn.sacred_enabled      = not cmn.same_arch
     cmn.smartresize_enabled = not cmn.same_arch
 
-    force_cross_arch  = bool(dual_soul_toggle)
-    force_sacred_keys = bool(sacred_keys_toggle)
-    force_smartresize = bool(smartresize_toggle)
-
-    cmn.opts.set("force_cross_arch", force_cross_arch)
-    cmn.opts.set("force_sacred_keys", force_sacred_keys)
-    cmn.opts.set("force_smartresize", force_smartresize)
-
+    force_cross_arch  = dual_soul_toggle
+    force_sacred_keys = sacred_keys_toggle
+    force_smartresize = smartresize_toggle
 
     if force_cross_arch:
         cmn.same_arch = False
