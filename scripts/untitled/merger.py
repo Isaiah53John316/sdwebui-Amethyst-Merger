@@ -23,7 +23,7 @@ from tqdm import tqdm
 from copy import copy, deepcopy
 from modules import devices, shared, script_loading, paths, paths_internal, sd_models
 from scripts.untitled.operators import SmartResize
-from scripts.untitled.common import cmn
+from scripts.untitled.common import CLIP_PREFIXES, VAE_PREFIXES, cmn
 from scripts.untitled.common import merge_stats
 from scripts.untitled.operators import WeightsCache
 
@@ -1040,11 +1040,15 @@ def do_merge(
 
     if not cmn.same_arch:
         progress(
-            f"AUTO-DETECTED mixed architectures — Dual-Soul ACTIVE "
+            f"AUTO-DETECTED mixed architectures "
             f"(SDXL-family={has_sdxl_family}, SD1.5={has_sd15}, Flux={has_flux})"
         )
+        progress("No merge policies enabled by default — awaiting user choice")
     else:
-        progress(f"Same architecture family detected: {next(iter(types)) if types else 'unknown'}")
+        progress(
+            f"Same architecture family detected: "
+            f"{next(iter(types)) if types else 'unknown'}"
+        )
 
     # ------------------------------------------------------------
     # 3. Choose primary
@@ -1070,12 +1074,18 @@ def do_merge(
         f"Using {os.path.basename(cmn.primary) if cmn.primary else 'None'} as primary"
     )
 
+
     # ------------------------------------------------------------
-    # 3.25 Policy toggles
+    # 3.25 Policy toggles (USER-DRIVEN)
     # ------------------------------------------------------------
-    cmn.dual_soul_enabled   = not cmn.same_arch
-    cmn.sacred_enabled      = not cmn.same_arch
-    cmn.smartresize_enabled = not cmn.same_arch
+
+    # Facts only
+    cmn.mixed_arch = not cmn.same_arch
+
+    # Explicit defaults (safe, but not inferred)
+    cmn.dual_soul_enabled   = False
+    cmn.sacred_enabled      = False
+    cmn.smartresize_enabled = False
 
     force_cross_arch  = dual_soul_toggle
     force_sacred_keys = sacred_keys_toggle
@@ -1084,15 +1094,16 @@ def do_merge(
     if force_cross_arch:
         cmn.same_arch = False
         cmn.dual_soul_enabled = True
-        progress("[Policy Override] Cross-arch FORCED")
+        progress("[Policy Override] Dual-Soul ENABLED by user")
 
     if force_sacred_keys:
         cmn.sacred_enabled = True
-        progress("[Policy Override] Sacred FORCED")
+        progress("[Policy Override] Sacred keys ENABLED by user")
 
     if force_smartresize:
         cmn.smartresize_enabled = True
-        progress("[Policy Override] SmartResize FORCED")
+        progress("[Policy Override] SmartResize ENABLED by user")
+
 
     print(
         f"[Policy] same_arch={cmn.same_arch} | "
@@ -1201,19 +1212,19 @@ def do_merge(
             # -------------------------
             if copy_vae_from_primary:
                 for k in pf.keys():
-                    if k.startswith((
-                        "first_stage_model.",  # SD1.5
-                        "vae.",                # SDXL / some Flux
-                    )):
+                    if cmn.is_vae_key(k):
                         state_dict[k] = pf.get_tensor(k).cpu()
                         copied_vae += 1
 
                 if copied_vae > 0:
-                    progress(f"[Policy] Copied VAE from primary ({copied_vae} tensors)")
+                    progress(
+                        f"[Policy] Copied VAE from primary "
+                        f"({copied_vae} tensors)"
+                    )
                 else:
                     progress(
-                        "[Policy WARNING] copy_vae enabled, "
-                        "but no VAE keys matched in primary"
+                        "[Policy WARNING] copy_vae enabled, but no VAE tensors matched "
+                        f"(checked prefixes: {', '.join(VAE_PREFIXES)})"
                     )
 
             # -------------------------
@@ -1221,18 +1232,7 @@ def do_merge(
             # -------------------------
             if copy_clip_from_primary:
                 for k in pf.keys():
-                    if k.startswith((
-                        # SD1.5
-                        "cond_stage_model.",
-                        # SDXL
-                        "conditioner.",
-                        "text_model.",
-                        # Flux / SD3 style
-                        "txt_proj.",
-                        "context_embedder.",
-                        "x_embedder.",
-                        "t_embedder.",
-                    )):
+                    if cmn.is_clip_key(k):
                         state_dict[k] = pf.get_tensor(k).cpu()
                         copied_clip += 1
 
@@ -1243,8 +1243,8 @@ def do_merge(
                     )
                 else:
                     progress(
-                        "[Policy WARNING] copy_clip enabled, "
-                        "but no text encoder keys matched in primary"
+                        "[Policy WARNING] copy_clip enabled, but no text encoder tensors matched "
+                        f"(checked prefixes: {', '.join(CLIP_PREFIXES)})"
                     )
 
     # ------------------------------------------------------------
