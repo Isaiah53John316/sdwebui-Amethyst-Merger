@@ -117,23 +117,41 @@ def is_clip_key(key: str) -> bool:
     )
 
 
-# === MERGE STATISTICS TRACKER — FINAL 2025 EDITION ===
+# === MERGE STATISTICS TRACKER — FINAL 2025 EDITION (HARDENED) ===
 class MergeStats:
     def __init__(self):
-        self.custom_merges     = 0   # Real merges from rules or global sliders
-        self.copied_primary    = 0   # Keys copied from primary (metadata, missing keys, etc.)
-        self.smart_resized     = 0   # Tensors that were resized (SmartResize called)
-        self.zero_filled       = 0   # Missing keys filled with zeros (kitchen-sink)
-        self.skipped           = 0   # Should always be 0 — true failure
-        self.smart_merge       = 0   # Sparse merges with multiple sources
+        # ── Core accounting ─────────────────────────────────────
+        self.custom_merges      = 0   # Successful custom / rule-based merges
+        self.custom_failed      = 0   # Custom merges attempted but failed safely
+
+        self.copied_primary     = 0   # Keys copied from primary (metadata, missing keys, etc.)
+        self.smart_resized      = 0   # Tensors that were resized (SmartResize called)
+        self.zero_filled        = 0   # Missing keys filled with zeros (kitchen-sink)
+        self.smart_merge        = 0   # Sparse merges with multiple sources
+
+        # ── Failure tracking ────────────────────────────────────
+        self.skipped            = 0   # Truly missing keys (should be 0 in true kitchen-sink)
+
+    # ── Safety net: never crash due to missing counters ─────────
+    def __getattr__(self, name):
+        if name.endswith("_failed") or name.endswith("_applied") or name.endswith("_attempted"):
+            setattr(self, name, 0)
+            return 0
+        raise AttributeError(name)
+
+    def total_processed(self):
+        return (
+            self.custom_merges +
+            self.custom_failed +
+            self.copied_primary +
+            self.smart_resized +
+            self.zero_filled +
+            self.smart_merge +
+            self.skipped
+        )
 
     def __str__(self):
-        total = (self.custom_merges +
-                 self.copied_primary +
-                 self.smart_resized +
-                 self.zero_filled +
-                 self.skipped +
-                 self.smart_merge)
+        total = self.total_processed()
 
         kitchen_sink = "YES" if self.skipped == 0 else "ALMOST"
         resize_active = "YES" if self.smart_resized > 0 else "NO"
@@ -141,6 +159,7 @@ class MergeStats:
         return (
             f"### AMETHYST MERGE COMPLETE ###\n"
             f"  • Custom merges          : {self.custom_merges:,}\n"
+            f"  • Custom failed (safe)   : {self.custom_failed:,}\n"
             f"  • Copied from Primary     : {self.copied_primary:,}  (metadata, missing keys)\n"
             f"  • Smart-resized           : {self.smart_resized:,}  ({resize_active})\n"
             f"  • Zero-filled (kitchen-sink): {self.zero_filled:,}\n"
@@ -156,25 +175,45 @@ merge_stats = MergeStats()
 
 class MergerContext:
     def __init__(self):
+        # Device / precision
         self.device = None
         self.dtype = torch.float32
+
+        # Primary checkpoint
         self.primary = None
 
-        # ✅ MUST start as None
+        # MUST start as None — populated by safe_open_multiple
         self.loaded_checkpoints = None
 
-        # ✅ used by LoadTensor fallback
+        # Used by LoadTensor fallback and sparse merge
         self.checkpoints_global = []
 
-        # Target shapes for SmartResize and zero-fill — ALWAYS useful
+        # Target shapes for SmartResize and zero-fill
         self.cross_arch_target_shapes = {}
 
+        # Task reuse
         self.last_merge_tasks = None
+
+        # Options storage (UI-backed)
         self.opts = {}
 
-        # Dual-Soul state — now the only architecture flag that matters
+        # Architecture detection
         self.same_arch = True
 
+        # ─────────────────────────────────────────────
+        # POLICY FLAGS (explicit, no magic attributes)
+        # ─────────────────────────────────────────────
+        self.dual_soul_enabled = False
+        self.sacred_enabled = False
+        self.smartresize_enabled = False
+
+        # Execution control
+        self.stop = False
+        self.interrupted = False
+
+    # -------------------------------------------------
+    # Accessors (used everywhere)
+    # -------------------------------------------------
     def get_device(self):
         return self.device
 
@@ -182,7 +221,9 @@ class MergerContext:
         return self.dtype
 
     def set_device(self, device_str: str):
-        self.device = torch.device(device_str if device_str != "cuda" else "cuda")
+        self.device = torch.device(
+            device_str if device_str != "cuda" else "cuda"
+        )
 
     def set_dtype(self, dtype_str: str):
         if dtype_str == "fp16":
@@ -366,6 +407,48 @@ def load_safetensors_state_dict(path: str, *, device="cpu"):
         for k in f.keys():
             sd[k] = f.get_tensor(k)
     return sd, meta
+
+def has_tensor(file, key: str) -> bool:
+    if file is None:
+        return False
+    if hasattr(file, "has_tensor"):
+        return file.has_tensor(key)
+    return key in file
+
+
+def get_tensor(file, key: str):
+    if file is None:
+        raise KeyError(f"Tensor source is None (key={key})")
+    if hasattr(file, "get_tensor"):
+        return file.get_tensor(key)
+    return file[key]
+
+def is_mergeable_tensor(t: torch.Tensor) -> bool:
+    """
+    Returns True if this tensor is safe for numeric merging.
+    Non-floating tensors (e.g. position_ids) must never be merged.
+    """
+    return t.is_floating_point()
+
+
+def handle_non_mergeable_tensor(
+    key: str,
+    tensors: list[torch.Tensor],
+    *,
+    prefer: int = 0
+) -> torch.Tensor:
+    """
+    Policy for non-floating tensors.
+
+    Default behavior:
+      • Return the first available tensor (prefer primary semantics)
+      • Clone to avoid accidental aliasing
+    """
+    if not tensors:
+        raise RuntimeError(f"No tensors available for non-mergeable key '{key}'")
+
+    t = tensors[prefer]
+    return t.clone()
 
 
 def bake_vae_from_file(

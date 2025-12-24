@@ -699,9 +699,19 @@ def on_ui_tabs():
                                 info="Preserve decoding stability and color fidelity"
                             )
                             copy_clip = gr.Checkbox(
-                            label="Copy CLIP from Primary (Recommended)",
-                            value=True,
-                            info="Preserve prompt semantics and text understanding"
+                                label="Copy CLIP from Primary (Recommended)",
+                                value=True,
+                                info="Preserve prompt semantics and text understanding"
+                            )
+                            allow_synthetic_custom_merge = gr.Checkbox(
+                                label="Allow Synthetic Custom Merges (Unsafe)",
+                                value=False,
+                                info="May inject zero-filled or resized tensors into custom merge math."
+                            )
+                            allow_non_float_merges = gr.Checkbox(
+                                label="Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
+                                value=False,
+                                info="Allow numeric merging of integer / boolean tensors "
                             )
 
                         # Kitchen-Sink Mode (zero-fill) — save to options
@@ -749,6 +759,18 @@ def on_ui_tabs():
                             inputs=copy_clip,
                             outputs=None
                         )
+                        allow_synthetic_custom_merge.change(
+                            fn=lambda v: cmn.opts.set(),
+                            inputs=allow_synthetic_custom_merge,
+                            outputs=None
+                        )
+
+                        allow_non_float_merges.change(
+                            fn=lambda v: cmn.opts.set(),
+                            inputs=allow_non_float_merges,
+                            outputs=None
+                        )   
+
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
 
                     # MAIN SLIDERS - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
@@ -1036,6 +1058,25 @@ def on_ui_tabs():
                             True
                         )
 
+                        cmn.opts.create_option(
+                            'allow_synthetic_custom_merge',
+                            gr.Checkbox,
+                        {
+                            "label": "Allow Synthetic Tensors for Custom Merges (Unsafe)",
+                            "info": "May inject zero-filled or resized tensors into custom merge math. "
+                        },
+                            False
+                        )
+                        cmn.opts.create_option(
+                            'allow_non_float_merges',
+                            gr.Checkbox,
+                        {
+                            "label": "Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
+                            "info": "Allow numeric merging of integer or boolean tensors such as position_ids or attention masks."
+                        },
+                            False   
+                        )
+
 
                         def update_cache_size(value):
                             weights_cache.__init__(max(0, int(value)))
@@ -1273,6 +1314,8 @@ def on_ui_tabs():
                             sacred_keys_toggle,
                             smartresize_toggle,
                             specific_selectors_first,
+                            allow_synthetic_custom_merge,
+                            allow_non_float_merges,
                             *custom_sliders,
                         ],
                         outputs=status
@@ -2099,7 +2142,8 @@ def start_merge(save_name, save_settings, finetune,
                 weight_editor, preset_output,          # ← Preset JSON
                 discard, clude, clude_mode,
                 merge_seed, enable_sliders, copy_vae_from_primary,
-                copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle, specific_selectors_first, *custom_sliders,):
+                copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle,
+                specific_selectors_first, allow_synthetic_custom_merge, allow_non_float_merges, *custom_sliders,):
     
     progress = Progress()
     
@@ -2111,6 +2155,8 @@ def start_merge(save_name, save_settings, finetune,
     specific_selectors_first = cmn.opts.get("specific_selectors_first", False)
     copy_vae_from_primary = cmn.opts.get('copy_vae_from_primary', True)
     copy_clip_from_primary = cmn.opts.get('copy_clip_from_primary', True)
+    allow_synthetic_custom_merge = cmn.opts.get("allow_synthetic_custom_merge", False)
+    allow_non_float_merges = cmn.opts.get("allow_non_float_merges", False)
 
     try:
         # ENHANCEMENT 2: Real-time ETA tracking
@@ -2140,6 +2186,8 @@ def start_merge(save_name, save_settings, finetune,
             sacred_keys_toggle,
             smartresize_toggle,
             specific_selectors_first,
+            allow_synthetic_custom_merge,
+            allow_non_float_merges,
             *custom_sliders,
             
         ]

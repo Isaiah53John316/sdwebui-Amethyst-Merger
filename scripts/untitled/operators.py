@@ -151,6 +151,11 @@ class CopyPrimary(Operation):
     • No device / dtype normalization
     • No silent shape violations
     • Zero-fill only if explicitly allowed
+    # NOTE:
+    # CopyPrimary is policy-agnostic by design.
+    # Eligibility, SmartResize, sacred handling, and synthetic rules
+    # are enforced exclusively by initialize_task().
+
     """
 
     def __init__(self, key, primary_path, stats=None, keep_zero_fill=False, bloat_mode=False):
@@ -187,9 +192,10 @@ class CopyPrimary(Operation):
         # --------------------------------------------------
         # 1. Copy from primary if available
         # --------------------------------------------------
-        if file and self.key in file:
+        if file and cmn.has_tensor(file, self.key):
             try:
-                t = file.get_tensor(self.key)
+                t = cmn.get_tensor(file, self.key)
+
 
                 # Optional bloat mode (never for sacred keys)
                 if self.bloat_mode and not cmn.is_sacred_key(self.key):
@@ -258,7 +264,7 @@ class CopyPrimary(Operation):
         # --------------------------------------------------
         if self.stats:
             self.stats.skipped += 1
-        print(f"[LeanMode] {self.key} ← SKIPPED")
+        print(f"[CopyPrimary:SKIPPED] {self.key}")
         return None
 
 
@@ -284,7 +290,11 @@ class LoadTensor(Operation):
         self.source_checkpoint = checkpoint_name  # attribution only
 
     def __hash__(self):
-        return hash((self.key, self.checkpoint_name))
+        return hash((
+            self.key,
+            self.checkpoint_name,
+            cmn.smartresize_enabled,  # optional policy salt
+        ))
 
     def __eq__(self, other):
         return (
@@ -348,13 +358,14 @@ class LoadTensor(Operation):
         # --------------------------------------------------
         # 3. Load tensor (policy-free)
         # --------------------------------------------------
-        if self.key not in file:
+        if not cmn.has_tensor(file, self.key):
             raise RuntimeError(
                 f"Key '{self.key}' missing from checkpoint "
                 f"{os.path.basename(used_path) if used_path else 'unknown'}"
             )
 
-        t = file.get_tensor(self.key)
+        t = cmn.get_tensor(file, self.key)
+
 
         # --------------------------------------------------
         # SHAPE AUTHORITY GUARD

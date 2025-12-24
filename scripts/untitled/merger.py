@@ -48,25 +48,45 @@ class MergeInterruptedError(Exception):
 
 class MergerContext:
     def __init__(self):
+        # Device / precision
         self.device = None
         self.dtype = torch.float32
+
+        # Primary checkpoint
         self.primary = None
 
-        # ✅ MUST start as None
+        # MUST start as None — populated by safe_open_multiple
         self.loaded_checkpoints = None
 
-        # ✅ used by LoadTensor fallback
+        # Used by LoadTensor fallback and sparse merge
         self.checkpoints_global = []
 
-        # Target shapes for SmartResize and zero-fill — ALWAYS useful
+        # Target shapes for SmartResize and zero-fill
         self.cross_arch_target_shapes = {}
 
+        # Task reuse
         self.last_merge_tasks = None
+
+        # Options storage (UI-backed)
         self.opts = {}
 
-        # Dual-Soul state — now the only architecture flag that matters
+        # Architecture detection
         self.same_arch = True
 
+        # ─────────────────────────────────────────────
+        # POLICY FLAGS (explicit, no magic attributes)
+        # ─────────────────────────────────────────────
+        self.dual_soul_enabled = False
+        self.sacred_enabled = False
+        self.smartresize_enabled = False
+
+        # Execution control
+        self.stop = False
+        self.interrupted = False
+
+    # -------------------------------------------------
+    # Accessors (used everywhere)
+    # -------------------------------------------------
     def get_device(self):
         return self.device
 
@@ -74,7 +94,9 @@ class MergerContext:
         return self.dtype
 
     def set_device(self, device_str: str):
-        self.device = torch.device(device_str if device_str != "cuda" else "cuda")
+        self.device = torch.device(
+            device_str if device_str != "cuda" else "cuda"
+        )
 
     def set_dtype(self, dtype_str: str):
         if dtype_str == "fp16":
@@ -573,6 +595,8 @@ def prepare_merge(
     dual_soul_toggle=False,
     sacred_keys_toggle=False,
     smartresize_toggle=False,
+    allow_synthetic_custom_merge=False,
+    allow_non_float_merges=False,
     *custom_sliders,
 ):
     progress("\n### Preparing merge ###")
@@ -738,6 +762,8 @@ def prepare_merge(
             dual_soul_toggle=dual_soul_toggle,
             sacred_keys_toggle=sacred_keys_toggle,
             smartresize_toggle=smartresize_toggle,
+            allow_synthetic_custom_merge=allow_synthetic_custom_merge,
+            allow_non_float_merges=allow_non_float_merges,  
         )
 
     # ─────────────────────────────────────────────
@@ -905,6 +931,7 @@ def do_merge(
     timer=None, threads=8, keep_zero_fill=True, bloat_mode=False,
     copy_vae_from_primary=True, copy_clip_from_primary=True,
     dual_soul_toggle=False, sacred_keys_toggle=False, smartresize_toggle=False,
+    allow_synthetic_custom_merge=False, allow_non_float_merges=False,
 ):
     """
     2025 KITCHEN-SINK MERGE ENGINE
@@ -1260,15 +1287,57 @@ def initialize_task(task):
         print(f"[TaskStart] {key} ← {task_type}")
 
     # =====================================================
-    # 1. FAST PATH — custom operator owns everything
+    # 0. CUSTOM MERGE ELIGIBILITY (POLICY GATE)
     # =====================================================
-    try:
-        tensor = task.merge()
-        merge_stats.custom_merges += 1
-        print(f"[CustomMerge] {key}")
-        return key, tensor.to(cmn.get_device(), dtype=cmn.get_dtype())
-    except Exception as e:
-        print(f"[CustomMerge] FAILED {key}: {e}")
+    has_all_sources = True
+    for cp in cmn.checkpoints_global:
+        f = cmn.loaded_checkpoints.get(cp)
+        if not f or not cmn.has_tensor(f, key):
+            has_all_sources = False
+            break
+
+    synthetic_allowed = (
+        cmn.opts.get("allow_synthetic_custom_merge", False)
+        and (
+            cmn.smartresize_enabled
+            or cmn.opts.get("keep_zero_fill", False)
+        )
+    )
+
+    eligible_custom = has_all_sources or synthetic_allowed
+
+    # =====================================================
+    # 1. FAST PATH — custom operator (ELIGIBLE ONLY)
+    # =====================================================
+    if eligible_custom:
+        try:
+            tensor = task.merge()
+
+            if tensor is None:
+                raise RuntimeError("Custom merge returned None")
+
+            merge_stats.custom_merges += 1
+            print(f"[CustomMerge:OK] {key} ← {task_type}")
+
+            return key, tensor.to(
+                cmn.get_device(),
+                dtype=cmn.get_dtype()
+            )
+
+        except Exception as e:
+            merge_stats.custom_failed += 1
+            print(
+                f"[CustomMerge:FAILED] {key} ← {task_type} | "
+                f"Reason: {type(e).__name__}: {e}"
+            )
+            print("[Fallback] Proceeding to eligibility / SmartMerge path")
+    else:
+        reason = "missing sources"
+
+        if not has_all_sources and not cmn.opts.get("allow_synthetic_custom_merge", False):
+            reason = "synthetic disabled"
+
+        print(f"[CustomMerge:SKIPPED] {key} ← {reason}")
 
     # =====================================================
     # 2. DUAL-SOUL SACRED PRESERVATION (POLICY-GATED)
@@ -1280,9 +1349,9 @@ def initialize_task(task):
     ):
         f = cmn.loaded_checkpoints.get(cmn.primary)
 
-        if f and key in f.keys():
+        if f and cmn.has_tensor(f, key):
             try:
-                t = f.get_tensor(key)
+                t = cmn.get_tensor(f, key)
 
                 if (
                     cmn.smartresize_enabled
@@ -1311,18 +1380,18 @@ def initialize_task(task):
         return key, None
 
     # =====================================================
-    # 3. ELIGIBLE TENSOR COLLECTION (MERGEABLE PATH)
+    # 3. ELIGIBLE TENSOR COLLECTION (SPARSE PATH)
     # =====================================================
     tensors = []
     sources = []
 
     for cp_path in cmn.checkpoints_global:
         f = cmn.loaded_checkpoints.get(cp_path)
-        if not f or key not in f.keys():
+        if not f or not cmn.has_tensor(f, key):
             continue
 
         try:
-            t = f.get_tensor(key)
+            t = cmn.get_tensor(f, key)
 
             if (
                 cmn.smartresize_enabled
@@ -1340,7 +1409,6 @@ def initialize_task(task):
                     orig_key=key
                 ).oper(t)
 
-            # If SmartResize is OFF and shape mismatches, reject
             if target_shape is not None and t.shape != target_shape:
                 continue
 
@@ -1351,14 +1419,31 @@ def initialize_task(task):
             print(f"[Sparse] FAILED {key} from {cp_path}: {e}")
 
     # =====================================================
-    # 4. FINAL DECISION TREE
+    # 4. NON-FLOATING TENSOR POLICY
+    # =====================================================
+    if tensors and not tensors[0].is_floating_point():
+        if not cmn.opts.get("allow_non_float_merges", False):
+            f = cmn.loaded_checkpoints.get(cmn.primary)
+            if f and cmn.has_tensor(f, key):
+                t = cmn.get_tensor(f, key)
+                merge_stats.copied_primary += 1
+                print(f"[NonFloatCopy] {key} ← primary (dtype={t.dtype})")
+                return key, t.to(cmn.get_device(), dtype=cmn.get_dtype())
+
+            # fallback if primary missing
+            print(f"[NonFloatCopy] {key} ← first available")
+            return key, tensors[0]
+
+
+    # =====================================================
+    # 5. FINAL DECISION TREE
     # =====================================================
     if not tensors:
         f = cmn.loaded_checkpoints.get(cmn.primary)
 
-        if f and key in f.keys():
+        if f and cmn.has_tensor(f, key):
             try:
-                t = f.get_tensor(key)
+                t = cmn.get_tensor(f, key)
 
                 if (
                     cmn.smartresize_enabled
@@ -1379,7 +1464,6 @@ def initialize_task(task):
             except Exception as e:
                 print(f"[FinalCopy] FAILED {key}: {e}")
 
-        # Zero-fill ONLY if shape exists AND kitchen-sink policy allows it
         if target_shape is not None and cmn.opts.get("keep_zero_fill", True):
             merge_stats.zero_filled += 1
             print(f"[ZeroFill] {key}")
@@ -1394,7 +1478,7 @@ def initialize_task(task):
         return key, None
 
     # =====================================================
-    # 5. SINGLE OR SAFE LINEAR MERGE
+    # 6. SINGLE OR SAFE LINEAR MERGE
     # =====================================================
     if len(tensors) == 1:
         merge_stats.copied_primary += 1
