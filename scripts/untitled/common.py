@@ -212,7 +212,7 @@ class MergerContext:
         self.interrupted = False
 
     # -------------------------------------------------
-    # Accessors (used everywhere)
+    # Accessors
     # -------------------------------------------------
     def get_device(self):
         return self.device
@@ -232,6 +232,99 @@ class MergerContext:
             self.dtype = torch.bfloat16
         else:
             self.dtype = torch.float32
+
+    def has_tensor(self, file, key: str) -> bool:
+        from scripts.untitled.common import has_tensor
+        return has_tensor(file, key)
+
+    def get_tensor(self, file, key: str):
+        from scripts.untitled.common import get_tensor
+        return get_tensor(file, key)
+
+    def is_vae_key(self, key: str) -> bool:
+        from scripts.untitled.common import is_vae_key
+        return is_vae_key(key)
+
+    def is_clip_key(self, key: str) -> bool:
+        from scripts.untitled.common import is_clip_key
+        return is_clip_key(key)
+
+    def is_sacred_key(self, key: str) -> bool:
+        from scripts.untitled.common import is_sacred_key
+        return is_sacred_key(key)
+
+    def is_mergeable_tensor(self, t: torch.Tensor) -> bool:
+        from scripts.untitled.common import is_mergeable_tensor
+        return is_mergeable_tensor(t)
+
+    # -------------------------------------------------
+    # Fallback helpers
+    # -------------------------------------------------
+
+    def _default_lerp_weights(self, n: int):
+        """
+        Primary-dominant fallback weights.
+        These define *who* participates — AdaptiveLERP decides *how*.
+        """
+        if n <= 1:
+            return [1.0]
+        base = 0.7
+        rem = (1.0 - base) / (n - 1)
+        return [base] + [rem] * (n - 1)
+
+
+    def adaptive_fallback_op(self, key: str, tensors):
+        """
+        Adaptive fallback operator for multi-source mergeable tensors.
+
+        Behavior:
+        • Uses AdaptiveLERP (LERP ↔ MEAN per-channel)
+        • Automatically stabilizes noisy or disagreeing regions
+        • CLIP / VAE keys get gentler defaults
+        • Never enforces policy — math only
+        • COPY remains the final authority in initialize_task
+        """
+        if not tensors:
+            raise RuntimeError(
+                f"adaptive_fallback_op called with no tensors (key={key})"
+            )
+
+        from scripts.untitled.operators import AdaptiveLERP
+
+        weights = self._default_lerp_weights(len(tensors))
+
+    # -----------------------------
+    # Soft profile tuning
+    # -----------------------------
+        if self.is_clip_key(key) or self.is_vae_key(key):
+            # CLIP / VAE: conservative, stability-biased
+            base_mix = float(self.opts.get("clip_vae_lerp_mix", 0.6))
+            confidence = float(self.opts.get("clip_vae_confidence", 0.35))
+            temperature = float(self.opts.get("clip_vae_lerp_temp", 2.0))
+        else:
+            # UNet / general weights: user-controlled
+            base_mix = float(self.opts.get("fallback_lerp_mix", 1.0))
+            confidence = float(self.opts.get("fallback_confidence", 0.5))
+            temperature = float(self.opts.get("fallback_lerp_temp", 1.0))
+
+        return AdaptiveLERP(
+            key,
+            weights,
+            *tensors,
+            base_mix=base_mix,
+            confidence=confidence,
+            temperature=temperature,
+        )
+
+
+    def copy_fallback(self, key: str, tensors, *, prefer: int = 0):
+        """
+        Semantic-preservation fallback.
+        Final authority when math must stop.
+        """
+        from scripts.untitled.operators import COPY
+        return COPY(key, *tensors, prefer=prefer)
+
 
 # =============================================================================
 # MERGE HISTORY — Elite, Safe, Cross-Platform (Forge Neo + A1111 dev)
@@ -411,25 +504,45 @@ def load_safetensors_state_dict(path: str, *, device="cpu"):
 def has_tensor(file, key: str) -> bool:
     if file is None:
         return False
+
+    # safetensors safe_open handle
+    if hasattr(file, "keys"):
+        try:
+            return key in file.keys()
+        except Exception:
+            return False
+
+    # custom wrapper with explicit method
     if hasattr(file, "has_tensor"):
         return file.has_tensor(key)
-    return key in file
+
+    # plain dict-like fallback
+    try:
+        return key in file
+    except TypeError:
+        return False
 
 
 def get_tensor(file, key: str):
     if file is None:
         raise KeyError(f"Tensor source is None (key={key})")
+
     if hasattr(file, "get_tensor"):
-        return file.get_tensor(key)
-    return file[key]
+        t = file.get_tensor(key)
+    else:
+        t = file[key]
+
+    # Defensive: ensure we always return a Tensor
+    if not isinstance(t, torch.Tensor):
+        raise TypeError(
+            f"Object for key '{key}' is not a torch.Tensor "
+            f"(got {type(t).__name__})"
+        )
+
+    return t
 
 def is_mergeable_tensor(t: torch.Tensor) -> bool:
-    """
-    Returns True if this tensor is safe for numeric merging.
-    Non-floating tensors (e.g. position_ids) must never be merged.
-    """
-    return t.is_floating_point()
-
+    return isinstance(t, torch.Tensor) and t.is_floating_point()
 
 def handle_non_mergeable_tensor(
     key: str,
@@ -441,15 +554,28 @@ def handle_non_mergeable_tensor(
     Policy for non-floating tensors.
 
     Default behavior:
-      • Return the first available tensor (prefer primary semantics)
-      • Clone to avoid accidental aliasing
+      • Return preferred tensor (default primary)
+      • Clone to avoid aliasing
     """
     if not tensors:
         raise RuntimeError(f"No tensors available for non-mergeable key '{key}'")
 
+    if prefer < 0 or prefer >= len(tensors):
+        prefer = 0
+
     t = tensors[prefer]
+
+    if not isinstance(t, torch.Tensor):
+        raise TypeError(
+            f"Non-mergeable object for key '{key}' is not a Tensor "
+            f"(got {type(t).__name__})"
+        )
+
     return t.clone()
 
+
+def is_sacred_key(key: str) -> bool:
+    return any(p in key for p in SACRED_PATTERNS)
 
 def bake_vae_from_file(
     target_state_dict: dict,

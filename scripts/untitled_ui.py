@@ -877,6 +877,102 @@ def on_ui_tabs():
                             outputs=slider_container
                         )
 
+                        # ─────────────────────────────────────────────
+                        # Fallback Tuning (AdaptiveLERP)
+                        # ─────────────────────────────────────────────
+                        with gr.Tab("Fallback Tuning"):
+                            gr.Markdown("### Adaptive Fallback Behavior")
+                            gr.Markdown(
+                                "Controls how the merger behaves when custom math fails.\n"
+                                "These settings affect **automatic fallback merges only**."
+                            )
+
+                            with gr.Accordion("UNet / General Layers", open=True):
+                                fallback_mix = cmn.opts.create_option(
+                                    "fallback_lerp_mix",
+                                    gr.Slider,
+                                    {
+                                        "minimum": 0.0,
+                                        "maximum": 1.0,
+                                        "step": 0.01,
+                                        "label": "Fallback Strength",
+                                        "info": "0 = ultra-stable (mean), 1 = aggressive (LERP)"
+                                    },
+                                    default=1.0
+                                )
+
+                                fallback_confidence = cmn.opts.create_option(
+                                    "fallback_confidence",
+                                    gr.Slider,
+                                    {
+                                        "minimum": 0.0,
+                                        "maximum": 1.0,
+                                        "step": 0.01,
+                                        "label": "Confidence",
+                                        "info": "Trust agreement vs stabilize disagreement"
+                                    },
+                                    default=0.5
+                                )
+
+                                fallback_temp = cmn.opts.create_option(
+                                    "fallback_lerp_temp",
+                                    gr.Slider,
+                                    {
+                                        "minimum": 0.5,
+                                        "maximum": 3.0,
+                                        "step": 0.05,
+                                        "label": "Weight Temperature",
+                                        "info": "Higher = smoother, safer weighting"
+                                    },
+                                    default=1.0
+                                )
+
+                            with gr.Accordion("CLIP / VAE Layers (Safer Defaults)", open=False):
+                                clip_mix = cmn.opts.create_option(
+                                    "clip_vae_lerp_mix",
+                                    gr.Slider,
+                                    {
+                                        "minimum": 0.0,
+                                        "maximum": 1.0,
+                                        "step": 0.01,
+                                        "label": "CLIP/VAE Strength",
+                                        "info": "Lower values preserve semantic stability"
+                                    },
+                                    default=0.6
+                                )
+
+                                clip_conf = cmn.opts.create_option(
+                                    "clip_vae_confidence",
+                                    gr.Slider,
+                                    {
+                                        "minimum": 0.0,
+                                        "maximum": 1.0,
+                                        "step": 0.01,
+                                        "label": "CLIP/VAE Confidence",
+                                        "info": "Lower = more conservative"
+                                    },
+                                    default=0.35
+                                )
+
+                                clip_temp = cmn.opts.create_option(
+                                    "clip_vae_lerp_temp",
+                                    gr.Slider,
+                                    {
+                                        "minimum": 1.0,
+                                        "maximum": 4.0,
+                                        "step": 0.1,
+                                        "label": "CLIP/VAE Temperature",
+                                        "info": "Higher = gentler blending"
+                                    },
+                                    default=2.0
+                                )
+
+                            gr.Markdown(
+                                "ℹ️ These settings are used **only when fallback logic activates**.\n"
+                                "Custom calc modes and sacred preservation are unaffected."
+                            )
+
+
                     # Supermerger Adjust - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
                     with gr.Accordion("Supermerger Adjust", open=False) as acc_ad:
                         with gr.Row(variant="compact"):
@@ -1078,9 +1174,12 @@ def on_ui_tabs():
                         )
 
 
-                        def update_cache_size(value):
+                        def update_cache_size(value=None):
+                            if value is None:
+                                value = cmn.opts.get('cache_size', 8192)
                             weights_cache.__init__(max(0, int(value)))
                             return f"Cache resized to {value} MB"
+
 
                         cache_size_slider.release(
                             fn=update_cache_size,

@@ -26,6 +26,8 @@ from scripts.untitled.operators import SmartResize
 from scripts.untitled.common import CLIP_PREFIXES, VAE_PREFIXES, cmn
 from scripts.untitled.common import merge_stats
 from scripts.untitled.operators import WeightsCache
+from scripts.untitled.common import MergerContext
+
 
 # Modern safe imports (2025+)
 try:
@@ -45,67 +47,6 @@ except (FileNotFoundError, OSError):
 class MergeInterruptedError(Exception):
     def __init__(self,*args):
         super().__init__(*args)
-
-class MergerContext:
-    def __init__(self):
-        # Device / precision
-        self.device = None
-        self.dtype = torch.float32
-
-        # Primary checkpoint
-        self.primary = None
-
-        # MUST start as None — populated by safe_open_multiple
-        self.loaded_checkpoints = None
-
-        # Used by LoadTensor fallback and sparse merge
-        self.checkpoints_global = []
-
-        # Target shapes for SmartResize and zero-fill
-        self.cross_arch_target_shapes = {}
-
-        # Task reuse
-        self.last_merge_tasks = None
-
-        # Options storage (UI-backed)
-        self.opts = {}
-
-        # Architecture detection
-        self.same_arch = True
-
-        # ─────────────────────────────────────────────
-        # POLICY FLAGS (explicit, no magic attributes)
-        # ─────────────────────────────────────────────
-        self.dual_soul_enabled = False
-        self.sacred_enabled = False
-        self.smartresize_enabled = False
-
-        # Execution control
-        self.stop = False
-        self.interrupted = False
-
-    # -------------------------------------------------
-    # Accessors (used everywhere)
-    # -------------------------------------------------
-    def get_device(self):
-        return self.device
-
-    def get_dtype(self):
-        return self.dtype
-
-    def set_device(self, device_str: str):
-        self.device = torch.device(
-            device_str if device_str != "cuda" else "cuda"
-        )
-
-    def set_dtype(self, dtype_str: str):
-        if dtype_str == "fp16":
-            self.dtype = torch.float16
-        elif dtype_str == "bf16":
-            self.dtype = torch.bfloat16
-        else:
-            self.dtype = torch.float32
-
 
 VALUE_NAMES = ('alpha','beta','gamma','delta')
 
@@ -1262,14 +1203,23 @@ def do_merge(
 
 def initialize_task(task):
     """
-    2025 DUAL-SOUL ELIGIBILITY INITIALIZER — POLICY-AWARE
+    2025 DUAL-SOUL ELIGIBILITY INITIALIZER — POLICY-AWARE (v2)
 
-    Guarantees:
-    • No silent exclusions
-    • Sacred keys preserved only when enabled
-    • Full merging in same-arch
-    • SmartResize only when explicitly enabled
-    • Zero-fill only as last resort
+    Responsibilities (ONLY):
+      • Decide if a custom operator is eligible to run
+      • Enforce policy gates (Dual-Soul Sacred when enabled)
+      • Collect eligible tensors (with SmartResize when enabled)
+      • Apply a strict fallback ladder (NO ad-hoc math here)
+
+    Fallback ladder (in order):
+      1) Sacred (when enabled) → Copy from primary (optionally SmartResize)
+      2) Custom operator (when eligible) → result tensor
+      3) Non-mergeable tensors → COPY fallback op
+      4) Mergeable multi-source tensors → LERPMEAN fallback op
+      5) Single tensor → return it
+      6) Primary copy → (optionally SmartResize)
+      7) Zero-fill (if enabled) → zeros(target_shape)
+      8) Skip
     """
 
     print(
@@ -1287,7 +1237,7 @@ def initialize_task(task):
         print(f"[TaskStart] {key} ← {task_type}")
 
     # =====================================================
-    # 0. CUSTOM MERGE ELIGIBILITY (POLICY GATE)
+    # 0) CUSTOM MERGE ELIGIBILITY (POLICY GATE)
     # =====================================================
     has_all_sources = True
     for cp in cmn.checkpoints_global:
@@ -1306,41 +1256,14 @@ def initialize_task(task):
 
     eligible_custom = has_all_sources or synthetic_allowed
 
-    # =====================================================
-    # 1. FAST PATH — custom operator (ELIGIBLE ONLY)
-    # =====================================================
-    if eligible_custom:
-        try:
-            tensor = task.merge()
-
-            if tensor is None:
-                raise RuntimeError("Custom merge returned None")
-
-            merge_stats.custom_merges += 1
-            print(f"[CustomMerge:OK] {key} ← {task_type}")
-
-            return key, tensor.to(
-                cmn.get_device(),
-                dtype=cmn.get_dtype()
-            )
-
-        except Exception as e:
-            merge_stats.custom_failed += 1
-            print(
-                f"[CustomMerge:FAILED] {key} ← {task_type} | "
-                f"Reason: {type(e).__name__}: {e}"
-            )
-            print("[Fallback] Proceeding to eligibility / SmartMerge path")
-    else:
+    if not eligible_custom:
         reason = "missing sources"
-
-        if not has_all_sources and not cmn.opts.get("allow_synthetic_custom_merge", False):
+        if (not has_all_sources) and (not cmn.opts.get("allow_synthetic_custom_merge", False)):
             reason = "synthetic disabled"
-
         print(f"[CustomMerge:SKIPPED] {key} ← {reason}")
 
     # =====================================================
-    # 2. DUAL-SOUL SACRED PRESERVATION (POLICY-GATED)
+    # 1) DUAL-SOUL SACRED PRESERVATION (POLICY-GATED)
     # =====================================================
     if (
         cmn.dual_soul_enabled
@@ -1380,7 +1303,28 @@ def initialize_task(task):
         return key, None
 
     # =====================================================
-    # 3. ELIGIBLE TENSOR COLLECTION (SPARSE PATH)
+    # 2) FAST PATH — custom operator (ELIGIBLE ONLY)
+    # =====================================================
+    if eligible_custom:
+        try:
+            out = task.merge()
+            if out is None:
+                raise RuntimeError("Custom merge returned None")
+
+            merge_stats.custom_merges += 1
+            print(f"[CustomMerge:OK] {key} ← {task_type}")
+            return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
+
+        except Exception as e:
+            merge_stats.custom_failed += 1
+            print(
+                f"[CustomMerge:FAILED] {key} ← {task_type} | "
+                f"Reason: {type(e).__name__}: {e}"
+            )
+            print("[Fallback] Proceeding to policy ladder (LERPMEAN/COPY/Primary/ZeroFill)")
+
+    # =====================================================
+    # 3) ELIGIBLE TENSOR COLLECTION (SPARSE PATH)
     # =====================================================
     tensors = []
     sources = []
@@ -1409,6 +1353,7 @@ def initialize_task(task):
                     orig_key=key
                 ).oper(t)
 
+            # If a target shape exists, enforce it (cross-arch correctness)
             if target_shape is not None and t.shape != target_shape:
                 continue
 
@@ -1419,25 +1364,27 @@ def initialize_task(task):
             print(f"[Sparse] FAILED {key} from {cp_path}: {e}")
 
     # =====================================================
-    # 4. NON-FLOATING TENSOR POLICY
+    # 4) POLICY LADDER (NO AD-HOC MERGE MATH HERE)
     # =====================================================
-    if tensors and not tensors[0].is_floating_point():
+
+    # 4a) If we have contributors and they are non-mergeable → COPY
+    if tensors and not cmn.is_mergeable_tensor(tensors[0]):
         if not cmn.opts.get("allow_non_float_merges", False):
-            f = cmn.loaded_checkpoints.get(cmn.primary)
-            if f and cmn.has_tensor(f, key):
-                t = cmn.get_tensor(f, key)
+            try:
+                op = cmn.copy_fallback(key, tensors, prefer=0)
+                out = op.merge()
                 merge_stats.copied_primary += 1
-                print(f"[NonFloatCopy] {key} ← primary (dtype={t.dtype})")
-                return key, t.to(cmn.get_device(), dtype=cmn.get_dtype())
+                print(f"[Fallback:COPY][NonMergeable] {key}")
+                return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
+            except Exception as e:
+                print(f"[Fallback:COPY][NonMergeable] FAILED {key}: {e}")
 
-            # fallback if primary missing
-            print(f"[NonFloatCopy] {key} ← first available")
-            return key, tensors[0]
+        # If user explicitly allows, return the preferred tensor unchanged
+        merge_stats.copied_primary += 1
+        print(f"[NonFloatAllowed] {key} ← first available (dtype={tensors[0].dtype})")
+        return key, tensors[0]
 
-
-    # =====================================================
-    # 5. FINAL DECISION TREE
-    # =====================================================
+    # 4b) No tensors → primary copy → zero-fill → skip
     if not tensors:
         f = cmn.loaded_checkpoints.get(cmn.primary)
 
@@ -1450,6 +1397,10 @@ def initialize_task(task):
                     and target_shape is not None
                     and t.shape != target_shape
                 ):
+                    print(
+                        f"[SmartResize][FinalCopy] {key} "
+                        f"{tuple(t.shape)} → {tuple(target_shape)}"
+                    )
                     t = SmartResize(
                         f"finalcopy_{key}",
                         target_shape,
@@ -1477,25 +1428,34 @@ def initialize_task(task):
         print(f"[SKIPPED] {key} (no contributors)")
         return key, None
 
-    # =====================================================
-    # 6. SINGLE OR SAFE LINEAR MERGE
-    # =====================================================
+    # 4c) One tensor → return it
     if len(tensors) == 1:
         merge_stats.copied_primary += 1
         return key, tensors[0]
 
-    merge_stats.smart_merge += 1
-    result = tensors[0].clone()
-    count = 1
+    # 4d) Multiple tensors → adaptive LERP profile (LERP/MEAN hybrid) → COPY
+    try:
+        op = cmn.adaptive_fallback_op(key, tensors)
+        out = op.merge()
+        merge_stats.smart_merge += 1
+        print(f"[Fallback:AdaptiveLERP] {key} ← {', '.join(sources)}")
+        return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
+    except Exception as e:
+        print(f"[Fallback:AdaptiveLERP] FAILED {key}: {e}")
 
-    for t in tensors[1:]:
-        if t.shape == result.shape:
-            result += t
-            count += 1
+    # 4e) Final safety: COPY fallback
+    try:
+        op = cmn.copy_fallback(key, tensors, prefer=0)
+        out = op.merge()
+        merge_stats.copied_primary += 1
+        print(f"[Fallback:COPY][Final] {key}")
+        return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
+    except Exception as e:
+        print(f"[Fallback:COPY][Final] FAILED {key}: {e}")
 
-    result /= count
-    print(f"[SmartMerge] {key} ← {', '.join(sources)}")
-    return key, result.to(cmn.get_dtype())
+    merge_stats.skipped += 1
+    print(f"[SKIPPED] {key} (fallback chain exhausted)")
+    return key, None
 
 
 def get_tensors_from_loaded_model(state_dict: dict, tasks: list) -> tuple[dict, list]:

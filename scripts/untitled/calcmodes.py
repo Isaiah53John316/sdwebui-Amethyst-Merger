@@ -532,6 +532,273 @@ class SLERP3Calc(CalcMode):
 CALCMODES_LIST.append(SLERP3Calc)
 
 
+class LERPCalc(CalcMode):
+    name = 'LERP (Linear)'
+    description = 'Linear interpolation — stable, magnitude-preserving, safest blend'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Blend ratio (0 = Model A, 1 = Model B)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5, beta=0, gamma=0, **kwargs
+    ):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        # Linear blend: A*(1-alpha) + B*alpha
+        return opr.LERP(key, [1.0 - alpha, alpha], a, b)
+
+CALCMODES_LIST.append(LERPCalc)
+
+class LERP3Calc(CalcMode):
+    name = 'LERP (3-model Linear)'
+    description = '3-way linear interpolation — smooth and predictable fusion'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Weight for Model B (0–1)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Weight for Model C (0–1, total B+C ≤ 1)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5, beta=0.3, gamma=0, **kwargs
+    ):
+        # Clamp to keep A >= 0
+        beta = min(beta, 1.0 - alpha)
+        base_weight = 1.0 - alpha - beta
+
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        # Linear blend: A*base + B*alpha + C*beta
+        return opr.LERP(key, [base_weight, alpha, beta], a, b, c)
+
+CALCMODES_LIST.append(LERP3Calc)
+
+class LERPMEANCalc(CalcMode):
+    name = 'LERP/MEAN Hybrid'
+    description = 'Linear blend stabilized by mean — wide-coverage, safe-by-design fallback'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Blend ratio (0 = Model A, 1 = Model B)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Stability mix (0 = MEAN, 1 = LERP)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5, beta=1.0, gamma=0, **kwargs
+    ):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        # weights: A*(1-alpha) + B*alpha
+        weights = [1.0 - alpha, alpha]
+
+        return opr.LERPMEAN(
+            key,
+            weights,
+            a,
+            b,
+            mix=beta,          # beta = how much LERP vs MEAN
+        )
+
+CALCMODES_LIST.append(LERPMEANCalc)
+
+class LERPMEAN3Calc(CalcMode):
+    name = 'LERP/MEAN Hybrid (3-model)'
+    description = '3-way linear blend with mean stabilization'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Weight for Model B (0–1)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Weight for Model C (0–1, total B+C ≤ 1)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    slid_c_info = "Stability mix (0 = MEAN, 1 = LERP)"
+    slid_c_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5, beta=0.3, gamma=1.0, **kwargs
+    ):
+        # Ensure A >= 0
+        beta = min(beta, 1.0 - alpha)
+        base_weight = 1.0 - alpha - beta
+
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        weights = [base_weight, alpha, beta]
+
+        return opr.LERPMEAN(
+            key,
+            weights,
+            a,
+            b,
+            c,
+            mix=gamma,
+        )
+
+CALCMODES_LIST.append(LERPMEAN3Calc)
+
+class AdaptiveLERPCalc(CalcMode):
+    name = 'Adaptive LERP'
+    description = (
+        'Adaptive blend that preserves structure where models disagree '
+        'and blends freely where they agree'
+    )
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Blend (0 = Model A, 1 = Model B)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Style strength (0 = very stable, 1 = very expressive)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    slid_c_info = "Confidence (how much agreement is trusted)"
+    slid_c_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5,   # blend
+        beta=1.0,    # style strength
+        gamma=0.5,   # confidence
+        **kwargs
+    ):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        weights = [1.0 - alpha, alpha]
+
+        return opr.AdaptiveLERP(
+            key,
+            weights,
+            a,
+            b,
+            base_mix=beta,
+            confidence=gamma,
+        )
+
+
+CALCMODES_LIST.append(AdaptiveLERPCalc)
+
+
+class AdaptiveLERP3Calc(CalcMode):
+    name = 'Adaptive LERP (3-model)'
+    description = '3-way adaptive blend with automatic per-channel stabilization'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Weight for Model B"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Weight for Model C (total ≤ 1)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    slid_c_info = "Style strength (0 = stable, 1 = expressive)"
+    slid_c_config = (0.0, 1.0, 0.01)
+
+    slid_d_info = "Confidence (trust agreement vs stability)"
+    slid_d_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5,
+        beta=0.3,
+        gamma=1.0,
+        delta=0.5,
+        **kwargs
+    ):
+        beta = min(beta, 1.0 - alpha)
+        base_weight = 1.0 - alpha - beta
+
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        weights = [base_weight, alpha, beta]
+
+        return opr.AdaptiveLERP(
+            key,
+            weights,
+            a,
+            b,
+            c,
+            base_mix=gamma,
+            confidence=delta,
+        )
+
+
+CALCMODES_LIST.append(AdaptiveLERP3Calc)
+
+
+class COPYCalc(CalcMode):
+    name = 'COPY (Select Model)'
+    description = 'Preserve weights from a single model verbatim'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Model to copy (0 = Model A, 1 = Model B)"
+    slid_a_config = (0, 1, 1)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0, beta=0, gamma=0, **kwargs
+    ):
+        idx = int(alpha)
+
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        return opr.COPY(key, a, b, prefer=idx)
+    
+CALCMODES_LIST.append(COPYCalc)
+
+class COPY3Calc(CalcMode):
+    name = 'COPY (3-model Select)'
+    description = 'Preserve weights from one of three models'
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Model index to copy (0 = A, 1 = B, 2 = C)"
+    slid_a_config = (0, 2, 1)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0, beta=0, gamma=0, **kwargs
+    ):
+        idx = int(alpha)
+
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        return opr.COPY(key, a, b, c, prefer=idx)
+
+CALCMODES_LIST.append(COPY3Calc)
+
 class ReBasinCalc(CalcMode):
     name = 'Git Re-Basin'
     description = 'Permutation-aware merging — cleaner cross-family results'
