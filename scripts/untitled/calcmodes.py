@@ -1193,3 +1193,241 @@ class ProgressiveDAREWISEAggressive3Calc(CalcMode):
         return opr.WISE(key, 0.18, 0.35, seed + 1, ab, c)
 
 CALCMODES_LIST.append(ProgressiveDAREWISEAggressive3Calc)
+
+class HybridCascadeSimpleCalc(CalcMode):
+    name = 'Hybrid Cascade Simple'
+    description = (
+        'Automatically selects the best merge strategy per layer '
+        '(COPY, AdaptiveLERP, DAREWISE, TrainDiff, TIES) '
+        'based on tensor role and agreement'
+    )
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 2
+
+    slid_a_info = "Blend ratio (0 = Model A, 1 = Model B)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Confidence (0 = ultra-stable, 1 = aggressive hybridization)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5,
+        beta=0.5,
+        **kwargs
+    ):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        # Linear participation weights (who contributes)
+        weights = [1.0 - alpha, alpha]
+
+        return opr.HybridCascadeSimple(
+            key,
+            weights,
+            a,
+            b,
+            confidence=beta,
+            seed=cmn.last_merge_seed or 42,
+        )
+
+CALCMODES_LIST.append(HybridCascadeSimpleCalc)
+
+class HybridCascadeSimple3Calc(CalcMode):
+    name = 'Hybrid Cascade Simple (3-model)'
+    description = (
+        '3-way intelligent hybrid merge with automatic per-layer operator selection'
+    )
+    compatible_modes = ['Weight-Sum', 'Add Difference']
+    input_models = 3
+
+    slid_a_info = "Weight for Model B (0–1)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Weight for Model C (0–1, total ≤ 1)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    slid_c_info = "Confidence (0 = stable, 1 = aggressive hybrid)"
+    slid_c_config = (0.0, 1.0, 0.01)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.3,
+        beta=0.3,
+        gamma=0.5,
+        **kwargs
+    ):
+        # Ensure A >= 0
+        beta = min(beta, 1.0 - alpha)
+        base_weight = 1.0 - alpha - beta
+
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+
+        weights = [base_weight, alpha, beta]
+
+        return opr.HybridCascadeSimple(
+            key,
+            weights,
+            a,
+            b,
+            c,
+            confidence=gamma,
+            seed=cmn.last_merge_seed or 42,
+        )
+
+CALCMODES_LIST.append(HybridCascadeSimple3Calc)
+
+class HybridCascadeCalc(CalcMode):
+    name = "HybridCascade"
+    description = (
+        "Block-aware hybrid merge that automatically selects "
+        "the safest or most expressive operator per layer "
+        "(AdaptiveLERP / DAREWISE / TrainDiff / TIES)"
+    )
+    compatible_modes = ["Weight-Sum", "Add Difference"]
+    input_models = 4  # works with 2–4
+
+    # ----------------------------------
+    # Slider definitions (A–E)
+    # ----------------------------------
+
+    slid_a_info = "Global Confidence (0 = stable, 1 = expressive)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Depth Bias Strength (early stable → late expressive)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    slid_c_info = "TrainDiff Strength (training-style delta injection)"
+    slid_c_config = (0.0, 1.0, 0.01)
+
+    slid_d_info = "DARE/WISE Density (detail vs sparsity)"
+    slid_d_config = (0.05, 0.6, 0.01)
+
+    slid_e_info = "TIES Pre-sparsity (0 = off)"
+    slid_e_config = (0.0, 0.6, 0.01)
+
+    # slid_f_info = "Weight Temperature (advanced)"      # ← intentionally disabled
+    # slid_f_config = (0.5, 3.0, 0.05)
+
+    # ----------------------------------
+    # Recipe builder
+    # ----------------------------------
+    def modify_recipe(
+        recipe,
+        key,
+        model_a,
+        model_b,
+        model_c,
+        model_d,
+        alpha=0.5,   # confidence
+        beta=0.35,   # depth bias
+        gamma=0.5,   # TrainDiff strength
+        delta=0.35,  # DARE/WISE density
+        epsilon=0.0, # TIES density
+        **kwargs
+    ):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        tensors = [a, b]
+        weights = [1.0, 1.0]
+
+        if model_c is not None:
+            c = opr.LoadTensor(key, model_c)
+            tensors.append(c)
+            weights.append(1.0)
+
+        if model_d is not None:
+            d = opr.LoadTensor(key, model_d)
+            tensors.append(d)
+            weights.append(1.0)
+
+        # Normalize weights (primary-dominant handled inside HybridCascade)
+        total = sum(weights)
+        weights = [w / total for w in weights]
+
+        return opr.HybridCascade(
+            key,
+            weights,
+            *tensors,
+
+            # ---- global personality ----
+            confidence=alpha,
+
+            # ---- depth bias ----
+            depth_bias_enabled=True,
+            depth_conf_strength=beta,
+            depth_mix_strength=beta * 0.75,
+            depth_traindiff_strength=beta,
+
+            # ---- TrainDiff ----
+            use_traindiff=gamma > 0.01,
+            traindiff_strength=gamma,
+
+            # ---- DARE / WISE ----
+            dare_density=delta,
+            wise_density=delta,
+            dare_dropout=0.10,
+            wise_dropout=0.30,
+
+            # ---- optional TIES ----
+            use_ties=epsilon > 0.01,
+            ties_density=epsilon,
+
+            seed=cmn.last_merge_seed or 42,
+        )
+
+
+CALCMODES_LIST.append(HybridCascadeCalc)
+
+class HybridCascadeLiteCalc(CalcMode):
+    name = "Hybrid Cascade Lite"
+    description = "Key-aware, depth-biased adaptive merge (fallback-safe)"
+    compatible_modes = ["Weight-Sum", "Add Difference"]
+    input_models = 2
+
+    slid_a_info = "Blend ratio (0 = A, 1 = B)"
+    slid_a_config = (0.0, 1.0, 0.01)
+
+    slid_b_info = "Aggression (LERP vs MEAN)"
+    slid_b_config = (0.0, 1.0, 0.01)
+
+    slid_c_info = "Confidence (agreement trust)"
+    slid_c_config = (0.0, 1.0, 0.01)
+
+    slid_d_info = "Depth bias strength"
+    slid_d_config = (0.0, 1.0, 0.01)
+
+    slid_e_info = "Weight temperature (safety)"
+    slid_e_config = (0.5, 3.0, 0.05)
+
+    def modify_recipe(
+        recipe, key,
+        model_a, model_b, model_c, model_d,
+        alpha=0.5,
+        beta=1.0,
+        gamma=0.5,
+        delta=0.35,
+        epsilon=1.0,
+        **kwargs
+    ):
+        a = opr.LoadTensor(key, model_a)
+        b = opr.LoadTensor(key, model_b)
+
+        weights = [1.0 - alpha, alpha]
+
+        return opr.HybridCascadeLite(
+            key,
+            weights,
+            a,
+            b,
+            base_mix=beta,
+            confidence=gamma,
+            depth_bias=delta,
+        )
+
+CALCMODES_LIST.append(HybridCascadeLiteCalc)

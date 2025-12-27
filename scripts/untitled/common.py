@@ -205,7 +205,7 @@ class MergerContext:
         # ─────────────────────────────────────────────
         self.dual_soul_enabled = False
         self.sacred_enabled = False
-        self.smartresize_enabled = False
+        self.smartresize_enabled = True
 
         # Execution control
         self.stop = False
@@ -215,15 +215,12 @@ class MergerContext:
     # Accessors
     # -------------------------------------------------
     def get_device(self):
+        if self.device is None:
+            raise RuntimeError("MergerContext.device not initialized")
         return self.device
 
     def get_dtype(self):
         return self.dtype
-
-    def set_device(self, device_str: str):
-        self.device = torch.device(
-            device_str if device_str != "cuda" else "cuda"
-        )
 
     def set_dtype(self, dtype_str: str):
         if dtype_str == "fp16":
@@ -257,14 +254,18 @@ class MergerContext:
         from scripts.untitled.common import is_mergeable_tensor
         return is_mergeable_tensor(t)
 
+    def get_opt(self, key, default=None):
+        if isinstance(self.opts, dict):
+            return self.opts.get(key, default)
+        return default
+
     # -------------------------------------------------
     # Fallback helpers
     # -------------------------------------------------
-
-    def _default_lerp_weights(self, n: int):
+    def _default_fallback_weights(self, n: int):
         """
-        Primary-dominant fallback weights.
-        These define *who* participates — AdaptiveLERP decides *how*.
+        Primary-dominant participation weights.
+        HybridCascadeLite decides *how* these are used.
         """
         if n <= 1:
             return [1.0]
@@ -272,58 +273,48 @@ class MergerContext:
         rem = (1.0 - base) / (n - 1)
         return [base] + [rem] * (n - 1)
 
-
-    def adaptive_fallback_op(self, key: str, tensors):
+    def hybrid_fallback_op(self, key: str, tensors):
         """
-        Adaptive fallback operator for multi-source mergeable tensors.
+        Default fallback operator (HybridCascadeLite).
 
         Behavior:
-        • Uses AdaptiveLERP (LERP ↔ MEAN per-channel)
-        • Automatically stabilizes noisy or disagreeing regions
-        • CLIP / VAE keys get gentler defaults
-        • Never enforces policy — math only
-        • COPY remains the final authority in initialize_task
+          • Key-aware routing (CLIP / VAE / noise / UNet)
+          • Depth-biased confidence & blending
+          • COPY behavior embedded internally
+          • Deterministic, low-memory, fallback-safe
+          • Policy enforcement remains in initialize_task
         """
         if not tensors:
             raise RuntimeError(
-                f"adaptive_fallback_op called with no tensors (key={key})"
+                f"hybrid_fallback_op called with no tensors (key={key})"
             )
 
-        from scripts.untitled.operators import AdaptiveLERP
+        from scripts.untitled.operators import HybridCascadeLite
 
-        weights = self._default_lerp_weights(len(tensors))
+        weights = self._default_fallback_weights(len(tensors))
 
-    # -----------------------------
-    # Soft profile tuning
-    # -----------------------------
-        if self.is_clip_key(key) or self.is_vae_key(key):
-            # CLIP / VAE: conservative, stability-biased
-            base_mix = float(self.opts.get("clip_vae_lerp_mix", 0.6))
-            confidence = float(self.opts.get("clip_vae_confidence", 0.35))
-            temperature = float(self.opts.get("clip_vae_lerp_temp", 2.0))
-        else:
-            # UNet / general weights: user-controlled
-            base_mix = float(self.opts.get("fallback_lerp_mix", 1.0))
-            confidence = float(self.opts.get("fallback_confidence", 0.5))
-            temperature = float(self.opts.get("fallback_lerp_temp", 1.0))
-
-        return AdaptiveLERP(
+        return HybridCascadeLite(
             key,
             weights,
             *tensors,
-            base_mix=base_mix,
-            confidence=confidence,
-            temperature=temperature,
+
+            # Global fallback personality
+            base_mix=float(self.get_opt("fallback_lerp_mix", 1.0)),
+            confidence=float(self.get_opt("fallback_confidence", 0.5)),
+
+            # CLIP / VAE (safer)
+            clip_mix=float(self.get_opt("clip_vae_lerp_mix", 0.6)),
+            clip_conf=float(self.get_opt("clip_vae_confidence", 0.35)),
+            clip_temp=float(self.get_opt("clip_vae_lerp_temp", 2.0)),
+
+            # Noise / timestep (ultra-safe)
+            noise_mix=float(self.get_opt("noise_lerp_mix", 0.4)),
+            noise_conf=float(self.get_opt("noise_confidence", 0.25)),
+            noise_temp=float(self.get_opt("noise_lerp_temp", 2.5)),
+
+            # Depth behavior
+            depth_bias=float(self.get_opt("fallback_depth_bias", 0.35)),
         )
-
-
-    def copy_fallback(self, key: str, tensors, *, prefer: int = 0):
-        """
-        Semantic-preservation fallback.
-        Final authority when math must stop.
-        """
-        from scripts.untitled.operators import COPY
-        return COPY(key, *tensors, prefer=prefer)
 
 
 # =============================================================================
@@ -428,13 +419,32 @@ def get_dtype(self) -> torch.dtype:
 def safe_apply(op, base, other, key=None):
     """
     Apply a binary tensor op safely.
-    Prevents broadcasting and catastrophic allocation.
+    Prevents broadcasting, scalar propagation, and catastrophic allocation.
     """
+
+    # Hard validation
+    if not isinstance(base, torch.Tensor) or not isinstance(other, torch.Tensor):
+        if key:
+            print(f"[SafeOp] Non-tensor operand skipped: {key}")
+        return base
+
+    # 🚨 Scalars are forbidden
+    if base.ndim == 0 or other.ndim == 0:
+        if key:
+            print(f"[SafeOp] Scalar operand blocked: {key}")
+        return base
+
+    # Shape enforcement
     if base.shape != other.shape:
         if key:
-            print(f"[SafeOp] Shape mismatch skipped: {key} {base.shape} vs {other.shape}")
+            print(
+                f"[SafeOp] Shape mismatch skipped: {key} "
+                f"{tuple(base.shape)} vs {tuple(other.shape)}"
+            )
         return base
+
     return op(base, other)
+
 
 def bake_component_into_state_dict(
     target_state_dict: dict,

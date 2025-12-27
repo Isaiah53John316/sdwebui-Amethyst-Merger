@@ -431,7 +431,7 @@ def save_state_dict(
     state_dict,
     save_path=None,
     filename=None,
-    settings="",
+    settings=None, #""
     timer=None,
     discard_keys=None,
     target_dtype=None,
@@ -442,7 +442,8 @@ def save_state_dict(
     - Reforge / A1111 compatible
     - Metadata written at save time
     """
-
+    import torch
+    import gradio as gr
     import os
     from modules import paths_internal, sd_models
     from safetensors.torch import save_file
@@ -487,8 +488,10 @@ def save_state_dict(
     # ✅ METADATA — SAFETENSORS REQUIRES STRINGS
     if isinstance(settings, (list, tuple)):
         desc = ", ".join(map(str, settings))
+    elif isinstance(settings, str):
+        desc = settings
     else:
-        desc = str(settings) if settings else "custom merge"
+        desc = "custom merge"
 
     metadata = {
         "modelspec.author": "Amethyst Merger",
@@ -561,9 +564,12 @@ def load_merged_state_dict(state_dict, checkpoint_info):
     print("[DEBUG] tensors:", len(state_dict))
 
     # Normalize dtype (match prior working behavior)
+    target_dtype = getattr(shared.sd_model, "dtype", None)
+
     for k, v in state_dict.items():
-        if hasattr(v, "is_floating_point") and v.is_floating_point():
-            state_dict[k] = v.half()
+        if v.is_floating_point():
+            if target_dtype is not None and v.dtype != target_dtype:
+                state_dict[k] = v.to(dtype=target_dtype)
 
     if shared.sd_model is None:
         raise RuntimeError(

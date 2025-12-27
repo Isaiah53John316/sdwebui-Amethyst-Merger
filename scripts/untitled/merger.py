@@ -535,19 +535,31 @@ def prepare_merge(
     copy_clip_from_primary=True,
     dual_soul_toggle=False,
     sacred_keys_toggle=False,
-    smartresize_toggle=False,
+    smartresize_toggle=True,
+    specific_selectors_first=False,
     allow_synthetic_custom_merge=False,
     allow_non_float_merges=False,
     *custom_sliders,
 ):
     progress("\n### Preparing merge ###")
     print(
-    f"[Policy] copy_vae={copy_vae_from_primary} | "
-    f"copy_clip={copy_clip_from_primary}"
+        f"[Policy] copy_vae={copy_vae_from_primary} | "
+        f"copy_clip={copy_clip_from_primary}"
     )
+
     timer = Timer()
     cmn.interrupted = False
     cmn.stop = False
+
+    # Reset merge stats (safe, no-op if unsupported)
+    try:
+        merge_stats.reset()
+    except Exception:
+        pass
+
+    # Predefine for safer post-use (save/load)
+    discard_keys = set()
+    clude_keys = set()
 
     # ─────────────────────────────────────────────
     # 1. Parse arguments (STRICT)
@@ -569,7 +581,6 @@ def prepare_merge(
 
     assert isinstance(checkpoints, list), "parse_arguments returned invalid checkpoints"
 
-    # Normalize model paths
     model_a = checkpoints[0] if len(checkpoints) > 0 else None
     model_b = checkpoints[1] if len(checkpoints) > 1 else None
     model_c = checkpoints[2] if len(checkpoints) > 2 else None
@@ -581,7 +592,6 @@ def prepare_merge(
     with safe_open_multiple(checkpoints, "cpu") as loaded_files:
         cmn.loaded_checkpoints = loaded_files
 
-        # Collect all keys
         keys = set()
         for f in loaded_files.values():
             if f is not None:
@@ -591,7 +601,7 @@ def prepare_merge(
             raise gr.Error("No keys found in any checkpoint — merge aborted")
 
         # ─────────────────────────────────────────────
-        # 3. Discard / clude (explicit, no magic)
+        # 3. Discard / clude
         # ─────────────────────────────────────────────
         discard_keys = {k.strip() for k in str(discard).split(",") if k.strip()}
         clude_keys   = {k.strip() for k in str(clude).split(",") if k.strip()}
@@ -605,24 +615,23 @@ def prepare_merge(
             keys &= clude_keys
 
         progress(f"Total keys to merge: {len(keys)}")
-
         if not keys:
             raise gr.Error("All keys were excluded — nothing left to merge")
 
         # ─────────────────────────────────────────────
-        # 4. Preset injection (safe)
+        # 4. Preset injection (preset WINS)
         # ─────────────────────────────────────────────
         if preset_output and preset_output.strip():
             try:
                 preset = json.loads(preset_output)
                 if isinstance(preset, dict):
-                    targets = {**preset, **targets}
+                    targets = {**targets, **preset}
                     progress("Applied Kitchen-Sink preset")
             except Exception as e:
                 progress(f"Preset ignored: {e}")
 
         # ─────────────────────────────────────────────
-        # 5. Checkpoint type map (required later)
+        # 5. Checkpoint type map
         # ─────────────────────────────────────────────
         cmn.checkpoints_types = {}
         for cp in checkpoints:
@@ -631,7 +640,7 @@ def prepare_merge(
                 cmn.checkpoints_types[cp] = typ
 
         # ─────────────────────────────────────────────
-        # 6. Device & dtype (deterministic)
+        # 6. Device & dtype
         # ─────────────────────────────────────────────
         device_choice = cmn.opts.get("device", "cuda/float16").lower()
 
@@ -654,9 +663,14 @@ def prepare_merge(
         progress(f"Merge running on {cmn.device.type.upper()} with {dtype_name}")
 
         # ─────────────────────────────────────────────
-        # 8. Create tasks
+        # 7. Create tasks (policy-aware)
         # ─────────────────────────────────────────────
-        assigned_keys = assign_weights_to_keys(targets, keys)
+        assigned_keys = assign_weights_to_keys(
+            targets,
+            keys,
+            specific_selectors_first=specific_selectors_first,
+        )
+
         tasks = create_tasks(
             progress,
             mergemode,
@@ -672,14 +686,14 @@ def prepare_merge(
             delta=delta,
             epsilon=epsilon,
             keep_zero_fill=keep_zero_fill,
-            bloat_mode=bloat_mode
+            bloat_mode=bloat_mode,
         )
 
         if not tasks:
             raise gr.Error("Task list is empty — merge aborted")
 
         # ─────────────────────────────────────────────
-        # 9. Run merge
+        # 8. Run merge
         # ─────────────────────────────────────────────
         merged_state_dict = do_merge(
             model_a, model_b, model_c, model_d,
@@ -698,17 +712,24 @@ def prepare_merge(
             threads=cmn.opts.get("threads", 8),
             keep_zero_fill=keep_zero_fill,
             bloat_mode=bloat_mode,
-            copy_vae_from_primary=copy_vae_from_primary,     
+            copy_vae_from_primary=copy_vae_from_primary,
             copy_clip_from_primary=copy_clip_from_primary,
             dual_soul_toggle=dual_soul_toggle,
             sacred_keys_toggle=sacred_keys_toggle,
             smartresize_toggle=smartresize_toggle,
             allow_synthetic_custom_merge=allow_synthetic_custom_merge,
-            allow_non_float_merges=allow_non_float_merges,  
+            allow_non_float_merges=allow_non_float_merges,
         )
 
+    # IMPORTANT: checkpoint handles are now closed
+    # Keep the dict, drop file handles to avoid accidental reuse.
+    try:
+        cmn.loaded_checkpoints = {}
+    except Exception:
+        pass
+
     # ─────────────────────────────────────────────
-    # 10. Finetune (unchanged but now safe)
+    # 9. Finetune (device-safe)
     # ─────────────────────────────────────────────
     if finetune:
         is_xl = bool(cmn.primary and "SDXL" in cmn.checkpoints_types.get(cmn.primary, ""))
@@ -721,7 +742,8 @@ def prepare_merge(
                     else:
                         merged_state_dict[key] += torch.tensor(
                             fine[i],
-                            dtype=merged_state_dict[key].dtype
+                            dtype=merged_state_dict[key].dtype,
+                            device=merged_state_dict[key].device,
                         )
 
     # ─────────────────────────────────────────────
@@ -860,9 +882,6 @@ def prepare_merge(
 
     return merged_state_dict
 
-
-
-
 def do_merge(
     model_a, model_b, model_c, model_d,
     checkpoints, tasks, state_dict, progress,
@@ -871,7 +890,7 @@ def do_merge(
     weight_editor="", discard="", clude="", clude_mode="Exclude",
     timer=None, threads=8, keep_zero_fill=True, bloat_mode=False,
     copy_vae_from_primary=True, copy_clip_from_primary=True,
-    dual_soul_toggle=False, sacred_keys_toggle=False, smartresize_toggle=False,
+    dual_soul_toggle=False, sacred_keys_toggle=False, smartresize_toggle=True,
     allow_synthetic_custom_merge=False, allow_non_float_merges=False,
 ):
     """
@@ -886,7 +905,6 @@ def do_merge(
     # - sacred handling
     # - shape correctness
     # - device/dtype correctness
-
     """
     progress("### Starting merge ###")
 
@@ -921,7 +939,9 @@ def do_merge(
                         read_mb = (cur.read_bytes - last_read) / (1024 * 1024)
                         write_mb = (cur.write_bytes - last_write) / (1024 * 1024)
                         if read_mb > 5 or write_mb > 5:
-                            self.progress(f"Disk IO: +{read_mb:.1f} MB read | +{write_mb:.1f} MB written")
+                            self.progress(
+                                f"Disk IO: +{read_mb:.1f} MB read | +{write_mb:.1f} MB written"
+                            )
                         last_read, last_write = cur.read_bytes, cur.write_bytes
 
                 self.thread = Thread(target=monitor_loop, daemon=True)
@@ -938,7 +958,8 @@ def do_merge(
                     total_read = (final.read_bytes - self.start_io[0]) / (1024 * 1024)
                     total_write = (final.write_bytes - self.start_io[1]) / (1024 * 1024)
                     self.progress(
-                        f"Disk Monitor: COMPLETE — Total Read: {total_read:.1f} MB | Total Written: {total_write:.2f} GB"
+                        f"Disk Monitor: COMPLETE — Total Read: {total_read:.1f} MB | "
+                        f"Total Written: {total_write:.2f} GB"
                     )
 
         disk_monitor = LiveDiskMonitor(progress)
@@ -947,7 +968,10 @@ def do_merge(
     # ------------------------------------------------------------
     # 1. Globals: checkpoints that actually opened
     # ------------------------------------------------------------
-    cmn.checkpoints_global = [cp for cp in checkpoints if cp and (cp in cmn.loaded_checkpoints)]
+    cmn.checkpoints_global = [
+        cp for cp in checkpoints
+        if cp and (cp in cmn.loaded_checkpoints)
+    ]
     for cp in cmn.checkpoints_global:
         f = cmn.loaded_checkpoints.get(cp)
         status = "OPENED" if f is not None else "FAILED/None"
@@ -976,7 +1000,11 @@ def do_merge(
         if "flux" in lower:
             has_flux = True
 
-    mixed = (len(types) > 1) or (has_sdxl_family and has_sd15) or (has_flux and (has_sdxl_family or has_sd15))
+    mixed = (
+        (len(types) > 1)
+        or (has_sdxl_family and has_sd15)
+        or (has_flux and (has_sdxl_family or has_sd15))
+    )
     cmn.same_arch = not mixed
 
     if not cmn.same_arch:
@@ -1011,50 +1039,43 @@ def do_merge(
     else:
         cmn.primary = model_a or (cmn.checkpoints_global[0] if cmn.checkpoints_global else None)
 
-    progress(
-        f"Using {os.path.basename(cmn.primary) if cmn.primary else 'None'} as primary"
-    )
-
+    progress(f"Using {os.path.basename(cmn.primary) if cmn.primary else 'None'} as primary")
 
     # ------------------------------------------------------------
     # 3.25 Policy toggles (USER-DRIVEN)
     # ------------------------------------------------------------
-
     # Facts only
     cmn.mixed_arch = not cmn.same_arch
 
-    # Explicit defaults (safe, but not inferred)
-    cmn.dual_soul_enabled   = False
-    cmn.sacred_enabled      = False
-    cmn.smartresize_enabled = False
+    # These flags are for initialize_task() to consult.
+    cmn.dual_soul_enabled   = bool(dual_soul_toggle)
+    cmn.sacred_enabled      = bool(sacred_keys_toggle)
+    cmn.smartresize_enabled = bool(smartresize_toggle)
 
-    force_cross_arch  = dual_soul_toggle
-    force_sacred_keys = sacred_keys_toggle
-    force_smartresize = smartresize_toggle
-
-    if force_cross_arch:
-        cmn.same_arch = False
-        cmn.dual_soul_enabled = True
+    if cmn.dual_soul_enabled:
         progress("[Policy Override] Dual-Soul ENABLED by user")
 
-    if force_sacred_keys:
-        cmn.sacred_enabled = True
+    if cmn.sacred_enabled:
         progress("[Policy Override] Sacred keys ENABLED by user")
 
-    if force_smartresize:
-        cmn.smartresize_enabled = True
+    if cmn.smartresize_enabled:
         progress("[Policy Override] SmartResize ENABLED by user")
 
+    # Pass-through policy toggles used by initialize_task() eligibility logic
+    cmn.allow_synthetic_custom_merge = bool(allow_synthetic_custom_merge)
+    cmn.allow_non_float_merges = bool(allow_non_float_merges)
 
     print(
         f"[Policy] same_arch={cmn.same_arch} | "
         f"dual_soul={'ON' if cmn.dual_soul_enabled else 'OFF'} | "
         f"sacred={'ON' if cmn.sacred_enabled else 'OFF'} | "
-        f"smartresize={'ON' if cmn.smartresize_enabled else 'OFF'}"
+        f"smartresize={'ON' if cmn.smartresize_enabled else 'OFF'} | "
+        f"synthetic_custom={'ON' if cmn.allow_synthetic_custom_merge else 'OFF'} | "
+        f"non_float_merges={'ON' if cmn.allow_non_float_merges else 'OFF'}"
     )
 
     # ------------------------------------------------------------
-    # 3.5 Target shape map
+    # 3.5 Target shape map (SmartResize reference)
     # ------------------------------------------------------------
     cmn.cross_arch_target_shapes.clear()
 
@@ -1078,6 +1099,7 @@ def do_merge(
     else:
         print("[ShapeMap] SmartResize disabled by policy")
 
+    # ------------------------------------------------------------
     # 4. Unload current model
     # ------------------------------------------------------------
     if shared.sd_model is not None:
@@ -1085,11 +1107,22 @@ def do_merge(
         try:
             sd_models.unload_model_weights(shared.sd_model)
         except TypeError:
-            # Some builds expect no args
             sd_models.unload_model_weights()
         shared.sd_model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------
+    # 5. Optional reuse path (same-arch + exact identical merge)
+    # ------------------------------------------------------------
+    # If you have this helper, keep it. If not, this block is safe to remove.
+    try:
+        if cmn.same_arch:
+            state_dict, remaining_tasks = get_tensors_from_loaded_model(state_dict, tasks)
+            if remaining_tasks is not tasks:
+                tasks = remaining_tasks
+    except Exception as e:
+        print(f"[Merger] Reuse path skipped: {e}")
 
     # ------------------------------------------------------------
     # 6. Parallel merge (policy lives in initialize_task)
@@ -1122,7 +1155,6 @@ def do_merge(
 
             with lock:
                 state_dict[key] = tensor.cpu()
-
                 if (len(state_dict) % 300) == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -1210,16 +1242,6 @@ def initialize_task(task):
       • Enforce policy gates (Dual-Soul Sacred when enabled)
       • Collect eligible tensors (with SmartResize when enabled)
       • Apply a strict fallback ladder (NO ad-hoc math here)
-
-    Fallback ladder (in order):
-      1) Sacred (when enabled) → Copy from primary (optionally SmartResize)
-      2) Custom operator (when eligible) → result tensor
-      3) Non-mergeable tensors → COPY fallback op
-      4) Mergeable multi-source tensors → LERPMEAN fallback op
-      5) Single tensor → return it
-      6) Primary copy → (optionally SmartResize)
-      7) Zero-fill (if enabled) → zeros(target_shape)
-      8) Skip
     """
 
     print(
@@ -1246,30 +1268,30 @@ def initialize_task(task):
             has_all_sources = False
             break
 
-    synthetic_allowed = (
+    allow_synthetic = getattr(
+        cmn, "allow_synthetic_custom_merge",
         cmn.opts.get("allow_synthetic_custom_merge", False)
-        and (
-            cmn.smartresize_enabled
-            or cmn.opts.get("keep_zero_fill", False)
-        )
+    )
+
+    keep_zero_fill = cmn.opts.get("keep_zero_fill", False)
+
+    synthetic_allowed = (
+        allow_synthetic
+        and (cmn.smartresize_enabled or keep_zero_fill)
     )
 
     eligible_custom = has_all_sources or synthetic_allowed
 
     if not eligible_custom:
         reason = "missing sources"
-        if (not has_all_sources) and (not cmn.opts.get("allow_synthetic_custom_merge", False)):
+        if not has_all_sources and not allow_synthetic:
             reason = "synthetic disabled"
         print(f"[CustomMerge:SKIPPED] {key} ← {reason}")
 
     # =====================================================
-    # 1) DUAL-SOUL SACRED PRESERVATION (POLICY-GATED)
+    # 1) DUAL-SOUL SACRED PRESERVATION
     # =====================================================
-    if (
-        cmn.dual_soul_enabled
-        and cmn.sacred_enabled
-        and cmn.is_sacred_key(key)
-    ):
+    if cmn.dual_soul_enabled and cmn.sacred_enabled and cmn.is_sacred_key(key):
         f = cmn.loaded_checkpoints.get(cmn.primary)
 
         if f and cmn.has_tensor(f, key):
@@ -1303,7 +1325,7 @@ def initialize_task(task):
         return key, None
 
     # =====================================================
-    # 2) FAST PATH — custom operator (ELIGIBLE ONLY)
+    # 2) FAST PATH — custom operator
     # =====================================================
     if eligible_custom:
         try:
@@ -1321,7 +1343,7 @@ def initialize_task(task):
                 f"[CustomMerge:FAILED] {key} ← {task_type} | "
                 f"Reason: {type(e).__name__}: {e}"
             )
-            print("[Fallback] Proceeding to policy ladder (LERPMEAN/COPY/Primary/ZeroFill)")
+            print("[Fallback] Entering policy ladder")
 
     # =====================================================
     # 3) ELIGIBLE TENSOR COLLECTION (SPARSE PATH)
@@ -1353,7 +1375,6 @@ def initialize_task(task):
                     orig_key=key
                 ).oper(t)
 
-            # If a target shape exists, enforce it (cross-arch correctness)
             if target_shape is not None and t.shape != target_shape:
                 continue
 
@@ -1364,12 +1385,15 @@ def initialize_task(task):
             print(f"[Sparse] FAILED {key} from {cp_path}: {e}")
 
     # =====================================================
-    # 4) POLICY LADDER (NO AD-HOC MERGE MATH HERE)
+    # 4a) POLICY LADDER
     # =====================================================
+    allow_non_float = getattr(
+        cmn, "allow_non_float_merges",
+        cmn.opts.get("allow_non_float_merges", False)
+    )
 
-    # 4a) If we have contributors and they are non-mergeable → COPY
     if tensors and not cmn.is_mergeable_tensor(tensors[0]):
-        if not cmn.opts.get("allow_non_float_merges", False):
+        if not allow_non_float:
             try:
                 op = cmn.copy_fallback(key, tensors, prefer=0)
                 out = op.merge()
@@ -1379,9 +1403,8 @@ def initialize_task(task):
             except Exception as e:
                 print(f"[Fallback:COPY][NonMergeable] FAILED {key}: {e}")
 
-        # If user explicitly allows, return the preferred tensor unchanged
         merge_stats.copied_primary += 1
-        print(f"[NonFloatAllowed] {key} ← first available (dtype={tensors[0].dtype})")
+        print(f"[NonFloatAllowed] {key} ← first available")
         return key, tensors[0]
 
     # 4b) No tensors → primary copy → zero-fill → skip
@@ -1435,13 +1458,13 @@ def initialize_task(task):
 
     # 4d) Multiple tensors → adaptive LERP profile (LERP/MEAN hybrid) → COPY
     try:
-        op = cmn.adaptive_fallback_op(key, tensors)
+        op = cmn.hybrid_fallback_op(key, tensors)
         out = op.merge()
         merge_stats.smart_merge += 1
-        print(f"[Fallback:AdaptiveLERP] {key} ← {', '.join(sources)}")
+        print(f"[Fallback:HybridCascadeLite] {key} ← {', '.join(sources)}")
         return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
     except Exception as e:
-        print(f"[Fallback:AdaptiveLERP] FAILED {key}: {e}")
+        print(f"[Fallback:HybridCascadeLite] FAILED {key}: {e}")
 
     # 4e) Final safety: COPY fallback
     try:

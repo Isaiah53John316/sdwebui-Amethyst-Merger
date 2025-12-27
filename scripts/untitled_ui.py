@@ -685,7 +685,7 @@ def on_ui_tabs():
 
                             smartresize_toggle = gr.Checkbox(
                                 label="Force SmartResize",
-                                value=False,
+                                value=True,
                                 info="Force tensor resizing to primary shapes when mismatched"
                             )
                             specific_selectors_first = gr.Checkbox(
@@ -877,100 +877,161 @@ def on_ui_tabs():
                             outputs=slider_container
                         )
 
-                        # ─────────────────────────────────────────────
-                        # Fallback Tuning (AdaptiveLERP)
-                        # ─────────────────────────────────────────────
-                        with gr.Tab("Fallback Tuning"):
-                            gr.Markdown("### Adaptive Fallback Behavior")
-                            gr.Markdown(
-                                "Controls how the merger behaves when custom math fails.\n"
-                                "These settings affect **automatic fallback merges only**."
+                    # ─────────────────────────────────────────────
+                    # Fallback Tuning (HybridCascadeLite)
+                    # ─────────────────────────────────────────────
+                    with gr.Tab("Fallback Tuning"):
+                        gr.Markdown("### Hybrid Fallback Behavior")
+                        gr.Markdown(
+                            "Controls how the merger behaves when **custom math fails**.\n\n"
+                            "Fallbacks are **key-aware and depth-biased**:\n"
+                            "• Early layers favor stability\n"
+                            "• Mid layers balance\n"
+                            "• Late layers allow more expressive blending\n\n"
+                            "These settings affect **automatic fallback merges only**."
+                        )
+
+                        # -------------------------------------------------
+                        # UNet / General Layers
+                        # -------------------------------------------------
+                        with gr.Accordion("UNet / General Layers", open=True):
+                            cmn.opts.create_option(
+                                "fallback_lerp_mix",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "Fallback Strength",
+                                    "info": "0 = ultra-stable (mean-like), 1 = expressive (detail-preserving)"
+                                },
+                                default=1.0
                             )
 
-                            with gr.Accordion("UNet / General Layers", open=True):
-                                fallback_mix = cmn.opts.create_option(
-                                    "fallback_lerp_mix",
-                                    gr.Slider,
-                                    {
-                                        "minimum": 0.0,
-                                        "maximum": 1.0,
-                                        "step": 0.01,
-                                        "label": "Fallback Strength",
-                                        "info": "0 = ultra-stable (mean), 1 = aggressive (LERP)"
-                                    },
-                                    default=1.0
-                                )
-
-                                fallback_confidence = cmn.opts.create_option(
-                                    "fallback_confidence",
-                                    gr.Slider,
-                                    {
-                                        "minimum": 0.0,
-                                        "maximum": 1.0,
-                                        "step": 0.01,
-                                        "label": "Confidence",
-                                        "info": "Trust agreement vs stabilize disagreement"
-                                    },
-                                    default=0.5
-                                )
-
-                                fallback_temp = cmn.opts.create_option(
-                                    "fallback_lerp_temp",
-                                    gr.Slider,
-                                    {
-                                        "minimum": 0.5,
-                                        "maximum": 3.0,
-                                        "step": 0.05,
-                                        "label": "Weight Temperature",
-                                        "info": "Higher = smoother, safer weighting"
-                                    },
-                                    default=1.0
-                                )
-
-                            with gr.Accordion("CLIP / VAE Layers (Safer Defaults)", open=False):
-                                clip_mix = cmn.opts.create_option(
-                                    "clip_vae_lerp_mix",
-                                    gr.Slider,
-                                    {
-                                        "minimum": 0.0,
-                                        "maximum": 1.0,
-                                        "step": 0.01,
-                                        "label": "CLIP/VAE Strength",
-                                        "info": "Lower values preserve semantic stability"
-                                    },
-                                    default=0.6
-                                )
-
-                                clip_conf = cmn.opts.create_option(
-                                    "clip_vae_confidence",
-                                    gr.Slider,
-                                    {
-                                        "minimum": 0.0,
-                                        "maximum": 1.0,
-                                        "step": 0.01,
-                                        "label": "CLIP/VAE Confidence",
-                                        "info": "Lower = more conservative"
-                                    },
-                                    default=0.35
-                                )
-
-                                clip_temp = cmn.opts.create_option(
-                                    "clip_vae_lerp_temp",
-                                    gr.Slider,
-                                    {
-                                        "minimum": 1.0,
-                                        "maximum": 4.0,
-                                        "step": 0.1,
-                                        "label": "CLIP/VAE Temperature",
-                                        "info": "Higher = gentler blending"
-                                    },
-                                    default=2.0
-                                )
-
-                            gr.Markdown(
-                                "ℹ️ These settings are used **only when fallback logic activates**.\n"
-                                "Custom calc modes and sacred preservation are unaffected."
+                            cmn.opts.create_option(
+                                "fallback_confidence",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "Confidence",
+                                    "info": "Trust agreement vs stabilize disagreement"
+                                },
+                                default=0.5
                             )
+
+                        # -------------------------------------------------
+                        # CLIP / VAE Layers (Safer Defaults)
+                        # -------------------------------------------------
+                        with gr.Accordion("CLIP / VAE Layers (Safer Defaults)", open=False):
+                            cmn.opts.create_option(
+                                "clip_vae_lerp_mix",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "CLIP / VAE Strength",
+                                    "info": "Lower values preserve semantic & decoding stability"
+                                },
+                                default=0.6
+                            )
+
+                            cmn.opts.create_option(
+                                "clip_vae_confidence",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "CLIP / VAE Confidence",
+                                    "info": "Lower = more conservative blending"
+                                },
+                                default=0.35
+                            )
+
+                            cmn.opts.create_option(
+                                "clip_vae_lerp_temp",
+                                gr.Slider,
+                                {
+                                    "minimum": 1.0,
+                                    "maximum": 4.0,
+                                    "step": 0.1,
+                                    "label": "CLIP / VAE Temperature",
+                                    "info": "Higher = gentler, smoother weighting"
+                                },
+                                default=2.0
+                            )
+
+                        # -------------------------------------------------
+                        # Noise / Timestep Layers (Ultra-Safe)
+                        # -------------------------------------------------
+                        with gr.Accordion("Noise / Timestep Layers (Ultra-Safe)", open=False):
+                            cmn.opts.create_option(
+                                "noise_lerp_mix",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "Noise Strength",
+                                    "info": "Lower values strongly preserve primary noise behavior"
+                                },
+                                default=0.4
+                            )
+
+                            cmn.opts.create_option(
+                                "noise_confidence",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "Noise Confidence",
+                                    "info": "How much agreement is trusted in noise-critical layers"
+                                },
+                                default=0.25
+                            )
+
+                            cmn.opts.create_option(
+                                "noise_lerp_temp",
+                                gr.Slider,
+                                {
+                                    "minimum": 1.0,
+                                    "maximum": 4.0,
+                                    "step": 0.1,
+                                    "label": "Noise Temperature",
+                                    "info": "Higher = extremely conservative blending"
+                                },
+                                default=2.5
+                            )
+
+                        # -------------------------------------------------
+                        # Depth Bias
+                        # -------------------------------------------------
+                        with gr.Accordion("Depth Bias (UNet-Aware)", open=False):
+                            cmn.opts.create_option(
+                                "fallback_depth_bias",
+                                gr.Slider,
+                                {
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "step": 0.01,
+                                    "label": "Depth Bias Strength",
+                                    "info": (
+                                        "How strongly fallback behavior scales with UNet depth.\n"
+                                        "0 = uniform behavior, 1 = early stable → late expressive"
+                                    )
+                                },
+                                default=0.35
+                            )
+
+                        gr.Markdown(
+                            "ℹ️ These settings are applied **only when fallback logic activates**.\n"
+                            "Custom calc modes, sacred preservation, and explicit COPY rules are unaffected."
+                        )
+
 
 
                     # Supermerger Adjust - ✅ Updated to 0.0000001 for 7 decimal places (float32 precision)
@@ -1123,7 +1184,7 @@ def on_ui_tabs():
                             "label": "Force SmartResize",
                             "info": "Always resize tensors to primary shape when mismatched"
                         },
-                            False
+                            True
                         )
                         cmn.opts.create_option(
                             'specific_selectors_first',
@@ -2238,30 +2299,50 @@ def start_merge(save_name, save_settings, finetune,
                 merge_mode_selector, calc_mode_selector,
                 model_a, model_b, model_c, model_d,
                 alpha, beta, gamma, delta, epsilon,
-                weight_editor, preset_output,          # ← Preset JSON
+                weight_editor, preset_output,
                 discard, clude, clude_mode,
                 merge_seed, enable_sliders, copy_vae_from_primary,
                 copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle,
-                specific_selectors_first, allow_synthetic_custom_merge, allow_non_float_merges, *custom_sliders,):
-    
+                specific_selectors_first, allow_synthetic_custom_merge, allow_non_float_merges,
+                *custom_sliders):
+
     progress = Progress()
-    
-    keep_zero_fill = cmn.opts.get('keep_zero_fill', True)
-    bloat_mode = cmn.opts.get('bloat_mode', False)
-    dual_soul_toggle = cmn.opts.get("force_cross_arch", False)
-    sacred_keys_toggle = cmn.opts.get("force_sacred_keys", False)
-    smartresize_toggle = cmn.opts.get("force_smartresize", False)
-    specific_selectors_first = cmn.opts.get("specific_selectors_first", False)
-    copy_vae_from_primary = cmn.opts.get('copy_vae_from_primary', True)
-    copy_clip_from_primary = cmn.opts.get('copy_clip_from_primary', True)
-    allow_synthetic_custom_merge = cmn.opts.get("allow_synthetic_custom_merge", False)
-    allow_non_float_merges = cmn.opts.get("allow_non_float_merges", False)
+
+    # ------------------------------------------------------------
+    # Policy: UI inputs win. opts are fallback only.
+    # ------------------------------------------------------------
+    def pick(ui_value, opt_key, default):
+        # Treat None as "not provided"; otherwise trust UI.
+        if ui_value is not None:
+            return ui_value
+        return cmn.opts.get(opt_key, default)
+
+    keep_zero_fill = cmn.opts.get("keep_zero_fill", True)
+    bloat_mode     = cmn.opts.get("bloat_mode", False)
+
+    # These MUST respect UI toggles
+    dual_soul_toggle              = pick(dual_soul_toggle, "force_cross_arch", False)
+    sacred_keys_toggle            = pick(sacred_keys_toggle, "force_sacred_keys", False)
+    smartresize_toggle            = pick(smartresize_toggle, "force_smartresize", True)
+    specific_selectors_first      = pick(specific_selectors_first, "specific_selectors_first", False)
+
+    copy_vae_from_primary         = pick(copy_vae_from_primary, "copy_vae_from_primary", True)
+    copy_clip_from_primary        = pick(copy_clip_from_primary, "copy_clip_from_primary", True)
+
+    allow_synthetic_custom_merge  = pick(allow_synthetic_custom_merge, "allow_synthetic_custom_merge", False)
+    allow_non_float_merges        = pick(allow_non_float_merges, "allow_non_float_merges", False)
+
+    # Optional: log what actually won (helps you sanity-check UI vs opts)
+    print(
+        f"[UI→Merge] dual_soul={dual_soul_toggle} sacred={sacred_keys_toggle} "
+        f"smartresize={smartresize_toggle} specific_first={specific_selectors_first} "
+        f"synthetic={allow_synthetic_custom_merge} non_float={allow_non_float_merges} "
+        f"copy_vae={copy_vae_from_primary} copy_clip={copy_clip_from_primary}"
+    )
 
     try:
-        # ENHANCEMENT 2: Real-time ETA tracking
         progress.start_merge(1000)
 
-        # === BUILD MERGE ARGS PROPERLY — THIS IS THE KEY FIX ===
         merge_args = [
             save_name,
             save_settings,
@@ -2276,7 +2357,7 @@ def start_merge(save_name, save_settings, finetune,
             clude or "",
             clude_mode,
             merge_seed,
-            enable_sliders,         
+            enable_sliders,
             keep_zero_fill,
             bloat_mode,
             copy_vae_from_primary,
@@ -2288,18 +2369,10 @@ def start_merge(save_name, save_settings, finetune,
             allow_synthetic_custom_merge,
             allow_non_float_merges,
             *custom_sliders,
-            
         ]
 
-        # -------------------------------
-        # MAIN MERGE (runs once)
-        # -------------------------------
         merger.prepare_merge(progress, *merge_args)
 
-        # -------------------------------
-        # 🔒 LOCK UI CHECKPOINT (CRITICAL)
-        # Lock to REAL base checkpoint title
-        # -------------------------------
         try:
             if cmn.primary:
                 base_title = os.path.splitext(os.path.basename(cmn.primary))[0]
@@ -2308,37 +2381,26 @@ def start_merge(save_name, save_settings, finetune,
         except Exception as e:
             print(f"[Amethyst] UI lock warning: {e}")
 
-
-        # -------------------------------
-        # SUCCESS → SAVE HISTORY
-        # -------------------------------
         save_to_history(
             {
-                'models': str(merge_args[3:7]),
-                'modes': f"{merge_args[2]}+{merge_args[1]}"
+                "models": str(merge_args[3:7]),
+                "modes": f"{merge_args[2]}+{merge_args[1]}",
             },
-            "Success"
+            "Success",
         )
 
     except Exception as error:
-        # Always clear cache on error
         merger.clear_cache()
-
-        # UNIVERSAL MODEL RELOAD – works everywhere
         universal_model_reload()
 
-        # Log failure to history
         error_msg = str(error)[:60] + ("..." if len(str(error)) > 60 else "")
-        save_to_history({'status': 'Failed'}, f"Failed: {error_msg}")
+        save_to_history({"status": "Failed"}, f"Failed: {error_msg}")
 
-        # Re-raise non-interrupt errors
-        if not isinstance(error, getattr(merger, 'MergeInterruptedError', Exception)):
+        if not isinstance(error, getattr(merger, "MergeInterruptedError", Exception)):
             raise
 
-    # -------------------------------
-    # RETURN TO GRADIO (last line)
-    # -------------------------------
     return progress.get_report()
+
 
 
 def universal_model_reload():

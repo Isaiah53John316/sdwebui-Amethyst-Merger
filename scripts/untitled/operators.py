@@ -10,8 +10,73 @@ from scripts.untitled.common import cmn
 from scripts.untitled.common import merge_stats
 from collections import OrderedDict
 import threading
+import math
+from typing import List, Optional
 
 
+class WeightsCache:
+    def __init__(self, size_mb, max_items=None):
+        self.mapping = OrderedDict()
+        self.size_cap = min(size_mb, 8192) * 1024 * 1024  # bytes
+        self.size = 0
+        self.max_items = max_items
+        self.lock = threading.Lock()
+
+        # Optional stats
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def __setitem__(self, key, t):
+        # Defensive: only cache valid tensors
+        if not isinstance(t, torch.Tensor) or t.numel() == 0:
+            return
+
+        # Defensive: key must be truly hashable
+        try:
+            hash(key)
+        except Exception as e:
+            raise TypeError(f"WeightsCache key must be hashable: {e}")
+
+        with self.lock:
+            # Remove existing entry
+            if key in self.mapping:
+                old = self.mapping.pop(key)
+                self.size -= tensor_size(old)
+
+            # Store CPU, detached tensor
+            t_cpu = t.detach().cpu()
+            self.mapping[key] = t_cpu
+            self.mapping.move_to_end(key)
+            self.size += tensor_size(t_cpu)
+
+            # Evict LRU until under limits
+            while (
+                self.mapping and
+                (
+                    self.size > self.size_cap or
+                    (self.max_items and len(self.mapping) > self.max_items)
+                )
+            ):
+                _, tensor = self.mapping.popitem(last=False)
+                self.size -= tensor_size(tensor)
+                self.evictions += 1
+
+    def __getitem__(self, key):
+        with self.lock:
+            if key not in self.mapping:
+                self.misses += 1
+                raise KeyError(f"WeightsCache miss for key: {key}")
+
+            t = self.mapping[key]
+            self.mapping.move_to_end(key)
+            self.hits += 1
+
+        return t.clone().to(
+            device=cmn.get_device(),
+            dtype=cmn.get_dtype()
+        )
+    
 def tensor_size(t):
     """Return tensor size in bytes (safe for all tensor dtypes)."""
     if not isinstance(t, torch.Tensor):
@@ -24,10 +89,10 @@ def recurse(operation):
 
     for idx, source in enumerate(operation.sources):
         try:
-            if hasattr(source, 'merge'):
+            # Resolve source
+            if hasattr(source, "merge"):
                 t = source.merge()
             else:
-                # Scalar literal → tensor
                 t = torch.as_tensor(source)
 
             if t is None:
@@ -35,8 +100,29 @@ def recurse(operation):
                     f"Source resolved to None (index {idx}, source={source})"
                 )
 
-            # Enforce device + dtype at the boundary
-            t = t.to(device=cmn.get_device(), dtype=cmn.get_dtype())
+            # 🚨 Scalar tensors are forbidden at execution boundary
+            if not isinstance(t, torch.Tensor) or t.ndim == 0:
+                raise RuntimeError(
+                    f"Invalid scalar or non-tensor source at index {idx} "
+                    f"for operation '{operation.key}'"
+                )
+
+            # Validate base tensor (operator-level policy)
+            validated = operation.validate_base(t)
+            if validated is None:
+                raise RuntimeError(
+                    f"Source rejected by validate_base "
+                    f"(index {idx}, key={operation.key})"
+                )
+
+            t = validated
+
+            # Normalize ONLY floating tensors
+            if t.is_floating_point():
+                t = t.to(device=cmn.get_device(), dtype=cmn.get_dtype())
+            else:
+                t = t.to(device=cmn.get_device())
+
             source_tensors.append(t)
 
         except Exception as e:
@@ -48,22 +134,24 @@ def recurse(operation):
     return operation.oper(*source_tensors)
 
 
-
 # Optional debug toggle (global, cheap)
 CACHE_DEBUG = False
-
 _cache_lock = threading.Lock()
 
 def multi_cache_operation(func):
     def wrapper(self, *source_tensors):
-        # Optional bypass hook (future-proof)
+
+        # ─────────────────────────────────────────────
+        # Optional bypass hook
+        # ─────────────────────────────────────────────
         if getattr(self, "disable_cache", False):
             return func(self, *source_tensors)
 
+        # ─────────────────────────────────────────────
         # Fast path: cache hit
+        # ─────────────────────────────────────────────
         try:
-            with _cache_lock:
-                result = weights_cache[self]
+            result = weights_cache[self]
             if CACHE_DEBUG:
                 print(f"[CACHE HIT] {self.__class__.__name__} :: {self.key}")
             return result
@@ -71,30 +159,61 @@ def multi_cache_operation(func):
             if CACHE_DEBUG:
                 print(f"[CACHE MISS] {self.__class__.__name__} :: {self.key}")
 
-        # Compute outside lock
+        # ─────────────────────────────────────────────
+        # Compute (outside lock)
+        # ─────────────────────────────────────────────
         result = func(self, *source_tensors)
 
-        # Do NOT cache invalid results
+        # ─────────────────────────────────────────────
+        # Validation gate (CRITICAL)
+        # ─────────────────────────────────────────────
         if result is None or not isinstance(result, torch.Tensor):
             if CACHE_DEBUG:
                 print(f"[CACHE SKIP] {self.key} → invalid result")
             return result
 
-        # Do NOT cache empty tensors
+        # 🚨 Scalar tensors forbidden
+        if result.ndim == 0:
+            raise ValueError(
+                f"[CACHE ERROR] Scalar tensor detected for key '{self.key}' "
+                f"in {self.__class__.__name__}"
+            )
+
         if result.numel() == 0:
             if CACHE_DEBUG:
                 print(f"[CACHE SKIP] {self.key} → empty tensor")
             return result
 
-        # Do NOT cache autograd tensors
         if result.requires_grad:
             if CACHE_DEBUG:
                 print(f"[CACHE SKIP] {self.key} → requires_grad")
             return result
 
-        # Store in cache
-        with _cache_lock:
-            weights_cache[self] = result
+        # ─────────────────────────────────────────────
+        # Cross-arch shape enforcement (optional but good)
+        # ─────────────────────────────────────────────
+        expected_shape = getattr(cmn, "cross_arch_target_shapes", {}).get(self.key)
+        if expected_shape is not None and tuple(result.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"[CACHE ERROR] Shape mismatch for key '{self.key}': "
+                f"got {tuple(result.shape)}, expected {tuple(expected_shape)}"
+            )
+
+        # ─────────────────────────────────────────────
+        # Semantic-critical keys bypass cache
+        # ─────────────────────────────────────────────
+        forbidden = getattr(self, "FORBIDDEN_PATTERNS", ())
+        key = str(self.key)
+        if forbidden and any(p in key for p in forbidden):
+
+            if CACHE_DEBUG:
+                print(f"[CACHE BYPASS] {self.key} → semantic-critical key")
+            return result
+
+        # ─────────────────────────────────────────────
+        # Cache store
+        # ─────────────────────────────────────────────
+        weights_cache[self] = result
 
         if CACHE_DEBUG:
             print(f"[CACHE STORE] {self.__class__.__name__} :: {self.key}")
@@ -102,6 +221,8 @@ def multi_cache_operation(func):
         return result
 
     return wrapper
+
+weights_cache = WeightsCache(4096, max_items=100_000)
 
 
 ###OPERATORS####
@@ -118,17 +239,69 @@ class Operation:
         self.merge_func = recurse  # ← still used by merge()
 
     def __eq__(self, other):
-        return (self.key, self.alpha, self.beta, self.gamma, self.delta, self.seed, self.sources) == \
-               (other.key, other.alpha, other.beta, other.gamma, other.delta, other.seed, other.sources)
+        return (
+            self.key,
+            self.alpha,
+            self.beta,
+            self.gamma,
+            self.delta,
+            self.seed,
+            self.sources
+        ) == (
+            other.key,
+            other.alpha,
+            other.beta,
+            other.gamma,
+            other.delta,
+            other.seed,
+            other.sources
+        )
 
     def __hash__(self):
-        return hash((self.key, self.alpha, self.beta, self.gamma, self.delta, self.seed, self.sources))
+        return hash((
+            self.key,
+            self.alpha,
+            self.beta,
+            self.gamma,
+            self.delta,
+            self.seed,
+            self.sources
+        ))
 
     def oper(self, *tensors) -> torch.Tensor:
         raise NotImplementedError("Subclasses must implement oper(self, *tensors)")
 
     def merge(self):
-        return self.merge_func(self)
+        out = self.merge_func(self)
+        return out
+    # -------------------------------------------------
+    # CANONICAL: cascade fallback validation helper
+    # -------------------------------------------------
+    def validate_base(self, base):
+        """
+        Validate the base tensor for this operation.
+
+        Returns:
+          • torch.Tensor → safe to operate on
+          • None          → MUST trigger cascade fallback
+
+        Contract:
+          • Scalar tensors are NEVER valid
+          • Non-tensors are refused
+          • Non-float tensors pass through untouched
+        """
+        if not isinstance(base, torch.Tensor):
+            return None
+
+        # Non-floating tensors are safe passthroughs
+        if not base.is_floating_point():
+            return base
+
+        # 🚨 Scalar tensors must never propagate
+        if base.ndim == 0:
+            return None
+
+        return base
 
     # -------------------------------------------------
     # OPTIONAL: shared broadcast-safe math helper
@@ -140,6 +313,196 @@ class Operation:
         """
         return cmn.safe_apply(op, a, b, self.key)
 
+class SmartResize(Operation):
+    """
+    SmartResize:
+      - Sacred keys: NEVER interpolate (pad/slice only)
+      - Non-sacred:
+          * 1D: linear
+          * 2D: bilinear (special-case large vocab as row-wise resize)
+          * 3D: resize last dim with linear; pad/slice first dims
+          * 4D (OIHW conv): resize H/W; pad/slice O/I channels
+      - Weird rank mismatch: pad/slice or return as-is
+
+    Fallback contract:
+      • If called with no tensors:
+          - Use self.source_tensor if provided
+          - Otherwise REFUSE (return None)
+    """
+    def __init__(self, key, target_shape, source_tensor=None, orig_key=None):
+        super().__init__(key)
+        self.target_shape = tuple(target_shape) if target_shape is not None else None
+        self.source_tensor = source_tensor
+        self.orig_key = orig_key if orig_key is not None else key
+
+        # SmartResize is NOT safely cacheable: output depends on input tensor values.
+        self.disable_cache = True
+
+    @multi_cache_operation
+    def oper(self, *tensors):
+        # --------------------------
+        # Resolve input tensor
+        # --------------------------
+        if not tensors:
+            if self.source_tensor is None:
+                return None
+            t = self.source_tensor
+        else:
+            t = tensors[0]
+
+        t = self.validate_base(t)
+        if t is None:
+            return None
+
+        target = self.target_shape
+        if (not target) or (len(target) == 0) or any(s > 100_000 for s in target):
+            return t
+
+        device = t.device
+        dtype = t.dtype
+
+        if t.numel() == 0:
+            return torch.zeros(target, device=device, dtype=dtype)
+
+        # Sacred check uses canonical key
+        is_sacred = cmn.is_sacred_key(self.orig_key)
+
+        # --------------------------
+        # Helpers
+        # --------------------------
+        def _pad_slice_to_target(x: torch.Tensor, tgt_shape: tuple) -> torch.Tensor:
+            if x.ndim != len(tgt_shape):
+                if x.ndim == 0 and len(tgt_shape) == 0:
+                    return x
+                return x
+
+            out = torch.zeros(tgt_shape, device=x.device, dtype=x.dtype)
+            slices_out = []
+            slices_in = []
+            for src, tgt in zip(x.shape, tgt_shape):
+                n = min(src, tgt)
+                slices_out.append(slice(0, n))
+                slices_in.append(slice(0, n))
+            out[tuple(slices_out)] = x[tuple(slices_in)]
+            return out
+
+        def _interp_last_dim(block: torch.Tensor, new_last: int) -> torch.Tensor:
+            if block.shape[-1] == new_last:
+                return block
+            flat = block.reshape(-1, 1, block.shape[-1])
+            resized = F.interpolate(flat, size=new_last, mode="linear", align_corners=False)
+            return resized.reshape(*block.shape[:-1], new_last)
+
+        def _is_interpolatable(x: torch.Tensor) -> bool:
+            # Interpolate supports floating point (not complex) safely here
+            return x.is_floating_point()
+
+        # ===============================================================
+        # SACRED: NEVER interpolate, only pad/slice
+        # ===============================================================
+        if is_sacred:
+            if t.shape == target:
+                return t
+
+            if t.ndim != len(target):
+                return t
+
+            result = _pad_slice_to_target(t, target)
+            merge_stats.smart_resized += 1
+            print(f"[SANCTUARY] Preserved sacred tensor: {self.orig_key} → {tuple(result.shape)}")
+            return result
+
+        # ===============================================================
+        # NORMAL: interpolation allowed
+        # ===============================================================
+        if t.ndim != len(target):
+            return t
+
+        # Non-float (including complex, int, bool): pad/slice only
+        if not _is_interpolatable(t):
+            result = _pad_slice_to_target(t, target)
+            merge_stats.smart_resized += 1
+            return result
+
+        # Promote half/bf16 to fp32 for interpolate stability
+        tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
+
+        # 1D
+        if tmp.ndim == 1:
+            if tmp.shape == target:
+                return tmp.to(dtype)
+            out = F.interpolate(tmp[None, None, :], size=target[0], mode="linear", align_corners=False)[0, 0]
+            merge_stats.smart_resized += 1
+            return out.to(dtype)
+
+        # 2D
+        if tmp.ndim == 2:
+            if tmp.shape == target:
+                return tmp.to(dtype)
+
+            # Large vocab special-case (vectorized, no Python loop)
+            if target[0] > 20_000:
+                rows = min(tmp.shape[0], target[0])
+                out = torch.zeros(target, device=device, dtype=tmp.dtype)
+
+                # Treat each row as a separate "batch item": (rows, 1, 1, src_w)
+                block = tmp[:rows].unsqueeze(1).unsqueeze(2)
+                resized = F.interpolate(
+                    block,
+                    size=(1, target[1]),
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze(2).squeeze(1)  # -> (rows, target[1])
+
+                out[:rows] = resized
+                merge_stats.smart_resized += 1
+                return out.to(dtype)
+
+            out = F.interpolate(tmp[None, None, :, :], size=target, mode="bilinear", align_corners=False)[0, 0]
+            merge_stats.smart_resized += 1
+            return out.to(dtype)
+
+        # 3D
+        if tmp.ndim == 3:
+            if tmp.shape == target:
+                return tmp.to(dtype)
+
+            out = torch.zeros(target, device=device, dtype=tmp.dtype)
+            a = min(tmp.shape[0], target[0])
+            b = min(tmp.shape[1], target[1])
+
+            block = tmp[:a, :b, :]
+            block = _interp_last_dim(block, target[2])
+            out[:a, :b, :] = block
+
+            merge_stats.smart_resized += 1
+            return out.to(dtype)
+
+        # 4D (OIHW conv)
+        if tmp.ndim == 4:
+            if tmp.shape == target:
+                return tmp.to(dtype)
+
+            tgt_o, tgt_i, tgt_h, tgt_w = target
+            src_o, src_i, src_h, src_w = tmp.shape
+
+            inter = torch.zeros((tgt_o, tgt_i, src_h, src_w), device=device, dtype=tmp.dtype)
+            o = min(src_o, tgt_o)
+            i = min(src_i, tgt_i)
+            inter[:o, :i, :, :] = tmp[:o, :i, :, :]
+
+            if (src_h, src_w) != (tgt_h, tgt_w):
+                flat = inter.reshape(-1, 1, src_h, src_w)
+                flat = F.interpolate(flat, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+                inter = flat.reshape(tgt_o, tgt_i, tgt_h, tgt_w)
+
+            merge_stats.smart_resized += 1
+            return inter.to(dtype)
+
+        # Weird rank but matching ndims: pad/slice
+        result = _pad_slice_to_target(tmp.to(dtype), target)
+        merge_stats.smart_resized += 1
+        return result
 
 class CopyPrimary(Operation):
     """
@@ -251,8 +614,6 @@ class CopyPrimary(Operation):
         if target_shape and self.keep_zero_fill:
             t = torch.zeros(
                 target_shape,
-                device=cmn.get_device(),
-                dtype=cmn.get_dtype()
             )
             if self.stats:
                 self.stats.zero_filled += 1
@@ -293,7 +654,6 @@ class LoadTensor(Operation):
         return hash((
             self.key,
             self.checkpoint_name,
-            cmn.smartresize_enabled,  # optional policy salt
         ))
 
     def __eq__(self, other):
@@ -449,9 +809,7 @@ class Add(Operation):
 
         base = tensors[0]
 
-        # ─────────────────────────────────────────
         # Semantic guard
-        # ─────────────────────────────────────────
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
@@ -461,13 +819,14 @@ class Add(Operation):
         if not base.is_floating_point():
             return base
 
-        # Collect compatible contributors
+        # Collect compatible contributors (excluding base)
         valid = [
             t for t in tensors[1:]
             if (
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
                 and torch.any(t != 0)
             )
         ]
@@ -475,22 +834,15 @@ class Add(Operation):
         if not valid:
             return base
 
-        # ─────────────────────────────────────────
-        # Additive interaction
-        # ─────────────────────────────────────────
-        result = base.clone()
+        # Additive interaction (explicit amplification)
+        out = base.clone()
         for t in valid:
-            result = result + t
+            out = out + t
 
-        # Numerical safety clamp (soft)
-        result = torch.nan_to_num(
-            result,
-            nan=0.0,
-            posinf=base.max(),
-            neginf=base.min(),
-        )
+        # Numerical safety (no shape or semantic distortion)
+        out = torch.nan_to_num(out, nan=0.0)
 
-        return result.to(base.dtype)
+        return out.to(base.dtype)
 
 
 class Sub(Operation):
@@ -551,9 +903,7 @@ class Sub(Operation):
 
         base = tensors[0]
 
-        # ─────────────────────────────────────────
         # Semantic guard
-        # ─────────────────────────────────────────
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
@@ -563,13 +913,14 @@ class Sub(Operation):
         if not base.is_floating_point():
             return base
 
-        # Collect compatible contributors
+        # Collect compatible contributors (excluding base)
         valid = [
             t for t in tensors[1:]
             if (
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
                 and torch.any(t != 0)
             )
         ]
@@ -577,22 +928,15 @@ class Sub(Operation):
         if not valid:
             return base
 
-        # ─────────────────────────────────────────
-        # Subtractive interaction
-        # ─────────────────────────────────────────
-        result = base.clone()
+        # Destructive subtraction
+        out = base.clone()
         for t in valid:
-            result = result - t
+            out = out - t
 
-        # Numerical safety
-        result = torch.nan_to_num(
-            result,
-            nan=0.0,
-            posinf=base.max(),
-            neginf=base.min(),
-        )
+        # Numerical safety (no semantic distortion)
+        out = torch.nan_to_num(out, nan=0.0)
 
-        return result.to(base.dtype)
+        return out.to(base.dtype)
 
 
 class Multiply(Operation):
@@ -653,9 +997,7 @@ class Multiply(Operation):
 
         base = tensors[0]
 
-        # ─────────────────────────────────────────
         # Semantic guard
-        # ─────────────────────────────────────────
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
@@ -665,137 +1007,30 @@ class Multiply(Operation):
         if not base.is_floating_point():
             return base
 
-        # Collect compatible contributors
+        # Collect compatible contributors (excluding base)
         valid = [
-            t for t in tensors
+            t for t in tensors[1:]
             if (
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
                 and torch.any(t != 0)
             )
         ]
 
-        if len(valid) <= 1:
+        if not valid:
             return base
 
-        # ─────────────────────────────────────────
         # Multiplicative interaction
-        # ─────────────────────────────────────────
-        result = base.clone()
-        for t in valid[1:]:
-            result = result * t
+        out = base.clone()
+        for t in valid:
+            out = out * t
 
-        # Safety: kill NaNs / infs
-        result = torch.nan_to_num(
-            result,
-            nan=0.0,
-            posinf=base.max(),
-            neginf=base.min(),
-        )
+        # Numerical safety: kill NaNs / infs without semantic distortion
+        out = torch.nan_to_num(out, nan=0.0)
 
-        return result.to(base.dtype)
-
-
-class MultiplyTensors(Operation):
-    """
-    MultiplyTensors:
-      • Element-wise multiplicative interaction
-      • Extremely aggressive
-      • Intended for experimental feature modulation ONLY
-
-    Semantic contract:
-      • NEVER touches temporal control, noise, CLIP, VAE, attention routing
-      • Preserves base semantics on refusal
-    """
-
-    FORBIDDEN_PATTERNS = (
-        # Temporal / noise control
-        "time_embed",
-        "time_embedding",
-        "timestep",
-        "time_in",
-        "sigma",
-        "noise",
-
-        # Attention & routing
-        "attn",
-        "attention",
-        "to_q",
-        "to_k",
-        "to_v",
-        "proj",
-        "skip_connection",
-
-        # Normalization & scaling
-        "norm",
-        "layer_norm",
-        "ln_",
-        "scale_shift",
-        "affine",
-
-        # Latent encode / decode
-        "vae",
-        "encoder",
-        "decoder",
-        "first_stage_model",
-
-        # Text / conditioning
-        "text_model",
-        "cond_stage_model",
-        "conditioner",
-        "token_embedding",
-        "position_embedding",
-    )
-
-    @multi_cache_operation
-    def oper(self, *tensors):
-        if not tensors:
-            return None
-
-        base = tensors[0]
-
-        # ─────────────────────────────────────────
-        # Semantic guard
-        # ─────────────────────────────────────────
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            return base
-
-        if not isinstance(base, torch.Tensor) or not base.is_floating_point():
-            return base
-
-        # Collect compatible contributors
-        valid = [
-            t for t in tensors
-            if (
-                isinstance(t, torch.Tensor)
-                and t.is_floating_point()
-                and t.shape == base.shape
-                and torch.any(t != 0)
-            )
-        ]
-
-        if len(valid) <= 1:
-            return base
-
-        # ─────────────────────────────────────────
-        # Multiplicative interaction (bounded)
-        # ─────────────────────────────────────────
-        result = base.clone()
-
-        for t in valid[1:]:
-            result = result * t
-
-        # Optional safety clamp (highly recommended)
-        result = torch.nan_to_num(
-            result,
-            nan=0.0,
-            posinf=base.max(),
-            neginf=base.min(),
-        )
-
-        return result.to(base.dtype)
-
+        return out.to(base.dtype)
 
 class Extract(Operation):
     """
@@ -851,13 +1086,18 @@ class Extract(Operation):
 
         base = tensors[0]
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------
         # Semantic guard
-        # ─────────────────────────────────────────
+        # -------------------------------------------------
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
-        if not isinstance(base, torch.Tensor) or not base.is_floating_point():
+        if (
+            not isinstance(base, torch.Tensor)
+            or not base.is_floating_point()
+            or base.ndim < 2        # 🚨 forbid scalars & 1D
+            or base.numel() == 0
+        ):
             return base
 
         a = tensors[1] if len(tensors) > 1 else base
@@ -872,28 +1112,41 @@ class Extract(Operation):
         ):
             return base
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------
         # Relative deltas
-        # ─────────────────────────────────────────
+        # -------------------------------------------------
         base_f = base.float()
-        a_f = (a.float() - base_f)
-        b_f = (b.float() - base_f)
+        a_f = a.float() - base_f
+        b_f = b.float() - base_f
 
-        # If deltas are trivial, bail
         if not (torch.any(a_f) and torch.any(b_f)):
             return base
 
-        # Cosine similarity along last dim
+        # -------------------------------------------------
+        # Cosine agreement (feature-wise, safe)
+        # -------------------------------------------------
         c = torch.cosine_similarity(a_f, b_f, dim=-1).clamp(-1.0, 1.0)
-        c = c.unsqueeze(-1)
 
-        d = ((c + 1.0) * 0.5) ** self.gamma
+        # Ensure non-scalar & broadcast-safe
+        if c.ndim == 0:
+            return base
 
-        # Interpolate deltas, then re-anchor to base
+        # Shape: [*, 1] for safe broadcast
+        while c.ndim < base.ndim:
+            c = c.unsqueeze(-1)
+
+        d = ((c + 1.0) * 0.5).pow(self.gamma)
+
+        # -------------------------------------------------
+        # Interpolate deltas, re-anchor to base
+        # -------------------------------------------------
         delta = torch.lerp(a_f, b_f, self.alpha)
-        gated = delta * torch.lerp(d, 1.0 - d, self.beta)
+        gate = torch.lerp(d, 1.0 - d, self.beta)
 
-        return (base_f + gated).to(base.dtype)
+        out = base_f + delta * gate
+
+        return out.to(base.dtype)
+
 
 
 class Similarities(Extract):
@@ -901,17 +1154,54 @@ class Similarities(Extract):
     Similarities:
       • Delegates to Extract to compute similarity features
       • Non-destructive, analysis-only operator
+      • NEVER fabricates tensors
     """
+
     def __init__(self, key, alpha, beta, gamma, a, b):
         super().__init__(key, alpha, beta, gamma, a, b)
 
     @multi_cache_operation
     def oper(self, *tensors):
-        valid = [t for t in tensors if isinstance(t, torch.Tensor) and t.numel() > 0]
+        # -------------------------------------------------
+        # Collect valid floating-point tensors
+        # -------------------------------------------------
+        valid = [
+            t for t in tensors
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.ndim > 0          # 🚨 forbid scalars
+                and t.numel() > 0
+            )
+        ]
+
         if len(valid) < 2:
             return valid[0] if valid else None
 
-        return super().oper(valid[0], valid[1])
+        a, b = valid[0], valid[1]
+
+        # -------------------------------------------------
+        # Shape safety
+        # -------------------------------------------------
+        if a.shape != b.shape:
+            return a  # preserve base semantics
+
+        # -------------------------------------------------
+        # Delegate to Extract (analysis-only)
+        # -------------------------------------------------
+        out = super().oper(a, b)
+
+        # Extract should already be safe, but defend anyway
+        if not isinstance(out, torch.Tensor):
+            return None
+
+        if out.ndim == 0:
+            return None
+
+        return out.to(
+            dtype=cmn.get_dtype(),
+            device=cmn.get_device()
+        )
 
 
 class Clamp(Operation):
@@ -936,19 +1226,53 @@ class Clamp(Operation):
 
     def __init__(self, key, min_val=-1.0, max_val=1.0):
         super().__init__(key)
-        self.min = float(min_val)
-        self.max = float(max_val)
+        self.min_val = float(min_val)
+        self.max_val = float(max_val)
+
+        # Defensive sanity
+        if self.min_val > self.max_val:
+            self.min_val, self.max_val = self.max_val, self.min_val
 
     @multi_cache_operation
     def oper(self, *tensors):
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+        # -------------------------------------------------
+        # Key-level semantic guard
+        # -------------------------------------------------
+        if self.FORBIDDEN_PATTERNS and any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return tensors[0] if tensors else None
 
-        t = tensors[0] if tensors else None
-        if not isinstance(t, torch.Tensor) or not t.is_floating_point():
+        if not tensors:
+            return None
+
+        t = tensors[0]
+
+        # -------------------------------------------------
+        # Tensor-level safety
+        # -------------------------------------------------
+        if not isinstance(t, torch.Tensor):
             return t
 
-        return t.clamp(self.min, self.max).to(cmn.get_dtype())
+        if not t.is_floating_point():
+            return t
+
+        # 🚨 Scalar tensors forbidden
+        if t.ndim == 0:
+            return None
+
+        if t.numel() == 0:
+            return t
+
+        # Optional: skip pointless work
+        if not torch.any(t != 0):
+            return t
+
+        out = t.clamp(self.min_val, self.max_val)
+
+        return out.to(
+            dtype=cmn.get_dtype(),
+            device=cmn.get_device()
+        )
+
     
 class Mean(Operation):
     """
@@ -970,17 +1294,46 @@ class Mean(Operation):
 
     @multi_cache_operation
     def oper(self, *tensors):
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+        # -------------------------------------------------
+        # Key-level semantic guard
+        # -------------------------------------------------
+        if self.FORBIDDEN_PATTERNS and any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return tensors[0] if tensors else None
 
+        # -------------------------------------------------
+        # Collect valid contributors
+        # -------------------------------------------------
         valid = [
             t for t in tensors
-            if isinstance(t, torch.Tensor) and t.is_floating_point()
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.ndim > 0
+                and t.numel() > 0
+            )
         ]
+
         if not valid:
             return None
 
-        return (sum(valid) / len(valid)).to(cmn.get_dtype())
+        base = valid[0]
+
+        # Shape safety (no broadcasting)
+        for t in valid[1:]:
+            if t.shape != base.shape:
+                return base
+
+        # Avoid meaningless averages
+        if not torch.any(base != 0):
+            return base
+
+        out = sum(valid) / float(len(valid))
+
+        return out.to(
+            dtype=cmn.get_dtype(),
+            device=cmn.get_device()
+        )
+
     
 class Normalize(Operation):
     """
@@ -988,23 +1341,54 @@ class Normalize(Operation):
       • L2 normalizes entire tensor
       • EXPERIMENTAL / DESTRUCTIVE
       • Should never run on production merges
+      • NOT cacheable
     """
 
     FORBIDDEN_PATTERNS = (
         "",  # default deny: forbid everything unless overridden
     )
 
-    @multi_cache_operation
+    def __init__(self, key, *sources):
+        super().__init__(key, *sources)
+        self.disable_cache = True  # 🚨 mandatory
+
     def oper(self, *tensors):
-        t = tensors[0] if tensors else None
-        if not isinstance(t, torch.Tensor) or not t.is_floating_point():
+        if not tensors:
+            return None
+
+        t = tensors[0]
+
+        # -------------------------------------------------
+        # Key-level default deny
+        # -------------------------------------------------
+        if self.FORBIDDEN_PATTERNS and any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return t
+
+        # -------------------------------------------------
+        # Tensor safety
+        # -------------------------------------------------
+        if not isinstance(t, torch.Tensor):
+            return t
+
+        if not t.is_floating_point():
+            return t
+
+        # 🚨 Scalar tensors forbidden
+        if t.ndim == 0:
+            return None
+
+        if t.numel() == 0:
             return t
 
         norm = t.norm()
         if norm <= 1e-8:
             return t
 
-        return (t / norm).to(cmn.get_dtype())
+        return (t / norm).to(
+            dtype=cmn.get_dtype(),
+            device=cmn.get_device()
+        )
+
 
 
 class ReBasin(Operation):
@@ -1019,6 +1403,7 @@ class ReBasin(Operation):
       • Experimental, highly aggressive
       • Must NEVER touch control, routing, or embeddings
       • Preserves primary semantics on refusal
+      • NOT cacheable
     """
 
     FORBIDDEN_PATTERNS = (
@@ -1063,8 +1448,8 @@ class ReBasin(Operation):
     def __init__(self, key, alpha, a, b):
         super().__init__(key, a, b)
         self.alpha = float(alpha)
+        self.disable_cache = True  # 🚨 required
 
-    @multi_cache_operation
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
@@ -1072,53 +1457,64 @@ class ReBasin(Operation):
         a = tensors[0]
         b = tensors[1] if len(tensors) > 1 else a
 
-        # -------------------------------------------------
+        # -----------------------------
         # Key-level semantic guard
-        # -------------------------------------------------
+        # -----------------------------
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return a
 
-        # -------------------------------------------------
+        # -----------------------------
         # Tensor-level safety
-        # -------------------------------------------------
+        # -----------------------------
         if not isinstance(a, torch.Tensor):
             return a
 
         if not a.is_floating_point():
             return a
 
+        # 🚨 Scalar tensors forbidden
+        if a.ndim == 0:
+            return None
+
         if a.shape != b.shape:
             print(f"[ReBasin] Shape mismatch skipped: {self.key}")
             return a
 
-        # -------------------------------------------------
+        if a.numel() < 2:
+            return a
+
+        if not torch.any(a != 0):
+            return a
+
+        # -----------------------------
         # Alpha safety
-        # -------------------------------------------------
+        # -----------------------------
         alpha = max(0.0, min(1.0, self.alpha))
         if alpha <= 0.0:
             return a
-        if alpha >= 1.0:
-            # full rebasin from b
-            source = b
-        else:
-            source = b
 
-        # -------------------------------------------------
+        # -----------------------------
         # Distributional rebasing
-        # -------------------------------------------------
-        a_flat = a.flatten()
-        b_flat = source.flatten()
+        # -----------------------------
+        try:
+            a_flat = a.flatten()
+            b_flat = b.flatten()
 
-        a_sorted, a_idx = torch.sort(a_flat)
-        b_sorted = torch.sort(b_flat).values
+            a_sorted, a_idx = torch.sort(a_flat)
+            b_sorted = torch.sort(b_flat).values
 
-        merged_sorted = torch.lerp(a_sorted, b_sorted, alpha)
+            merged_sorted = torch.lerp(a_sorted, b_sorted, alpha)
 
-        # Restore original ordering
-        rebased = torch.empty_like(merged_sorted)
-        rebased[a_idx] = merged_sorted
+            # Restore original ordering
+            rebased = torch.empty_like(merged_sorted)
+            rebased[a_idx] = merged_sorted
 
-        return rebased.view_as(a).to(a.dtype)
+            return rebased.view_as(a).to(a.dtype)
+
+        except Exception:
+            # Absolute safety: preserve base on any failure
+            return a
+
 
 
 
@@ -1134,9 +1530,9 @@ class DeMe(Operation):
       • Useful for feature refinement
       • Dangerous for control signals and embeddings
       • Preserves base semantics on refusal
+      • NOT cacheable
     """
 
-    # DeMe must not touch control or semantic glue
     FORBIDDEN_PATTERNS = (
         # Temporal / noise control
         "time_embed",
@@ -1166,8 +1562,8 @@ class DeMe(Operation):
     def __init__(self, key, alpha, a, b):
         super().__init__(key, a, b)
         self.alpha = float(alpha)
+        self.disable_cache = True  # 🚨 required
 
-    @multi_cache_operation
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
@@ -1175,44 +1571,59 @@ class DeMe(Operation):
         a = tensors[0]
         b = tensors[1] if len(tensors) > 1 else a
 
-        # -------------------------------------------------
+        # -----------------------------
         # Key-level semantic guard
-        # -------------------------------------------------
+        # -----------------------------
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return a
 
-        # -------------------------------------------------
+        # -----------------------------
         # Tensor-level safety
-        # -------------------------------------------------
+        # -----------------------------
         if not isinstance(a, torch.Tensor):
             return a
 
         if not a.is_floating_point():
             return a
 
+        # 🚨 Scalar tensors forbidden
+        if a.ndim == 0:
+            return None
+
         if a.shape != b.shape:
             print(f"[DeMe] Shape mismatch skipped: {self.key}")
             return a
 
-        # -------------------------------------------------
+        if a.numel() == 0 or not torch.any(a != 0):
+            return a
+
+        # Must have a feature axis
+        if a.ndim < 2:
+            return a
+
+        # -----------------------------
         # Alpha safety
-        # -------------------------------------------------
+        # -----------------------------
         alpha = max(0.0, min(1.0, self.alpha))
         if alpha <= 0.0:
             return a
 
-        # -------------------------------------------------
+        # -----------------------------
         # Variance-based decoupling
-        # -------------------------------------------------
-        var_a = torch.var(a, dim=-1, keepdim=True)
-        var_b = torch.var(b, dim=-1, keepdim=True)
+        # -----------------------------
+        try:
+            var_a = torch.var(a, dim=-1, keepdim=True)
+            var_b = torch.var(b, dim=-1, keepdim=True)
+        except Exception:
+            return a
 
         decoupled = torch.where(var_a > var_b, a, b)
 
-        # -------------------------------------------------
+        # -----------------------------
         # Blend back toward primary
-        # -------------------------------------------------
+        # -----------------------------
         return torch.lerp(a, decoupled, alpha).to(a.dtype)
+
 
 
 
@@ -1225,9 +1636,9 @@ class BlockWeighted(Operation):
       • Deterministic, depth-aware blending
       • Identity on refusal
       • Never fabricates tensors
+      • NOT cacheable
     """
 
-    # Block weighting must not touch control or glue
     FORBIDDEN_PATTERNS = (
         # Temporal / noise control
         "time_embed",
@@ -1251,11 +1662,22 @@ class BlockWeighted(Operation):
         "conditioner",
     )
 
+    # Allowed UNet block namespaces
+    BLOCK_PATTERNS = (
+        "input_blocks",
+        "output_blocks",
+        "down_blocks",
+        "up_blocks",
+        "middle_block",
+        "mid_block",
+    )
+
     def __init__(self, key, alphas, a, b):
         super().__init__(key, a, b)
-        self.alphas = list(alphas)
 
-    @multi_cache_operation
+        self.alphas = list(alphas) if alphas else []
+        self.disable_cache = True  # 🚨 required
+
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
@@ -1263,43 +1685,63 @@ class BlockWeighted(Operation):
         a = tensors[0]
         b = tensors[1] if len(tensors) > 1 else a
 
-        # -------------------------------------------------
-        # Key-level semantic guard
-        # -------------------------------------------------
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            return a
-
-        # -------------------------------------------------
+        # -----------------------------
         # Tensor-level safety
-        # -------------------------------------------------
+        # -----------------------------
         if not isinstance(a, torch.Tensor):
             return a
 
         if not a.is_floating_point():
             return a
 
+        # 🚨 Scalar tensors forbidden
+        if a.ndim == 0:
+            return None
+
         if a.shape != b.shape:
             print(f"[BlockWeighted] Shape mismatch skipped: {self.key}")
             return a
 
-        # -------------------------------------------------
-        # Block index extraction
-        # -------------------------------------------------
-        match = re.search(r'\.(\d+)\.', self.key)
-        idx = int(match.group(1)) if match else 0
+        # -----------------------------
+        # Key-level semantic guard
+        # -----------------------------
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return a
+
+        key_lower = self.key.lower()
+
+        # Must be a known UNet block
+        if not any(p in key_lower for p in self.BLOCK_PATTERNS):
+            return a
+
+        # -----------------------------
+        # Block index extraction (strict)
+        # -----------------------------
+        match = re.search(
+            r'(input_blocks|output_blocks|down_blocks|up_blocks)[._](\d+)',
+            key_lower
+        )
+
+        if not match:
+            # middle / mid blocks get their own fixed index
+            if "middle_block" in key_lower or "mid_block" in key_lower:
+                idx = len(self.alphas) // 2 if self.alphas else 0
+            else:
+                return a
+        else:
+            idx = int(match.group(2))
 
         if not self.alphas:
             return a
 
         alpha = self.alphas[min(idx, len(self.alphas) - 1)]
-
-        # Clamp alpha defensively
         alpha = max(0.0, min(1.0, float(alpha)))
 
-        # -------------------------------------------------
+        # -----------------------------
         # Linear blend
-        # -------------------------------------------------
+        # -----------------------------
         return torch.lerp(a, b, alpha).to(a.dtype)
+
 
 
 
@@ -1313,84 +1755,89 @@ class ToMe(Operation):
       • Never fabricates tensors
       • Never applies to control or weight keys
       • Preserves base semantics on refusal
+      • NOT cacheable
     """
 
-    # ToMe must never touch non-token or control keys
+    # Temporal / control only — rely on shape for safety
     FORBIDDEN_PATTERNS = (
-        # Temporal / control
         "time_embed",
         "time_embedding",
         "timestep",
         "sigma",
         "noise",
-
-        # Weights / structure
-        "weight",
-        "bias",
-        "conv",
-        "linear",
-        "proj",
-
-        # Latent encode/decode
-        "vae",
-        "encoder",
-        "decoder",
-        "first_stage_model",
     )
 
     def __init__(self, key, ratio, tensor):
         super().__init__(key, tensor)
-        self.ratio = float(ratio)
 
-    @multi_cache_operation
+        self.ratio = float(ratio)
+        self.disable_cache = True  # 🚨 required
+
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
 
-        tensor = tensors[0]
+        x = tensors[0]
 
-        # -------------------------------------------------
+        # -----------------------------
+        # Basic tensor safety
+        # -----------------------------
+        if not isinstance(x, torch.Tensor):
+            return x
+
+        if not x.is_floating_point():
+            return x
+
+        # 🚨 Scalar tensors forbidden
+        if x.ndim == 0:
+            return None
+
+        # -----------------------------
         # Key-level semantic guard
-        # -------------------------------------------------
+        # -----------------------------
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            return tensor
+            return x
 
-        # -------------------------------------------------
-        # Token-shape validation
-        # -------------------------------------------------
-        if not isinstance(tensor, torch.Tensor):
-            return tensor
+        # -----------------------------
+        # Token shape enforcement
+        # -----------------------------
+        # Must be [N, D] with N >= 2
+        if x.ndim != 2 or x.size(0) < 2:
+            return x
 
-        if not tensor.is_floating_point():
-            return tensor
-
-        # Must be token matrix [N, D]
-        if tensor.ndim != 2 or tensor.size(0) < 2:
-            return tensor
-
-        # -------------------------------------------------
+        # -----------------------------
         # Ratio validation
-        # -------------------------------------------------
-        ratio = max(0.0, min(1.0, self.ratio))
-        if ratio <= 0.0:
-            return tensor
+        # -----------------------------
+        r = max(0.0, min(1.0, self.ratio))
+        if r <= 0.0:
+            return x
 
-        N = tensor.size(0)
-        k = max(2, int(N * ratio))
+        N, D = x.shape
+        k = max(2, int(N * r))
+
         if k >= N:
-            return tensor
+            return x
 
-        # -------------------------------------------------
-        # ToMe-style merge
-        # -------------------------------------------------
+        # -----------------------------
+        # ToMe-style global merge
+        # -----------------------------
         with torch.no_grad():
-            normed = F.normalize(tensor, dim=-1)
-            sim = normed @ normed.T  # [N, N]
+            # Normalize for cosine similarity
+            normed = F.normalize(x, dim=-1)
 
-            _, indices = torch.topk(sim, k, dim=1)
-            merged = tensor[indices].mean(dim=1)
+            # Mean token as anchor (stable + cheap)
+            anchor = normed.mean(dim=0, keepdim=True)  # [1, D]
 
-        return merged.to(tensor.dtype)
+            # Similarity to anchor
+            sim = (normed @ anchor.T).squeeze(1)  # [N]
+
+            # Select top-k most representative tokens
+            _, idx = torch.topk(sim, k=k, largest=True)
+
+            merged = x[idx]
+
+        return merged.to(x.dtype)
+
 
 class AttentionMerge(Operation):
     """
@@ -1401,18 +1848,29 @@ class AttentionMerge(Operation):
       • Linear interpolation between two sources
       • Identity everywhere else
       • Never fabricates tensors
+      • Never propagates scalars
+      • NOT cached (input + alpha dependent)
     """
     def __init__(self, key, alpha, a, b):
         super().__init__(key, a, b)
-        self.alpha = float(alpha)
 
-    @multi_cache_operation
+        self.alpha = float(alpha)
+        self.disable_cache = True  # 🚨 critical: do not cache
+
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
 
         a = tensors[0]
         b = tensors[1] if len(tensors) > 1 else a
+
+        # Type safety
+        if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+            return a
+
+        # 🚨 Scalar tensors must never propagate
+        if a.ndim == 0 or b.ndim == 0:
+            return None
 
         # Only act on attention-related layers
         key_lower = self.key.lower()
@@ -1440,12 +1898,15 @@ class Smooth(Operation):
     1D Gaussian smoothing conditioner.
 
     • Single-tensor only
-    • Identity on failure
+    • Refuses scalars (never propagate 0-dim tensors)
     • Floating-point only
-    • Deterministic and safe
+    • NOT cached (depends on sigma/kernel + input tensor values)
     """
-    def __init__(self, key, tensor, kernel_size=5, sigma=1.0):
+    def __init__(self, key, tensor=None, kernel_size=5, sigma=1.0):
         super().__init__(key, tensor)
+
+        self.disable_cache = True  # 🚨 critical: do NOT cache conditioners
+
         self.kernel_size = int(kernel_size)
         self.sigma = float(sigma)
 
@@ -1454,12 +1915,18 @@ class Smooth(Operation):
             self.kernel_size += 1
         self.kernel_size = max(3, min(self.kernel_size, 31))
 
-    @multi_cache_operation
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
 
         tensor = tensors[0]
+
+        if not isinstance(tensor, torch.Tensor):
+            return None
+
+        # 🚨 scalar tensors must never propagate
+        if tensor.ndim == 0:
+            return None
 
         # Conditioner never modifies non-floating tensors
         if not tensor.is_floating_point():
@@ -1474,30 +1941,41 @@ class Smooth(Operation):
         sigma = self.sigma
         center = size // 2
 
-        x = torch.arange(size, device=device, dtype=dtype)
+        # Build kernel in float32 for numerical stability, then cast
+        x = torch.arange(size, device=device, dtype=torch.float32)
         kernel = torch.exp(-0.5 * ((x - center) / (sigma + 1e-12)) ** 2)
-        kernel /= kernel.sum()
-        kernel = kernel.view(1, 1, -1)
+        kernel = kernel / kernel.sum()
+        kernel = kernel.to(dtype=dtype).view(1, 1, -1)
 
         orig_shape = tensor.shape
 
         # Flatten → smooth → restore
-        x = tensor.flatten().unsqueeze(0).unsqueeze(0)
-        x = F.pad(x, (center, center), mode="replicate")
-        smoothed = F.conv1d(x, kernel)
-        smoothed = smoothed.squeeze(0).squeeze(0)
+        xf = tensor.flatten().unsqueeze(0).unsqueeze(0)
+        xf = F.pad(xf, (center, center), mode="replicate")
+        smoothed = F.conv1d(xf, kernel).squeeze(0).squeeze(0)
 
         return smoothed.view(orig_shape).to(dtype)
 
+
 class SmoothConv(Operation):
     """
-    Smart hybrid smoothing:
+    Smart hybrid smoothing (conditioner):
+
       • Conv2d weights (4D) → 2D Gaussian
       • Linear / attention / other (>=2D) → 1D Gaussian
-      • Everything else → pass-through
+      • Everything else → refusal / passthrough
+
+    NOTE:
+      • Conditioner, not a merge operator
+      • Must NOT be cached
+      • Must NOT propagate scalars
     """
+
     def __init__(self, key, sigma=1.0, kernel_size=None, tensor=None):
         super().__init__(key, tensor)
+
+        self.disable_cache = True  # 🚨 critical
+
         self.sigma = float(sigma)
         self.kernel_size = kernel_size or (max(3, int(4 * self.sigma + 1)) | 1)
 
@@ -1507,12 +1985,19 @@ class SmoothConv(Operation):
         if self.kernel_size % 2 == 0:
             self.kernel_size += 1
 
-    @multi_cache_operation
     def oper(self, *tensors):
         if not tensors or tensors[0] is None:
             return None
 
         tensor = tensors[0]
+
+        # Must be tensor
+        if not isinstance(tensor, torch.Tensor):
+            return None
+
+        # 🚨 Scalar tensors must never propagate
+        if tensor.ndim == 0:
+            return None
 
         # Conditioner never modifies non-floating tensors
         if not tensor.is_floating_point():
@@ -1559,8 +2044,10 @@ class SmoothConv(Operation):
         return smoothed.to(dtype)
 
     def _smooth_1d(self, tensor):
-        # Delegates to existing Smooth operator (1D Gaussian)
+        # Delegate carefully; Smooth must also be non-cached & scalar-safe
+        from scripts.untitled.operators import Smooth
         return Smooth(self.key, tensor).oper(tensor)
+
 
     
 class COPY(Operation):
@@ -1609,7 +2096,7 @@ class COPY(Operation):
         # -------------------------------------------------
         # Key-level safety (absolute refusal)
         # -------------------------------------------------
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+        if self.FORBIDDEN_PATTERNS and any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
         # -------------------------------------------------
@@ -1627,16 +2114,18 @@ class COPY(Operation):
         if not isinstance(t, torch.Tensor):
             return base
 
+        # Scalar tensors must never propagate
+        if t.ndim == 0:
+            return base
+
         if not self.allow_non_floating and not t.is_floating_point():
             return base
 
         # -------------------------------------------------
-        # Defensive clone + normalize
+        # Verbatim preservation
+        # (NO clone, NO device, NO dtype)
         # -------------------------------------------------
-        return t.clone().to(
-            dtype=cmn.get_dtype(),
-            device=cmn.get_device()
-        )
+        return t
 
 
 class LERP(Operation):
@@ -1670,52 +2159,75 @@ class LERP(Operation):
     def __init__(self, key, weights, *sources):
         super().__init__(key, *sources)
 
-        # Defensive weight handling
-        weights = list(weights) if weights else []
-        total = sum(w for w in weights if w > 0.0)
+        if not weights:
+            self.weights = []
+            return
 
+        w = [float(x) for x in weights]
+        if len(w) < len(sources):
+            w += [0.0] * (len(sources) - len(w))
+
+        # Normalize positive weights only
+        total = sum(x for x in w if x > 0.0)
         if total <= 0.0:
-            # Refuse safely; base semantics preserved in oper()
             self.weights = []
         else:
-            self.weights = [w / total for w in weights]
+            self.weights = [x / total if x > 0.0 else 0.0 for x in w]
 
-        # Pad to source count
-        self.weights += [0.0] * (len(sources) - len(self.weights))
-
+    # -------------------------------------------------
+    # Merge
+    # -------------------------------------------------
     @multi_cache_operation
     def oper(self, *tensors):
+        # ❗ Never invent tensors
+        if not tensors:
+            return None
+
         base = tensors[0]
 
-        # ── Semantic refusal ──
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+        # Operator-level semantic guard
+        if self.FORBIDDEN_PATTERNS and any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
-        # LERP only applies to floating-point tensors
-        if not base.is_floating_point():
+        # Must be floating-point tensor
+        if not isinstance(base, torch.Tensor) or not base.is_floating_point():
             return base
 
-        # Collect valid same-shape contributors
-        contributors = [
-            (t, w)
-            for t, w in zip(tensors, self.weights)
-            if (
-                isinstance(t, torch.Tensor)
-                and t.is_floating_point()
-                and t.shape == base.shape
-                and w > 0.0
-            )
-        ]
+        # -------------------------------------------------
+        # Collect valid contributors
+        # -------------------------------------------------
+        valid = []
+        wts = []
 
-        if not contributors:
+        for t, w in zip(tensors, self.weights):
+            if w <= 0.0:
+                continue
+            if not isinstance(t, torch.Tensor):
+                continue
+            if not t.is_floating_point():
+                continue
+            if t.shape != base.shape:
+                continue
+            if t.numel() == 0:
+                continue
+
+            valid.append(t)
+            wts.append(w)
+
+        if not valid:
             return base
+        if len(valid) == 1:
+            return valid[0]
 
+        # -------------------------------------------------
         # Linear blend
-        merged = torch.zeros_like(base)
-        for t, w in contributors:
-            merged += t * w
+        # -------------------------------------------------
+        out = torch.zeros_like(base)
+        for t, w in zip(valid, wts):
+            out += t * w
 
-        return merged.to(base.dtype)
+        return out.to(base.dtype)
+
 
 class LERPMEAN(Operation):
     """
@@ -1746,62 +2258,74 @@ class LERPMEAN(Operation):
         temperature=1.0,    # 1.0 = raw weights, <1 sharpens, >1 flattens
     ):
         super().__init__(key, *sources)
+
         self.mix = float(mix)
         self.temperature = float(temperature)
 
+        # -------------------------------------------------
         # Normalize weights safely
+        # -------------------------------------------------
         if not weights:
             raise ValueError("LERPMEAN requires weights (at least one)")
 
         w = [float(x) for x in weights]
+
         # Pad weights to number of sources
         if len(w) < len(sources):
-            w = w + [0.0] * (len(sources) - len(w))
+            w += [0.0] * (len(sources) - len(w))
 
-        # Apply temperature (still linear, just reweighting)
-        # - if temperature < 1, emphasizes larger weights
-        # - if temperature > 1, flattens weights
+        # Apply temperature reweighting
         if self.temperature != 1.0:
-            # keep sign and avoid weird negatives
             w = [max(0.0, x) for x in w]
             eps = 1e-12
-            w = [(x + eps) ** (1.0 / max(self.temperature, eps)) for x in w]
+            t = max(self.temperature, eps)
+            w = [(x + eps) ** (1.0 / t) for x in w]
 
         total = sum(w)
         if total <= 0.0:
-            # If user gave all zeros, default to primary-dominant
+            # Primary-dominant fallback
             w = [1.0] + [0.0] * (len(sources) - 1)
             total = 1.0
 
         self.weights = [x / total for x in w]
 
+    # -------------------------------------------------
+    # Merge
+    # -------------------------------------------------
     @multi_cache_operation
     def oper(self, *tensors):
+        # ❗ NEVER invent tensors — refuse cleanly
         if not tensors:
-            return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
+            return None
 
         base = tensors[0]
 
-        # Optional operator-level gate (soft guardrail)
+        # Optional operator-level soft gate
         if self.FORBIDDEN_PATTERNS and any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
-        # Must be float to merge meaningfully
+        # Must be a floating-point tensor to merge meaningfully
         if not isinstance(base, torch.Tensor) or not base.is_floating_point():
             return base
 
-        # Collect same-shape float tensors with nonzero weights
+        # -------------------------------------------------
+        # Collect valid contributors
+        # -------------------------------------------------
         valid = []
         wts = []
+
         for t, w in zip(tensors, self.weights):
             if w <= 0.0:
                 continue
-            if not isinstance(t, torch.Tensor) or not t.is_floating_point():
+            if not isinstance(t, torch.Tensor):
+                continue
+            if not t.is_floating_point():
                 continue
             if t.shape != base.shape:
                 continue
             if t.numel() == 0:
                 continue
+
             valid.append(t)
             wts.append(w)
 
@@ -1810,19 +2334,26 @@ class LERPMEAN(Operation):
         if len(valid) == 1:
             return valid[0]
 
+        # -------------------------------------------------
         # MEAN path (stability)
+        # -------------------------------------------------
         mean_out = torch.mean(torch.stack(valid, dim=0), dim=0)
 
-        # LERP path (identity-preserving weighted blend)
+        # -------------------------------------------------
+        # LERP path (identity-preserving)
+        # -------------------------------------------------
         lerp_out = torch.zeros_like(base)
         for t, w in zip(valid, wts):
             lerp_out += t * w
 
-        # Blend between them (bounded)
+        # -------------------------------------------------
+        # Final blend
+        # -------------------------------------------------
         mix = float(max(0.0, min(1.0, self.mix)))
         out = torch.lerp(mean_out, lerp_out, mix)
 
         return out.to(base.dtype)
+
     
 class AdaptiveLERP(Operation):
     """
@@ -1850,8 +2381,10 @@ class AdaptiveLERP(Operation):
         agree_power=1.0,
         var_power=1.0,
         eps=1e-8,
+        disable_cache: bool = True,   # ✅ safest default
     ):
         super().__init__(key, *sources)
+        self.disable_cache = bool(disable_cache)
 
         self.base_mix = float(max(0.0, min(1.0, base_mix)))
         self.confidence = float(max(0.0, min(1.0, confidence)))
@@ -1873,6 +2406,7 @@ class AdaptiveLERP(Operation):
         if len(w) < len(sources):
             w += [0.0] * (len(sources) - len(w))
 
+        # Temperature shaping
         if self.temperature != 1.0:
             w = [max(0.0, x) for x in w]
             t = max(self.temperature, 1e-12)
@@ -1890,49 +2424,59 @@ class AdaptiveLERP(Operation):
     # -------------------------------------------------
     def _depth_bias_from_key(self, key: str):
         import re
-
         m = re.search(r'\.(\d+)\.', key)
         if not m:
             if "middle" in key:
                 return 1.05
             return 1.0
-
         idx = int(m.group(1))
         bias = 0.85 + 0.1 * (idx ** 0.5)
         return float(max(0.7, min(1.15, bias)))
 
     @multi_cache_operation
     def oper(self, *tensors):
+        # ✅ Refuse instead of returning scalar tensors
         if not tensors:
-            return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
+            return None
 
         base = tensors[0]
+        base = self.validate_base(base)
+        if base is None:
+            return None
 
         if not isinstance(base, torch.Tensor) or not base.is_floating_point():
             return base
 
+        # Filter valid contributors by shape + weight
         valid, wts = [], []
         for t, w in zip(tensors, self.weights):
-            if w > 0.0 and isinstance(t, torch.Tensor) and t.is_floating_point() and t.shape == base.shape:
+            if (
+                w > 0.0
+                and isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.shape == base.shape
+                and t.numel() > 0
+            ):
                 valid.append(t)
-                wts.append(w)
+                wts.append(float(w))
 
         if not valid:
             return base
         if len(valid) == 1:
             return valid[0]
 
+        # MEAN candidate
         mean_out = torch.mean(torch.stack(valid, dim=0), dim=0)
 
-        lerp_out = torch.zeros_like(base)
+        # Weighted LERP candidate
+        lerp_out = torch.zeros_like(mean_out)
         for t, w in zip(valid, wts):
-            lerp_out += t * w
+            lerp_out = lerp_out + (t * w)
 
         if self.base_mix <= 0.0:
             return mean_out.to(base.dtype)
 
-        if base.ndim == 0:
-            return torch.lerp(mean_out, lerp_out, self.base_mix).to(base.dtype)
+        # From here on, base is guaranteed non-scalar by validate_base()
 
         C = base.shape[0]
         reduce_dims = tuple(range(1, base.ndim)) if base.ndim > 1 else None
@@ -1940,6 +2484,7 @@ class AdaptiveLERP(Operation):
         mean_base_f = mean_out.float()
         deltas = [(t.float() - mean_base_f) for t in valid]
 
+        # Agreement: cosine similarity vs ref delta (channel-wise)
         ref = deltas[0]
         ref_flat = ref.flatten(start_dim=1) if base.ndim > 1 else ref.unsqueeze(1)
         ref_norm = ref_flat.norm(dim=-1).clamp_min(self.eps)
@@ -1951,14 +2496,19 @@ class AdaptiveLERP(Operation):
             cos = ((df * ref_flat).sum(dim=-1) / (dn * ref_norm)).clamp(-1.0, 1.0)
             sims.append(cos)
 
-        agree = torch.mean(torch.stack(sims), dim=0) if sims else torch.ones(C, device=base.device)
+        if sims:
+            agree = torch.mean(torch.stack(sims, dim=0), dim=0)
+        else:
+            agree = torch.ones(C, device=base.device)
+
         agree = ((agree + 1.0) * 0.5).clamp(0.0, 1.0)
         agree = agree ** self.agree_power
 
-        stacked = torch.stack(deltas, dim=0)
+        # Variance safety: higher variance => lower aggression
+        stacked = torch.stack(deltas, dim=0)  # [M, ...]
         var = stacked.var(dim=0)
         if reduce_dims:
-            var = var.mean(dim=reduce_dims)
+            var = var.mean(dim=reduce_dims)   # -> [C]
 
         var_safe = (1.0 / (1.0 + var)).clamp_min(0.0) ** self.var_power
 
@@ -1967,12 +2517,11 @@ class AdaptiveLERP(Operation):
         depth_bias = self._depth_bias_from_key(self.key)
 
         mix_c = (self.base_mix * A * depth_bias).clamp(self.mix_min, self.mix_max)
-
         mix_view = mix_c.view(C, *([1] * (base.ndim - 1)))
+
         out = mean_out + (lerp_out - mean_out) * mix_view
         return out.to(base.dtype)
-
-
+    
 class TIES(Operation):
     """
     TIES (Top-Influence Exclusive Selection):
@@ -1986,156 +2535,6 @@ class TIES(Operation):
       • Excellent for structural alignment and decisive feature adoption
       • Extremely aggressive (single-winner semantics)
       • Dangerous for control signals, normalization, and embeddings
-      • Must NEVER touch temporal control, noise scale, or semantic glue
-    """
-
-    # ─────────────────────────────────────────────
-    # TIES-SPECIFIC FORBIDDEN KEYS
-    # (single-winner logic breaks semantics & stability)
-    # ─────────────────────────────────────────────
-    FORBIDDEN_PATTERNS = (
-        # Timestep / temporal conditioning
-        "time_embed.",
-        "time_embedding",
-        "timestep",
-        "time_in.",
-
-        # Noise / sigma control
-        "sigma",
-        "noise",
-
-        # Early signal injection (winner dominance is catastrophic)
-        "conv_in.",
-        "input_blocks.0.",
-
-        # Residual routing (breaks information pathways)
-        "skip_connection",
-
-        # Latent encode / decode stability
-        "first_stage_model.",
-        "vae.",
-        "encoder.",
-        "decoder.",
-
-        # Semantic embeddings (single winner ≠ meaning)
-        "text_model.",
-        "cond_stage_model.",
-        "conditioner.",
-        "token_embedding",
-        "position_embedding",
-
-        # Normalization / scaling layers (TIES is especially unsafe here)
-        "layer_norm",
-        "scale_shift",
-        "affine",
-        "ln_",          # keep if your keys use ln_ prefixes
-        "norm",         # remove later if you decide to allow it
-    )
-
-    def __init__(self, key, *sources, density, seed=42):
-        super().__init__(key, *sources)
-        self.density = float(density)
-        self.seed = int(seed)
-
-    @multi_cache_operation
-    def oper(self, *tensors):
-        # ─────────────────────────────────────────
-        # Operator-level semantic guard
-        # ─────────────────────────────────────────
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            return tensors[0]
-
-        base = tensors[0]
-
-        # TIES only applies to floating-point tensors
-        if not base.is_floating_point():
-            return base
-
-        # Density edge cases
-        if self.density <= 0.0:
-            return base
-
-        # Collect valid same-shape floating contributors (including base)
-        valid = [
-            t for t in tensors
-            if (
-                t.numel() > 0
-                and torch.any(t != 0)
-                and t.is_floating_point()
-                and t.shape == base.shape
-            )
-        ]
-        if len(valid) <= 1:
-            return base
-
-        others = valid[1:]
-        if not others:
-            return base
-
-        # Deterministic behavior
-        torch.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
-
-        deltas = [t - base for t in others]
-        if not deltas:
-            return base
-
-        # ─────────────────────────────────────────
-        # Select ONE winning delta (global)
-        # ─────────────────────────────────────────
-        delta_norms = torch.stack([d.norm(p=2) for d in deltas])
-        winner_idx = int(torch.argmax(delta_norms))
-        winning_delta = deltas[winner_idx]
-
-        # If the winning delta is effectively zero, refuse
-        if not torch.any(winning_delta):
-            return base
-
-        abs_delta = winning_delta.abs()
-
-        # Top-k mask
-        k = max(1, int(self.density * abs_delta.numel()))
-        threshold = torch.topk(abs_delta.flatten(), k).values[-1]
-        mask = abs_delta >= threshold
-
-        if not torch.any(mask):
-            return base
-
-        # ─────────────────────────────────────────
-        # Sign resolution (safer + simpler)
-        # ─────────────────────────────────────────
-        # If winning_delta is 0 at a location, do nothing there.
-        # Otherwise apply sign from winning_delta.
-        sign = torch.sign(winning_delta)
-        safe_delta = winning_delta * mask.to(winning_delta.dtype)  # keep native sign
-
-        # ─────────────────────────────────────────
-        # Apply delta with bounded scale
-        # ─────────────────────────────────────────
-        out = base + safe_delta
-
-        # Norm preservation (bounded)
-        sd_norm = safe_delta.norm(p=2)
-        wd_norm = winning_delta.norm(p=2)
-        if sd_norm > 1e-8 and wd_norm > 0.0:
-            scale = (wd_norm / (sd_norm + 1e-8)).clamp(max=10.0)
-            out = base + safe_delta * scale
-
-        return out.to(base.dtype)
-
-
-class WISE(Operation):
-    """
-    N-way WISE (Winner-Index Sparse Energy):
-
-      • Selects per-element strongest delta among contributors
-      • Top-k mask with optional dropout
-      • Random scaling on masked entries (intrinsic)
-      • Energy preservation (bounded)
-
-    Semantic contract:
-      • Excellent for sharpening / emphasizing dominant features
-      • Highly aggressive and non-linear
-      • Dangerous for control signals and embeddings
       • Must NEVER touch temporal control, noise scale, or semantic glue
     """
 
@@ -2169,125 +2568,308 @@ class WISE(Operation):
         "conditioner.",
         "token_embedding",
         "position_embedding",
+
+        # Normalization / scaling layers
+        "layer_norm",
+        "scale_shift",
+        "affine",
+        "ln_",
+        "norm",
+    )
+
+    def __init__(self, key, *sources, density, seed=42):
+        super().__init__(key, *sources)
+        self.density = float(density)
+        self.seed = int(seed)
+
+    @multi_cache_operation
+    def oper(self, *tensors):
+        # -------------------------------------------------
+        # Absolute safety: need a base
+        # -------------------------------------------------
+        if not tensors:
+            return None
+
+        base = tensors[0]
+        if base is None:
+            return None
+
+        if not isinstance(base, torch.Tensor):
+            return base
+
+        # Scalar tensors are forbidden in your pipeline → refuse safely
+        if base.ndim == 0 or base.numel() == 0:
+            return base
+
+        # -------------------------------------------------
+        # Operator-level semantic guard
+        # -------------------------------------------------
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return base
+
+        # Floating-point only
+        if not base.is_floating_point():
+            return base
+
+        # Density edge cases
+        if self.density <= 0.0:
+            return base
+
+        # -------------------------------------------------
+        # Collect valid same-shape floating contributors (including base)
+        # -------------------------------------------------
+        valid = [
+            t for t in tensors
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.shape == base.shape
+                and t.numel() > 0
+            )
+        ]
+        if len(valid) <= 1:
+            return base
+
+        others = valid[1:]
+        if not others:
+            return base
+
+        # Deterministic behavior per key
+        torch.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
+
+        deltas = [t - base for t in others]
+
+        # If all deltas are effectively zero, refuse
+        # (cheap aggregate check)
+        delta_norms = torch.stack([d.norm(p=2) for d in deltas])
+        if delta_norms.numel() == 0 or float(delta_norms.max().item()) <= 1e-12:
+            return base
+
+        # -------------------------------------------------
+        # Select ONE winning delta (global)
+        # -------------------------------------------------
+        winner_idx = int(torch.argmax(delta_norms).item())
+        winning_delta = deltas[winner_idx]
+
+        if not torch.any(winning_delta):
+            return base
+
+        abs_delta = winning_delta.abs()
+
+        # Top-k mask
+        k = max(1, int(self.density * abs_delta.numel()))
+        k = min(k, abs_delta.numel())
+
+        threshold = torch.topk(abs_delta.flatten(), k).values[-1]
+        mask = abs_delta >= threshold
+
+        if not torch.any(mask):
+            return base
+
+        # Keep native sign, apply sparsity
+        sparse_delta = winning_delta * mask.to(winning_delta.dtype)
+
+        # -------------------------------------------------
+        # Norm preservation (bounded)
+        # -------------------------------------------------
+        sd_norm = sparse_delta.norm(p=2)
+        wd_norm = winning_delta.norm(p=2)
+
+        if sd_norm > 1e-8 and wd_norm > 0.0:
+            scale = (wd_norm / (sd_norm + 1e-8)).clamp(max=10.0)
+            sparse_delta = sparse_delta * scale
+
+        out = base + sparse_delta
+        return out.to(base.dtype)
+
+
+class WISE(Operation):
+    """
+    N-way WISE (Winner-Index Sparse Energy):
+
+      • Selects per-element strongest delta among contributors
+      • Top-k mask with optional dropout
+      • Random scaling on masked entries (intrinsic)
+      • Energy preservation (bounded)
+    """
+
+    FORBIDDEN_PATTERNS = (
+        "time_embed.",
+        "time_embedding",
+        "timestep",
+        "time_in.",
+        "sigma",
+        "noise",
+        "conv_in.",
+        "input_blocks.0.",
+        "skip_connection",
+        "first_stage_model.",
+        "vae.",
+        "encoder.",
+        "decoder.",
+        "text_model.",
+        "cond_stage_model.",
+        "conditioner.",
+        "token_embedding",
+        "position_embedding",
     )
 
     def __init__(self, key, density, dropout_p=0.3, seed=42, *sources):
         super().__init__(key, *sources)
         self.density = float(density)
         self.dropout_p = float(dropout_p)
-        self.seed = int(seed)
+        self.seed = int(seed)  # IMPORTANT: this overwrites Operation.seed, so cache uses it
+
+        # Optional: if you want extra safety, you can disable caching:
+        # self.disable_cache = True
+
+    # IMPORTANT: include density/dropout in cache identity if caching stays ON
+    def __hash__(self):
+        return hash((
+            self.key,
+            self.density,
+            self.dropout_p,
+            self.seed,
+            self.sources,
+        ))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, WISE)
+            and self.key == other.key
+            and self.density == other.density
+            and self.dropout_p == other.dropout_p
+            and self.seed == other.seed
+            and self.sources == other.sources
+        )
 
     @multi_cache_operation
     def oper(self, *tensors):
+        if not tensors:
+            return None
+
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return tensors[0]
 
-        base = tensors[0]
-        if not base.is_floating_point():
-            return base
+        base0 = tensors[0]
+        base0 = self.validate_base(base0)
+        if base0 is None:
+            return None
 
-        if self.density <= 0.0:
-            return base
+        if not isinstance(base0, torch.Tensor) or not base0.is_floating_point():
+            return base0
 
-        valid = [
-            t for t in tensors
+        density = max(0.0, min(1.0, float(self.density)))
+        dropout_p = max(0.0, min(1.0, float(self.dropout_p)))
+
+        if density <= 0.0:
+            return base0
+
+        out_dtype = base0.dtype
+        device = base0.device
+
+        # Collect valid contributors (same-shape, float, non-empty)
+        valid = []
+        for t in tensors:
             if (
-                t.numel() > 0
-                and torch.any(t != 0)
+                isinstance(t, torch.Tensor)
                 and t.is_floating_point()
-                and t.shape == base.shape
-            )
-        ]
+                and t.shape == base0.shape
+                and t.numel() > 0
+            ):
+                valid.append(t)
+
         if len(valid) <= 1:
-            return base
+            return base0
 
+        # WISE uses contributors beyond base
         contributors = valid[1:]
+        if not contributors:
+            return base0
 
-        if self.density >= 1.0:
-            deltas = [t - base for t in contributors]
+        # Work in float32 for stability
+        base = base0.float()
+        contrib_f = [t.float() for t in contributors]
+
+        # Density >= 1.0: "winner takes all" by largest delta norm
+        if density >= 1.0:
+            deltas = [t - base for t in contrib_f]
             norms = torch.stack([d.norm(p=2) for d in deltas])
-            return contributors[int(torch.argmax(norms))].to(base.dtype)
+            winner = int(torch.argmax(norms).item())
+            return contributors[winner].to(dtype=out_dtype)
 
-        torch.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
+        # Thread-safe deterministic RNG
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
 
-        deltas = [t - base for t in contributors]
+        # Compute deltas stack: [M, ...]
+        deltas = torch.stack([t - base for t in contrib_f], dim=0)
+        abs_deltas = deltas.abs()
 
-        abs_deltas = torch.stack([d.abs() for d in deltas], dim=0)
-        max_mag, best = torch.max(abs_deltas, dim=0)
+        # Per-element winning contributor index
+        max_mag, best = abs_deltas.max(dim=0)  # max_mag: [...], best: [...]
 
-        k = max(1, int(self.density * max_mag.numel()))
-        threshold = torch.topk(max_mag.flatten(), k).values[-1]
-        mask = max_mag >= threshold
+        # Top-k mask by magnitude
+        k = max(1, int(density * max_mag.numel()))
+        flat = max_mag.reshape(-1)
+        threshold = torch.topk(flat, k, largest=True, sorted=False).values.min()
+        mask = (max_mag >= threshold)
 
-        if self.dropout_p > 0.0:
-            keep = 1.0 - self.dropout_p
-            mask &= torch.bernoulli(torch.full_like(mask.float(), keep)).bool()
+        # Optional dropout on mask (thread-safe)
+        if dropout_p > 0.0:
+            keep = 1.0 - dropout_p
+            drop_mask = torch.rand(mask.shape, generator=gen, device=device) < keep
+            mask = mask & drop_mask
 
-        if not torch.any(mask):
-            return base
+        if not bool(mask.any().item()):
+            return base0
 
-        winning_delta = deltas[0]
-        for i in range(1, len(deltas)):
-            winning_delta = torch.where(best == i, deltas[i], winning_delta)
+        # Select winning delta per element using gather
+        # gather expects index shape with leading dim=1 for dim=0 gather
+        winning_delta = deltas.gather(0, best.unsqueeze(0)).squeeze(0)
 
-        # Intrinsic random scaling (bounded, deterministic)
-        scale = torch.ones_like(winning_delta)
-        n = int(mask.sum().item())
-        scale_vals = torch.empty(n, device=scale.device).uniform_(0.5, 2.0)
-        scale[mask] = scale_vals
+        # Intrinsic random scaling on masked entries (bounded, deterministic)
+        # scale in [0.5, 2.0]
+        rand = torch.rand(mask.shape, generator=gen, device=device, dtype=torch.float32)
+        scale = 0.5 + 1.5 * rand
 
         wise_delta = winning_delta * mask.to(winning_delta.dtype) * scale
 
-        total_energy = sum(d.norm(p=2) for d in deltas)
+        # Energy normalization (safety-capped)
+        total_energy = deltas.norm(p=2, dim=tuple(range(1, deltas.ndim))).sum()  # scalar
         wd_norm = wise_delta.norm(p=2)
-        if wd_norm > 1e-8 and total_energy > 0.0:
-            wise_delta *= (total_energy / (wd_norm + 1e-8)).clamp(max=10.0)
 
-        return (base + wise_delta).to(base.dtype)
+        if wd_norm.item() > 1e-8 and total_energy.item() > 0.0:
+            wise_delta = wise_delta * (total_energy / (wd_norm + 1e-8)).clamp(max=10.0)
+
+        out = base + wise_delta
+        return out.to(dtype=out_dtype)
+
 
 
 class DARE_Nway(Operation):
     """
     True N-way DARE (Delta-Aware Residual Energy merge):
-
       • Symmetric contributors
       • Per-source sparse deltas
       • Additive (non-competitive)
       • Direction-preserving
       • Energy-stable
-
-    Semantic contract:
-      • Excellent for mid / late UNet feature refinement
-      • Dangerous for timestep math, noise scale, and embeddings
-      • Must NEVER touch temporal control or architectural glue
     """
 
-    # ─────────────────────────────────────────────
-    # DARE-SPECIFIC FORBIDDEN KEYS
-    # (energy redistribution breaks control semantics)
-    # ─────────────────────────────────────────────
     FORBIDDEN_PATTERNS = (
-        # Timestep / temporal conditioning
         "time_embed.",
         "time_embedding",
         "timestep",
         "time_in.",
-
-        # Noise / sigma control
         "sigma",
         "noise",
-
-        # Early signal injection (energy explosion risk)
         "conv_in.",
         "input_blocks.0.",
-
-        # Latent decode / encode stability
         "first_stage_model.",
         "vae.",
         "encoder.",
         "decoder.",
-
-        # Semantic embeddings (energy ≠ meaning)
         "text_model.",
         "cond_stage_model.",
         "conditioner.",
@@ -2308,87 +2890,100 @@ class DARE_Nway(Operation):
         self.density = float(density)
         self.dropout_p = float(dropout_p)
         self.seed = int(seed)
-        self.base_mode = base_mode
+        self.base_mode = str(base_mode)
 
     @multi_cache_operation
     def oper(self, *tensors):
-        # ─────────────────────────────────────────
-        # Operator-level semantic guard
-        # ─────────────────────────────────────────
+        if not tensors:
+            return None
+
+        # Semantic guard
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return tensors[0]
 
-        base = tensors[0]
+        base0 = tensors[0]
+        base0 = self.validate_base(base0)
+        if base0 is None:
+            return None
 
         # DARE only applies to floating-point tensors
-        if not base.is_floating_point():
-            return base
+        if not isinstance(base0, torch.Tensor) or not base0.is_floating_point():
+            return base0
 
-        # Collect valid contributors
-        valid = [
-            t for t in tensors
+        out_dtype = base0.dtype
+        device = base0.device
+
+        # Collect valid contributors (same-shape, float, non-empty)
+        valid = []
+        for t in tensors:
             if (
-                t.numel() > 0
-                and torch.any(t != 0)
+                isinstance(t, torch.Tensor)
                 and t.is_floating_point()
-                and t.shape == base.shape
-            )
-        ]
+                and t.shape == base0.shape
+                and t.numel() > 0
+            ):
+                valid.append(t)
 
         if len(valid) <= 1:
-            return base
+            return base0
 
-        # ─────────────────────────────────────────
+        # Work in float32 for stability
+        valid_f = [t.float() for t in valid]
+
         # Base selection
-        # ─────────────────────────────────────────
         if self.base_mode == "mean":
-            base = torch.mean(torch.stack(valid), dim=0)
+            base = torch.stack(valid_f, dim=0).mean(dim=0)
         elif self.base_mode == "first":
-            base = valid[0]
+            base = valid_f[0]
         else:
-            return base  # refuse unknown modes safely
+            return base0  # refuse unknown modes safely
 
-        # Deterministic sparsity
-        torch.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
+        # Thread-safe deterministic RNG
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
 
         merged_delta = torch.zeros_like(base)
-        total_energy = 0.0
+        total_energy = torch.zeros((), device=device, dtype=torch.float32)
 
-        # ─────────────────────────────────────────
-        # Delta accumulation
-        # ─────────────────────────────────────────
-        for t in valid:
+        # Clamp density into sane range
+        density = max(0.0, min(1.0, self.density))
+        dropout_p = max(0.0, min(1.0, self.dropout_p))
+
+        for t in valid_f:
             delta = t - base
-            if not torch.any(delta):
+
+            # Skip exact-zero deltas cheaply
+            if (delta.abs().max().item() == 0.0):
                 continue
 
             # Per-source sparsity
-            k = max(1, int(self.density * delta.numel()))
-            mags = delta.abs().flatten()
-            threshold = torch.topk(mags, k).values[-1]
-            mask = delta.abs() >= threshold
+            k = max(1, int(density * delta.numel()))
+            mags = delta.abs().reshape(-1)
 
-            # Optional dropout
-            if self.dropout_p > 0.0:
-                keep = 1.0 - self.dropout_p
-                mask &= torch.bernoulli(
-                    torch.full_like(mask.float(), keep)
-                ).bool()
+            # topk on huge tensors is expensive, but correct.
+            # k==numel is fine.
+            threshold = torch.topk(mags, k, largest=True, sorted=False).values.min()
+            mask = (delta.abs() >= threshold)
+
+            # Optional dropout (uses local generator)
+            if dropout_p > 0.0:
+                keep = 1.0 - dropout_p
+                drop_mask = torch.rand(mask.shape, generator=gen, device=device) < keep
+                mask = mask & drop_mask
 
             sparse_delta = delta * mask.to(delta.dtype)
 
-            merged_delta += sparse_delta
-            total_energy += delta.norm(p=2)
+            merged_delta = merged_delta + sparse_delta
+            total_energy = total_energy + delta.norm(p=2)
 
-        # ─────────────────────────────────────────
         # Energy normalization (safety-capped)
-        # ─────────────────────────────────────────
         md_norm = merged_delta.norm(p=2)
-        if md_norm > 1e-8 and total_energy > 0.0:
+        if md_norm.item() > 1e-8 and total_energy.item() > 0.0:
             scale = (total_energy / (md_norm + 1e-8)).clamp(max=10.0)
-            merged_delta *= scale
+            merged_delta = merged_delta * scale
 
-        return (base + merged_delta).to(base.dtype)
+        out = base + merged_delta
+        return out.to(dtype=out_dtype)
 
 
 class DAREWISE(Operation):
@@ -2496,20 +3091,26 @@ class DAREWISE(Operation):
 
         return out.to(base.dtype)
 
-
 class AdaptiveDAREWISE(Operation):
     """
     Adaptive DARE+WISE:
-      - Computes both DARE and WISE candidates
-      - Builds an internal 'aggression field' A ∈ [0, 1]
-      - A decides how much WISE is allowed per tensor
-      - Attention layers hard-lock to DARE
+      - Computes DARE and WISE candidates
+      - Builds an internal aggression scalar A ∈ [0, 1]
+      - A decides how much WISE is allowed
+      - Attention-ish layers hard-lock to DARE
 
     Composite contract:
       • Never invents tensors
       • Refuses by preserving base semantics
       • Delegates semantic safety to child operators
     """
+
+    ATTENTION_PATTERNS = (
+        "attn", "attention",
+        "to_q", "to_k", "to_v",
+        "q_proj", "k_proj", "v_proj",
+        "proj", "out_proj", "proj_out",
+    )
 
     def __init__(
         self,
@@ -2518,11 +3119,15 @@ class AdaptiveDAREWISE(Operation):
         dare_dropout,
         wise_density,
         wise_dropout,
-        aggression_bias=0.5,   # user-facing control
+        aggression_bias=0.5,
         seed=42,
         *sources
     ):
         super().__init__(key, *sources)
+
+        # 🚫 Safer: do not cache this composite op
+        self.disable_cache = True
+
         self.dare_density = float(dare_density)
         self.dare_dropout = float(dare_dropout)
         self.wise_density = float(wise_density)
@@ -2532,84 +3137,99 @@ class AdaptiveDAREWISE(Operation):
 
     @multi_cache_operation
     def oper(self, *tensors):
+        # Must handle empty calls safely
+        if not tensors:
+            return None
+
         base = tensors[0]
 
-        # Composite operators never invent tensors
-        if not tensors or not base.is_floating_point():
+        # Refusal semantics for invalid bases
+        base = self.validate_base(base)
+        if base is None:
+            return None
+
+        # Non-float passthrough (composite never invents)
+        if not isinstance(base, torch.Tensor) or not base.is_floating_point():
             return base
 
-        # Collect valid same-shape floating tensors (including base)
+        # Collect valid same-shape floating tensors
         valid = [
             t for t in tensors
             if (
-                t.numel() > 0
-                and torch.any(t != 0)
+                isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
             )
         ]
         if len(valid) <= 1:
             return base
 
         # -------------------------
-        # Step 1: compute deltas (safe)
+        # Step 1: compute mean + deltas in float32 (more stable)
         # -------------------------
-        mean_base = torch.mean(torch.stack(valid), dim=0)
-        deltas = [t - mean_base for t in valid]
+        # (keeps memory sane; stack is unavoidable if you want real mean)
+        stack = torch.stack([t.float() for t in valid], dim=0)
+        mean_base = stack.mean(dim=0)
+        deltas = stack - mean_base  # [M, ...]
 
         # -------------------------
         # Step 2: aggression signals
         # -------------------------
+        eps = 1e-8
 
-        # (a) Delta agreement (cosine similarity) using consecutive pairs
-        if len(deltas) >= 2:
-            flat = [d.flatten() for d in deltas]
+        # (a) Agreement proxy: average cosine similarity to delta[0]
+        # Compute dot/norm via reductions (no giant flatten copies)
+        d0 = deltas[0]
+        d0_norm = torch.sqrt((d0 * d0).sum() + eps)
+
+        if deltas.shape[0] >= 2:
             sims = []
-            for i in range(len(flat) - 1):
-                num = torch.dot(flat[i], flat[i + 1])
-                den = flat[i].norm() * flat[i + 1].norm() + 1e-8
-                sims.append((num / den).clamp(-1, 1))
-            agreement = torch.mean(torch.stack(sims))
-            A_similarity = float(((agreement + 1) * 0.5).clamp(0, 1))
+            for i in range(1, deltas.shape[0]):
+                di = deltas[i]
+                di_norm = torch.sqrt((di * di).sum() + eps)
+                num = (d0 * di).sum()
+                cos = (num / (d0_norm * di_norm + eps)).clamp(-1.0, 1.0)
+                sims.append(cos)
+            agreement = torch.stack(sims).mean()
+            A_similarity = float(((agreement + 1.0) * 0.5).clamp(0.0, 1.0))
         else:
             A_similarity = 0.0
 
-        # (b) Variance safety (high variance → low aggression)
-        stacked = torch.stack(deltas)
-        var = stacked.var(dim=0).mean()
-        A_variance = float(torch.exp(-var).clamp(0, 1))
+        # (b) Variance safety: higher variance => lower aggression
+        # Use a scalar variance proxy
+        var = deltas.var(dim=0).mean()
+        A_variance = float(torch.exp(-var).clamp(0.0, 1.0))
 
-        # (c) Block-depth heuristic (cheap, key-based)
+        # (c) Cheap depth heuristic (key-based)
         key_lower = self.key.lower()
-        depth_scale = 1.0
         if "down_blocks" in key_lower or "input_blocks" in key_lower:
             depth_scale = 0.3
         elif "mid_block" in key_lower or "middle_block" in key_lower:
             depth_scale = 0.6
         elif "up_blocks" in key_lower or "output_blocks" in key_lower:
             depth_scale = 1.0
+        else:
+            depth_scale = 0.75
 
         # -------------------------
-        # Step 3: attention override
+        # Step 3: attention override (hard lock to DARE)
         # -------------------------
-        attention_safe = any(
-            s in key_lower
-            for s in ("attn", "attention", "to_q", "to_k", "to_v", "proj")
-        )
+        is_attention = any(p in key_lower for p in self.ATTENTION_PATTERNS)
 
-        if attention_safe:
+        if is_attention:
             A = 0.0
         else:
             # Combine signals (bounded)
             A = (0.45 * A_similarity + 0.35 * A_variance)
             A *= depth_scale
-            A *= self.bias
+            A *= max(0.0, self.bias)
             A = float(max(0.0, min(1.0, A)))
 
         # -------------------------
         # Step 4: compute candidates
-        # (child operators enforce their own safety)
         # -------------------------
+        # IMPORTANT: pass original tensors (not float32 stack) so downstream ops keep dtype behavior
         dare = DARE_Nway(
             self.key,
             self.dare_density,
@@ -2640,8 +3260,7 @@ class AdaptiveDAREWISE(Operation):
         else:
             out = torch.lerp(dare, wise, A)
 
-        return out.to(base.dtype)
-
+        return out.to(dtype=base.dtype)
 
 class SLERP(Operation):
     """
@@ -2655,10 +3274,6 @@ class SLERP(Operation):
     Therefore: SLERP enforces its own forbidden-key policy.
     """
 
-    # ─────────────────────────────────────────────
-    # SLERP-SPECIFIC FORBIDDEN KEYS
-    # (temporal control, noise semantics, signal injection)
-    # ─────────────────────────────────────────────
     FORBIDDEN_PATTERNS = (
         # Timestep / temporal conditioning
         "time_embed.",
@@ -2678,96 +3293,122 @@ class SLERP(Operation):
         "skip_connection",
     )
 
-    def __init__(self, key, weights, *sources):
+    def __init__(self, key, weights, *sources, eps=1e-8):
         super().__init__(key, *sources)
 
-        total = sum(weights)
-        if total > 1.0:
-            weights = [w / total for w in weights]
-            total = 1.0
+        w = list(weights) if weights is not None else []
+        # Pad to match number of sources (same convention as your other ops)
+        if len(w) < len(sources):
+            w += [0.0] * (len(sources) - len(w))
+        self.weights = [float(x) for x in w]
 
-        self.weights = weights + [0.0] * (len(sources) - len(weights))
-        self.base_weight = 1.0 - total
+        self.eps = float(eps)
+
+        # Optional: normalize if user provided sum > 1 (keeps "base gravity")
+        pos_sum = sum(x for x in self.weights[1:] if x > 0.0)
+        if pos_sum > 1.0:
+            scale = 1.0 / pos_sum
+            for i in range(1, len(self.weights)):
+                self.weights[i] = max(0.0, self.weights[i]) * scale
 
     @multi_cache_operation
     def oper(self, *tensors):
-        # ─────────────────────────────────────────
-        # Operator-level semantic guard (authoritative)
-        # ─────────────────────────────────────────
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            # Preserve primary semantics
-            return tensors[0]
+        # -------------------------------------------------
+        # Absolute safety
+        # -------------------------------------------------
+        if not tensors:
+            return None
 
-        # Defensive: SLERP only applies to floating-point tensors
         base = tensors[0]
+        if base is None:
+            return None
+
+        # Preserve non-tensor semantics
+        if not isinstance(base, torch.Tensor):
+            return base
+
+        # Scalar tensors are forbidden in your system; refuse
+        if base.ndim == 0 or base.numel() == 0:
+            return None
+
+        # -------------------------------------------------
+        # Operator-level semantic guard (authoritative)
+        # -------------------------------------------------
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return base
+
+        # Floating only
         if not base.is_floating_point():
             return base
 
-        # Filter valid contributors
-        valid = [
-            t for t in tensors
-            if t.numel() > 0 and torch.any(t != 0) and t.is_floating_point()
-        ]
-
-        if not valid:
-            return torch.zeros(
-                [],
-                dtype=cmn.get_dtype(),
-                device=cmn.get_device()
-            )
-
-        if len(valid) == 1:
-            return valid[0]
-
-        base = valid[0]
-
-        # ─────────────────────────────────────────
-        # CROSS-ARCH SAFETY: only same-shape tensors
-        # ─────────────────────────────────────────
-        others = [t for t in valid[1:] if t.shape == base.shape]
-        if not others:
-            return base
-
-        base_flat = base.flatten()
-        base_norm = base_flat.norm() + 1e-8
-
-        def log_map(x, base_vec, base_norm):
-            x_flat = x.flatten()
-            x_norm = x_flat.norm() + 1e-8
-
-            cos_theta = (x_flat @ base_vec) / (x_norm * base_norm)
-            cos_theta = cos_theta.clamp(-1.0, 1.0)
-            theta = torch.acos(cos_theta)
-
-            # Near-identical vectors → zero tangent
-            if theta.item() < 1e-6:
-                return torch.zeros_like(base_vec)
-
-            return (x_flat - cos_theta * base_vec) * (theta / torch.sin(theta))
-
-        # ─────────────────────────────────────────
-        # Log-map accumulation (directional merge)
-        # ─────────────────────────────────────────
-        log_merged = torch.zeros_like(base_flat)
-
-        for t, w in zip(others, self.weights):
+        # -------------------------------------------------
+        # Collect valid same-shape contributors WITH index-aligned weights
+        # -------------------------------------------------
+        base_shape = base.shape
+        pairs = []  # (tensor, weight)
+        for i, (t, w) in enumerate(zip(tensors, self.weights)):
+            if i == 0:
+                continue
             if w <= 0.0:
                 continue
-            log_merged += w * log_map(t, base_flat, base_norm)
+            if not isinstance(t, torch.Tensor):
+                continue
+            if not t.is_floating_point():
+                continue
+            if t.shape != base_shape:
+                continue
+            if t.numel() == 0:
+                continue
+            pairs.append((t, float(w)))
 
-        # ─────────────────────────────────────────
-        # Exponential map back to sphere
-        # ─────────────────────────────────────────
-        norm = log_merged.norm()
-        if norm < 1e-6:
+        # Nothing to do → preserve base
+        if not pairs:
             return base
 
-        exp_merged = (
-            torch.cos(norm) * base_flat +
-            torch.sin(norm) * (log_merged / norm)
-        )
+        # -------------------------------------------------
+        # Proper SLERP on unit sphere, then rescale to base norm
+        # -------------------------------------------------
+        eps = self.eps
+        base_f = base.float()
+        base_flat = base_f.flatten()
+        base_norm = base_flat.norm().clamp_min(eps)
+        base_u = base_flat / base_norm  # unit direction
 
-        return exp_merged.view_as(base).to(base.dtype)
+        def log_map_unit(x: torch.Tensor) -> torch.Tensor:
+            x_f = x.float().flatten()
+            x_norm = x_f.norm().clamp_min(eps)
+            x_u = x_f / x_norm
+
+            cos_theta = (x_u @ base_u).clamp(-1.0, 1.0)
+            theta = torch.acos(cos_theta)
+
+            sin_theta = torch.sin(theta).clamp_min(eps)
+
+            # factor ~ 1 when theta ~ 0 (avoids item() + avoids blowups)
+            factor = torch.where(theta < 1e-6, torch.ones_like(theta), theta / sin_theta)
+
+            # Tangent vector at base_u
+            v = (x_u - cos_theta * base_u) * factor
+            return v
+
+        # Weighted tangent accumulation
+        v = torch.zeros_like(base_u)
+        for t, w in pairs:
+            v = v + (w * log_map_unit(t))
+
+        v_norm = v.norm()
+
+        # If tiny move, return base (no scalar creation)
+        if v_norm <= 1e-6:
+            return base
+
+        # Exponential map back to sphere (unit)
+        y_u = torch.cos(v_norm) * base_u + torch.sin(v_norm) * (v / v_norm.clamp_min(eps))
+
+        # Preserve base magnitude (important for weight tensors)
+        y = (y_u * base_norm).view_as(base_f)
+
+        return y.to(base.dtype)
 
 
 class TrainDiff(Operation):
@@ -2776,8 +3417,9 @@ class TrainDiff(Operation):
 
       • Approximates training-induced updates in weight space
       • Selects top-K strongest deltas from contributors
-      • Averages selected deltas
-      • Optional drift suppression
+      • Soft-weights selected deltas by magnitude
+      • Optional drift suppression (channel-aware)
+      • Optional strength scaling
 
     Semantic contract:
       • Directional, additive
@@ -2834,98 +3476,122 @@ class TrainDiff(Operation):
         *extra_sources,
         top_k: int = 3,
         zero_center: bool = True,
+        channelwise_zero_center: bool = True,
+        strength: float = 1.0,
+        eps: float = 1e-8,
     ):
         super().__init__(key, a, b, c, *extra_sources)
         self.top_k = int(top_k)
         self.zero_center = bool(zero_center)
+        self.channelwise_zero_center = bool(channelwise_zero_center)
+        self.strength = float(max(0.0, strength))
+        self.eps = float(eps)
 
     @multi_cache_operation
     def oper(self, *tensors):
-        if not tensors or tensors[0] is None:
+        # ---------------------------------------------
+        # Absolute safety + “preserve base semantics”
+        # ---------------------------------------------
+        if not tensors:
+            return None  # no base exists, let ladder handle
+        base = tensors[0]
+        if base is None:
             return None
 
-        base = tensors[0]
-
-        # -------------------------------------------------
-        # Key-level semantic guard
-        # -------------------------------------------------
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            return base
-
-        # -------------------------------------------------
-        # Tensor-level safety
-        # -------------------------------------------------
         if not isinstance(base, torch.Tensor):
             return base
 
+        # Scalar tensors are forbidden in your pipeline → refuse safely
+        if base.ndim == 0 or base.numel() == 0:
+            return base
+
+        # ---------------------------------------------
+        # Key-level semantic guard
+        # ---------------------------------------------
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return base
+
+        # Floating-only
         if not base.is_floating_point():
             return base
 
+        # ---------------------------------------------
         # Shape-safe contributors only
+        # ---------------------------------------------
         others = [
             t for t in tensors[1:]
             if (
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
             )
         ]
-
         if not others:
             return base
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Delta computation
-        # -------------------------------------------------
+        # ---------------------------------------------
         deltas = [t - base for t in others]
-        if not deltas:
+
+        # If all deltas are trivially zero, preserve base
+        # (cheap early-out: check aggregate norm)
+        norms = torch.stack([d.norm(p=2) for d in deltas])  # shape [M]
+        if norms.numel() == 0:
             return base
 
-        # Top-K strongest deltas by L2 norm
-        norms = torch.stack([d.norm(p=2) for d in deltas])
-        k = max(1, min(self.top_k, len(deltas)))
-        top_idx = torch.topk(norms, k).indices.tolist()
+        # ---------------------------------------------
+        # Top-K selection
+        # ---------------------------------------------
+        k = max(1, min(self.top_k, int(norms.numel())))
+        top_vals, top_idx = torch.topk(norms, k)
 
-        selected = [deltas[i] for i in top_idx]
+        # If top_vals sum is ~0, nothing meaningful to add
+        denom = top_vals.sum().clamp_min(self.eps)
 
-        combined_delta = torch.mean(torch.stack(selected), dim=0)
+        # Soft weights (no CPU sync)
+        weights = top_vals / denom  # [k]
 
-        # -------------------------------------------------
+        # Combine selected deltas
+        combined_delta = torch.zeros_like(base)
+        # Iterate over indices without .tolist() (still Python loop, but no forced sync)
+        for j in range(k):
+            idx = int(top_idx[j].item())  # tiny scalar read; acceptable here
+            combined_delta = combined_delta + deltas[idx] * weights[j]
+
+        # ---------------------------------------------
         # Optional drift suppression
-        # -------------------------------------------------
+        # ---------------------------------------------
         if self.zero_center:
-            combined_delta = combined_delta - combined_delta.mean()
+            if self.channelwise_zero_center and combined_delta.ndim > 1:
+                dims = tuple(range(1, combined_delta.ndim))
+                combined_delta = combined_delta - combined_delta.mean(dim=dims, keepdim=True)
+            else:
+                combined_delta = combined_delta - combined_delta.mean()
+
+        # ---------------------------------------------
+        # Strength scaling
+        # ---------------------------------------------
+        if self.strength != 1.0:
+            combined_delta = combined_delta * self.strength
 
         return (base + combined_delta).to(base.dtype)
 
 
 
-
 class InterpolateDifference(Operation):
     """
-    InterpolateDifference (Stochastic Difference Selector):
-
-      • Per-element probabilistic replacement
-      • Driven by similarity or difference magnitude
-      • Deterministic via key-based seeding
-      • Extremely aggressive and non-linear
-
-    Semantic contract:
-      • Useful for experimental UNet feature mutation
-      • Dangerous for embeddings, normalization, routing, and control
-      • Must NEVER touch CLIP, VAE, or timestep math
+    InterpolateDifference (Stochastic Difference Selector)
     """
 
     FORBIDDEN_PATTERNS = (
-        # Temporal / noise control
         "time_embed",
         "time_embedding",
         "timestep",
         "time_in",
         "sigma",
         "noise",
-
-        # Attention & routing
         "attn",
         "attention",
         "to_q",
@@ -2933,21 +3599,15 @@ class InterpolateDifference(Operation):
         "to_v",
         "proj",
         "skip_connection",
-
-        # Normalization
         "norm",
         "layer_norm",
         "ln_",
         "scale_shift",
         "affine",
-
-        # Latent encode / decode
         "vae",
         "encoder",
         "decoder",
         "first_stage_model",
-
-        # Text / conditioning
         "text_model",
         "cond_stage_model",
         "conditioner",
@@ -2955,15 +3615,7 @@ class InterpolateDifference(Operation):
         "position_embedding",
     )
 
-    def __init__(
-        self,
-        key,
-        alpha,
-        mode,      # "difference" or "similarity"
-        gamma,
-        seed,
-        *sources
-    ):
+    def __init__(self, key, alpha, mode, gamma, seed, *sources):
         super().__init__(key, *sources)
         self.alpha = float(alpha)
         self.mode = mode
@@ -2972,24 +3624,21 @@ class InterpolateDifference(Operation):
 
     @multi_cache_operation
     def oper(self, *tensors):
-        if not tensors or tensors[0] is None:
+        if not tensors:
             return None
 
         base = tensors[0]
 
-        # -------------------------------------------------
-        # Key-level semantic guard
-        # -------------------------------------------------
+        # ── Semantic guard ──
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
-        # -------------------------------------------------
-        # Tensor-level safety
-        # -------------------------------------------------
-        if not isinstance(base, torch.Tensor):
-            return base
-
-        if not base.is_floating_point():
+        if (
+            not isinstance(base, torch.Tensor)
+            or not base.is_floating_point()
+            or base.ndim < 2            # 🚨 critical
+            or base.numel() == 0
+        ):
             return base
 
         others = [
@@ -3000,36 +3649,29 @@ class InterpolateDifference(Operation):
                 and t.shape == base.shape
             )
         ]
-
         if not others:
             return base
 
-        alpha = max(self.alpha, 1e-3)
+        # Stabilize alpha
+        alpha = max(self.alpha, 0.05)
 
-        # Absolute deltas
         deltas = [torch.abs(t - base) for t in others]
-        delta_max = torch.max(torch.stack(deltas), dim=0).values
+        delta_stack = torch.stack(deltas, dim=0)
+        delta_max = delta_stack.max(dim=0).values
 
         if not torch.any(delta_max):
             return base
 
-        # -------------------------------------------------
-        # Difference vs similarity signal
-        # -------------------------------------------------
+        # Difference vs similarity signal (per-element safe)
         if self.mode == "difference":
-            diff = torch.max(
-                torch.stack([d / (delta_max + 1e-8) for d in deltas]),
-                dim=0
-            ).values
+            diff = (delta_stack / (delta_max + 1e-8)).max(dim=0).values
         else:
-            diff = 1.0 - (delta_max / (delta_max.max() + 1e-8))
+            diff = 1.0 - (delta_max / (delta_max + delta_max.mean() + 1e-8))
 
-        diff = diff.clamp(0, 1) ** (1 / alpha)
+        diff = diff.clamp(0.0, 1.0).pow(1.0 / alpha)
         diff = torch.nan_to_num(diff, nan=0.0, posinf=1.0, neginf=0.0)
 
-        # -------------------------------------------------
         # Deterministic stochastic mask
-        # -------------------------------------------------
         rng = torch.Generator(device=diff.device)
         rng.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
 
@@ -3039,48 +3681,29 @@ class InterpolateDifference(Operation):
         if not torch.any(mask):
             return base
 
-        # -------------------------------------------------
-        # Winner selection per element
-        # -------------------------------------------------
-        abs_deltas = torch.stack(deltas, dim=0)
-        _, best_idx = torch.max(abs_deltas, dim=0)
+        # Winner selection
+        _, best_idx = torch.max(delta_stack, dim=0)
 
         winning = others[0]
         for i in range(1, len(others)):
             winning = torch.where(best_idx == i, others[i], winning)
 
-        # -------------------------------------------------
-        # Blend
-        # -------------------------------------------------
-        return (base * (1 - mask) + winning * mask).to(base.dtype)
+        return (base * (1.0 - mask) + winning * mask).to(base.dtype)
+
 
 
 class AutoEnhancedInterpolateDifference(Operation):
     """
-    AutoEnhancedInterpolateDifference (Adaptive Similarity Band Selector):
-
-      • Computes per-contributor similarity-to-base per element
-      • Selects the LEAST similar contributor per element (spicy winner)
-      • Applies an adaptive band mask around mean similarity
-      • Uses deterministic stochastic gating for controlled swaps
-      • Blends base ↔ winner via a smooth interpolation mask
-
-    Semantic contract:
-      • Experimental UNet feature mutation tool
-      • Extremely unsafe for timestep/noise, CLIP, VAE, attention routing, normalization
-      • Preserves base semantics on refusal
+    AutoEnhancedInterpolateDifference (Adaptive Similarity Band Selector)
     """
 
     FORBIDDEN_PATTERNS = (
-        # Temporal / noise control
         "time_embed",
         "time_embedding",
         "timestep",
         "time_in",
         "sigma",
         "noise",
-
-        # Attention & routing
         "attn",
         "attention",
         "to_q",
@@ -3088,21 +3711,15 @@ class AutoEnhancedInterpolateDifference(Operation):
         "to_v",
         "proj",
         "skip_connection",
-
-        # Normalization (optional: comment out for experiments)
         "norm",
         "layer_norm",
         "ln_",
         "scale_shift",
         "affine",
-
-        # Latent encode / decode
         "vae",
         "encoder",
         "decoder",
         "first_stage_model",
-
-        # Text / conditioning
         "text_model",
         "cond_stage_model",
         "conditioner",
@@ -3113,30 +3730,31 @@ class AutoEnhancedInterpolateDifference(Operation):
     def __init__(self, key, alpha, beta, gamma, seed, *sources):
         super().__init__(key, *sources)
         self.alpha = float(alpha)   # shaping strength (higher = softer)
-        self.beta = float(beta)     # adaptive band width (0..1 is sane)
-        self.gamma = float(gamma)   # smoothness (0=hard bernoulli, 1=soft prob)
+        self.beta = float(beta)     # band width (0..1 recommended)
+        self.gamma = float(gamma)   # 0=hard bernoulli, 1=soft prob
         self.seed = int(seed)
+
+        # Optional: if you want absolute safety for fallbacks/debugging
+        # self.disable_cache = True
 
     @multi_cache_operation
     def oper(self, *tensors):
-        if not tensors or tensors[0] is None:
+        if not tensors:
             return None
 
         base = tensors[0]
 
-        # -------------------------------------------------
-        # Key-level semantic guard
-        # -------------------------------------------------
+        # ── Key-level semantic guard ──
         if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
-        # -------------------------------------------------
-        # Tensor-level safety
-        # -------------------------------------------------
-        if not isinstance(base, torch.Tensor):
-            return base
-
-        if not base.is_floating_point():
+        # ── Tensor-level safety ──
+        if (
+            not isinstance(base, torch.Tensor)
+            or not base.is_floating_point()
+            or base.ndim < 2           # 🚨 forbid scalars & 1D
+            or base.numel() == 0
+        ):
             return base
 
         others = [
@@ -3145,49 +3763,71 @@ class AutoEnhancedInterpolateDifference(Operation):
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
             )
         ]
         if not others:
             return base
 
-        # -------------------------------------------------
-        # Similarity-to-base per contributor
-        # sim = 1 → identical to base, 0 → far from base
-        # -------------------------------------------------
-        deltas = [torch.abs(t - base) for t in others]
+        # ── Clamp knobs ──
+        alpha = max(self.alpha, 0.05)
+        beta = float(max(0.0, min(1.0, self.beta)))
+        gamma = float(max(0.0, min(1.0, self.gamma)))
+        eps = 1e-8
 
-        max_overall = torch.max(torch.stack(deltas), dim=0).values
-        if not torch.any(max_overall):
+        # ─────────────────────────────────────────────
+        # PASS 1: elementwise max delta (memory-safe)
+        # ─────────────────────────────────────────────
+        with torch.no_grad():
+            max_overall = None
+            for t in others:
+                d = (t - base).abs()
+                max_overall = d if max_overall is None else torch.maximum(max_overall, d)
+
+        if max_overall is None or not torch.any(max_overall):
             return base
 
-        denom = max_overall.max() + 1e-8  # global normalization
-        sim_stack = torch.stack([1.0 - (d / denom) for d in deltas], dim=0)
-        sim_stack = torch.nan_to_num(sim_stack, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        denom = max_overall.clamp_min(eps)   # per-element denom
 
-        # -------------------------------------------------
-        # Winner = LEAST similar to base per element
-        # -------------------------------------------------
-        sim, best_idx = torch.min(sim_stack, dim=0)
+        # ─────────────────────────────────────────────
+        # PASS 2: winner = least similar (min sim)
+        # sim = 1 - d/denom  in [0,1]
+        # ─────────────────────────────────────────────
+        with torch.no_grad():
+            best_sim = None
+            best_idx = None
 
-        # -------------------------------------------------
-        # Adaptive similarity band
-        # (band is around the "least-similar" similarity field)
-        # -------------------------------------------------
-        mean_sim = sim.mean()
-        beta = max(0.0, self.beta)
+            for i, t in enumerate(others):
+                d = (t - base).abs()
+                sim = 1.0 - (d / denom)
+                sim = torch.nan_to_num(sim, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+                if best_sim is None:
+                    best_sim = sim
+                    best_idx = torch.zeros_like(sim, dtype=torch.long)
+                else:
+                    take = sim < best_sim
+                    best_idx = torch.where(take, torch.full_like(best_idx, i), best_idx)
+                    best_sim = torch.where(take, sim, best_sim)
+
+        # If something went sideways, refuse safely
+        if best_sim is None or best_idx is None:
+            return base
+
+        # ─────────────────────────────────────────────
+        # Adaptive similarity band (around mean of best_sim)
+        # ─────────────────────────────────────────────
+        mean_sim = best_sim.mean()
         lower = mean_sim * (1.0 - beta)
         upper = mean_sim * (1.0 + beta)
-        band_mask = (sim > lower) & (sim < upper)
+        band_mask = (best_sim > lower) & (best_sim < upper)
 
-        # -------------------------------------------------
-        # Power shaping (alpha)
-        # NOTE: since sim is low for "spicy" regions,
-        # this tends to reduce probability unless beta selects mid-sim zones.
-        # If you want "more spice = higher prob", invert sim (see note below).
-        # -------------------------------------------------
-        alpha_safe = max(self.alpha, 1e-3)
-        diffiness = (1.0 - sim)
-        shaped = diffiness ** (1.0 / alpha_safe)
+        # ─────────────────────────────────────────────
+        # Shape probability: more different = higher prob
+        # diffiness = 1 - sim
+        # ─────────────────────────────────────────────
+        diffiness = (1.0 - best_sim).clamp(0.0, 1.0)
+        shaped = diffiness.pow(1.0 / alpha)
         shaped = torch.nan_to_num(shaped, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
         shaped = shaped * band_mask.to(shaped.dtype)
@@ -3195,76 +3835,57 @@ class AutoEnhancedInterpolateDifference(Operation):
         if not torch.any(shaped):
             return base
 
-        # -------------------------------------------------
+        # ─────────────────────────────────────────────
         # Deterministic stochastic gate
-        # -------------------------------------------------
+        # ─────────────────────────────────────────────
         rng = torch.Generator(device=shaped.device)
         rng.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
 
         bern = torch.bernoulli(shaped, generator=rng)
-        interp_mask = torch.lerp(bern, shaped, self.gamma).clamp(0.0, 1.0)
+        interp_mask = torch.lerp(bern, shaped, gamma).clamp(0.0, 1.0)
 
         if not torch.any(interp_mask):
             return base
 
-        # -------------------------------------------------
-        # Build winning tensor per element
-        # -------------------------------------------------
+        # ─────────────────────────────────────────────
+        # Build winning tensor per element (streaming)
+        # ─────────────────────────────────────────────
         winning = others[0]
         for i in range(1, len(others)):
             winning = torch.where(best_idx == i, others[i], winning)
 
-        # -------------------------------------------------
+        # ─────────────────────────────────────────────
         # Blend base ↔ winner
-        # -------------------------------------------------
+        # ─────────────────────────────────────────────
         result = base * (1.0 - interp_mask) + winning * interp_mask
         return result.to(base.dtype)
-
 
 
 class SingularValueDeOperator(Operation):
     """
     Singular-Value Decomposition based delta reconstruction.
 
-    Semantic contract:
-      • Extracts dominant linear modes from parameter deltas
-      • Useful for style / feature-space refinement
-      • Extremely dangerous for control, routing, and timing weights
-      • Computationally expensive
-
-    Therefore:
-      • Enforces strict forbidden-key policy
-      • Refuses non-floating, non-2D, or oversized tensors
-      • Preserves primary semantics on refusal
+    Contract:
+      • Operates ONLY on 2D floating tensors
+      • Refuses oversized tensors
+      • Avoids large intermediate stacks
+      • Preserves base semantics on refusal
     """
 
-    # ─────────────────────────────────────────────
-    # SVD-SPECIFIC FORBIDDEN KEYS
-    # (routing, timing, noise, latent control)
-    # ─────────────────────────────────────────────
     FORBIDDEN_PATTERNS = (
-        # Temporal / timestep control
         "time_embed.",
         "time_embedding",
         "timestep",
         "time_in.",
-
-        # Noise / sigma control
         "sigma",
         "noise",
-
-        # Structural routing
         "skip_connection",
         "input_blocks.0.",
         "conv_in.",
-
-        # Latent / VAE stability
         "first_stage_model.",
         "vae.",
         "encoder.",
         "decoder.",
-
-        # Text / conditioning
         "cond_stage_model.",
         "conditioner.",
         "text_model.",
@@ -3276,96 +3897,125 @@ class SingularValueDeOperator(Operation):
         self.beta = float(beta)     # top-k fraction to keep
         self.seed = int(seed)
 
+        # SVD is expensive + large; safest to not cache by default
+        self.disable_cache = True
+
     @multi_cache_operation
     def oper(self, *tensors):
         # ─────────────────────────────────────────
-        # Operator-level semantic guard
+        # Basic existence + key guard
         # ─────────────────────────────────────────
-        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
-            return tensors[0]
+        if not tensors:
+            return None
 
         base = tensors[0]
 
-        # SVD is strictly floating-point math
-        if not base.is_floating_point():
-            return base
-
-        # Collect valid contributors
-        valid = [
-            t for t in tensors
-            if (
-                t.numel() > 0
-                and torch.any(t != 0)
-                and t.is_floating_point()
-            )
-        ]
-
-        if not valid or len(valid) == 1:
-            return base
-
-        # Shape-safe contributors only
-        others = [t for t in valid[1:] if t.shape == base.shape]
-        if not others:
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
             return base
 
         # ─────────────────────────────────────────
-        # Structural guards (SVD applicability)
+        # Tensor-level safety
         # ─────────────────────────────────────────
+        if not isinstance(base, torch.Tensor):
+            return base
+
+        # Forbid scalar + non-float + empty
+        if (base.ndim == 0) or (base.numel() == 0) or (not base.is_floating_point()):
+            return base
+
         # Only 2D matrices
         if base.ndim != 2:
             return base
 
         # Avoid pathological SVDs
+        # (tune these limits to taste)
         if base.numel() > 8_000_000 or max(base.shape) > 4096:
             return base
 
-        # Deterministic behavior
+        # Clamp knobs defensively
+        alpha = float(max(0.0, self.alpha))
+        beta = float(max(0.0, min(1.0, self.beta)))
+
+        # Shape-safe contributors only (same shape, float, non-empty)
+        others = [
+            t for t in tensors[1:]
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.shape == base.shape
+                and t.numel() > 0
+            )
+        ]
+        if not others:
+            return base
+
+        # Deterministic behavior (if any internal randomness is introduced later)
         torch.manual_seed(self.seed + (hash(self.key) & 0xFFFFFFFF))
 
         try:
-            # Aggregate deltas
-            diffs = [t - base for t in others]
-            total_diff = torch.sum(torch.stack(diffs, dim=0), dim=0)
+            with torch.no_grad():
+                # ─────────────────────────────────────────
+                # Accumulate delta sum without stacking
+                # ─────────────────────────────────────────
+                # Use float32 for stability, but keep device
+                total_diff = torch.zeros_like(base, dtype=torch.float32)
+                base_f = base.to(dtype=torch.float32)
 
-            # Work in float32 for numerical stability
-            work = total_diff.float()
+                any_delta = False
+                for t in others:
+                    d = t.to(dtype=torch.float32) - base_f
+                    if torch.any(d):
+                        any_delta = True
+                        total_diff += d
 
-            # Compute SVD
-            U, S, Vh = torch.linalg.svd(work, full_matrices=False)
+                if not any_delta or not torch.any(total_diff):
+                    return base
 
-            if S.numel() == 0:
-                return base
+                # ─────────────────────────────────────────
+                # SVD
+                # ─────────────────────────────────────────
+                U, S, Vh = torch.linalg.svd(total_diff, full_matrices=False)
 
-            s_max = S.max()
-            if s_max <= 1e-12:
-                return base
+                if S.numel() == 0:
+                    return base
 
-            # ─────────────────────────────────────────
-            # Singular value filtering
-            # ─────────────────────────────────────────
-            threshold = self.alpha * s_max
-            significant = S > threshold
+                s_max = S.max()
+                if s_max <= 1e-12:
+                    return base
 
-            # Top-k fraction (S is sorted descending)
-            if self.beta < 1.0:
-                k = max(1, int(self.beta * S.numel()))
-                topk_mask = torch.zeros_like(significant)
-                topk_mask[:k] = True
-                significant = significant & topk_mask
+                # ─────────────────────────────────────────
+                # Singular value filtering
+                # ─────────────────────────────────────────
+                threshold = alpha * s_max
+                significant = S > threshold
 
-            if not torch.any(significant):
-                return base
+                if beta < 1.0:
+                    k = max(1, int(beta * S.numel()))
+                    topk_mask = torch.zeros_like(significant, dtype=torch.bool)
+                    topk_mask[:k] = True
+                    significant = significant & topk_mask
 
-            S_filtered = S * significant.to(S.dtype)
+                if not torch.any(significant):
+                    return base
 
-            # Efficient reconstruction
-            reconstructed = (U * S_filtered.unsqueeze(0)) @ Vh
+                S_filtered = S * significant.to(S.dtype)
 
-            return (base + reconstructed.to(base.dtype))
+                # Reconstruction: (U * S) @ Vh
+                reconstructed = (U * S_filtered.unsqueeze(0)) @ Vh
+
+                # Safety cleanup (rare but worth it)
+                reconstructed = torch.nan_to_num(
+                    reconstructed, nan=0.0, posinf=0.0, neginf=0.0
+                )
+
+                out = base_f + reconstructed
+
+                # Return in original dtype (and leave device unchanged)
+                return out.to(dtype=base.dtype)
 
         except Exception:
-            # Hard refusal: preserve base semantics
             return base
+
 
 
 class TensorExchange(Operation):
@@ -3376,27 +4026,15 @@ class TensorExchange(Operation):
       • No numeric blending
       • Deterministic per-key behavior
       • Preserves base semantics on refusal
-
-    Semantic contract:
-      • Experimental structural mutation tool
-      • Extremely dangerous for control, embeddings, normalization
-      • Must NEVER touch temporal control or semantic glue
     """
 
-    # ─────────────────────────────────────────────
-    # EXCHANGE-SPECIFIC FORBIDDEN KEYS
-    # (hard swap breaks control semantics instantly)
-    # ─────────────────────────────────────────────
     FORBIDDEN_PATTERNS = (
-        # Temporal / noise control
         "time_embed",
         "time_embedding",
         "timestep",
         "time_in",
         "sigma",
         "noise",
-
-        # Attention & routing
         "attn",
         "attention",
         "to_q",
@@ -3404,21 +4042,15 @@ class TensorExchange(Operation):
         "to_v",
         "proj",
         "skip_connection",
-
-        # Normalization
         "norm",
         "layer_norm",
         "ln_",
         "scale_shift",
         "affine",
-
-        # Latent encode / decode
         "vae",
         "encoder",
         "decoder",
         "first_stage_model",
-
-        # Text / conditioning
         "text_model",
         "cond_stage_model",
         "conditioner",
@@ -3430,6 +4062,9 @@ class TensorExchange(Operation):
         super().__init__(key, *sources)
         self.alpha = float(alpha)
         self.seed = int(seed)
+
+        # Hard swaps + stochastic logic should not be cached
+        self.disable_cache = True
 
     @multi_cache_operation
     def oper(self, *tensors):
@@ -3447,19 +4082,21 @@ class TensorExchange(Operation):
         # ─────────────────────────────────────────
         # Tensor-level safety
         # ─────────────────────────────────────────
-        if not isinstance(base, torch.Tensor):
+        if (
+            not isinstance(base, torch.Tensor)
+            or not base.is_floating_point()
+            or base.ndim == 0
+            or base.numel() == 0
+        ):
             return base
 
-        if not base.is_floating_point():
-            return base
-
-        # Collect valid same-shape floating contributors
         others = [
             t for t in tensors[1:]
             if (
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
                 and torch.any(t != 0)
             )
         ]
@@ -3467,22 +4104,25 @@ class TensorExchange(Operation):
             return base
 
         # ─────────────────────────────────────────
-        # Probability gate (deterministic)
+        # Deterministic probability gate
         # ─────────────────────────────────────────
-        alpha = float(torch.clamp(
-            torch.tensor(self.alpha),
-            0.0,
-            1.0
-        ))
-
-        seed_val = self.seed + (hash(self.key) & 0xFFFFFFFF)
-        rnd = (seed_val % 10_000) / 10_000.0
-
-        if rnd >= alpha:
+        alpha = max(0.0, min(1.0, self.alpha))
+        if alpha <= 0.0:
             return base
+        if alpha >= 1.0:
+            # Always exchange
+            pass
+        else:
+            # Hash → uniform [0,1)
+            seed_val = self.seed ^ (hash(self.key) & 0xFFFFFFFF)
+            rnd = ((seed_val * 2654435761) & 0xFFFFFFFF) / 2**32
+            if rnd >= alpha:
+                return base
 
+        # ─────────────────────────────────────────
         # Deterministic selection among alternatives
-        idx = seed_val % len(others)
+        # ─────────────────────────────────────────
+        idx = (self.seed + hash(self.key)) % len(others)
         return others[idx].to(base.dtype)
 
 
@@ -3494,23 +4134,15 @@ class WeightSumCutoff(Operation):
       • Selects channels with moderate difference
       • Blends contributor mean into base for selected channels
       • Preserves base semantics elsewhere
-
-    Semantic contract:
-      • Safe, conservative UNet refinement operator
-      • NOT a control or semantic mutation tool
-      • Must NEVER touch temporal control, attention, embeddings, or normalization
     """
 
     FORBIDDEN_PATTERNS = (
-        # Temporal / noise control
         "time_embed",
         "time_embedding",
         "timestep",
         "time_in",
         "sigma",
         "noise",
-
-        # Attention & routing
         "attn",
         "attention",
         "to_q",
@@ -3518,21 +4150,15 @@ class WeightSumCutoff(Operation):
         "to_v",
         "proj",
         "skip_connection",
-
-        # Normalization
         "norm",
         "layer_norm",
         "ln_",
         "scale_shift",
         "affine",
-
-        # Latent encode / decode
         "vae",
         "encoder",
         "decoder",
         "first_stage_model",
-
-        # Text / conditioning
         "text_model",
         "cond_stage_model",
         "conditioner",
@@ -3562,10 +4188,12 @@ class WeightSumCutoff(Operation):
         # ─────────────────────────────────────────
         # Tensor-level safety
         # ─────────────────────────────────────────
-        if not isinstance(base, torch.Tensor):
-            return base
-
-        if not base.is_floating_point():
+        if (
+            not isinstance(base, torch.Tensor)
+            or not base.is_floating_point()
+            or base.ndim < 2
+            or base.numel() == 0
+        ):
             return base
 
         others = [
@@ -3574,286 +4202,1257 @@ class WeightSumCutoff(Operation):
                 isinstance(t, torch.Tensor)
                 and t.is_floating_point()
                 and t.shape == base.shape
+                and t.numel() > 0
             )
         ]
         if not others:
             return base
 
-        # Clamp parameters
-        alpha = float(torch.clamp(torch.tensor(self.alpha), 0.0, 1.0))
-        beta = float(torch.clamp(torch.tensor(self.beta), 0.0, 1.0))
-        gamma = float(torch.clamp(torch.tensor(self.gamma), beta, 1.0))
+        # ─────────────────────────────────────────
+        # Parameter clamps (pure Python)
+        # ─────────────────────────────────────────
+        alpha = max(0.0, min(1.0, self.alpha))
+        beta  = max(0.0, min(1.0, self.beta))
+        gamma = max(beta, min(1.0, self.gamma))
 
-        # Absolute deltas
+        if alpha <= 0.0 or beta >= gamma:
+            return base
+
+        # ─────────────────────────────────────────
+        # Similarity computation
+        # ─────────────────────────────────────────
         deltas = [torch.abs(t - base) for t in others]
-        max_delta = torch.max(torch.stack(deltas), dim=0).values
+        max_delta = torch.max(torch.stack(deltas, dim=0), dim=0).values
+
         if not torch.any(max_delta):
             return base
 
-        # Similarity map
         sim = 1.0 - (max_delta / (max_delta.max() + 1e-8))
-        sim = torch.nan_to_num(sim, nan=0.0).clamp(0.0, 1.0)
+        sim = torch.nan_to_num(sim, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-        # Channel-wise similarity
-        if sim.ndim > 1:
-            reduce_dims = tuple(range(1, sim.ndim))
-            channel_sim = sim.mean(dim=reduce_dims, keepdim=True)
-        else:
-            channel_sim = sim
+        # ─────────────────────────────────────────
+        # Channel-wise reduction
+        # ─────────────────────────────────────────
+        reduce_dims = tuple(range(1, sim.ndim))
+        channel_sim = sim.mean(dim=reduce_dims, keepdim=True)
 
         # Band-pass mask
-        mask = (channel_sim > beta) & (channel_sim < gamma)
+        mask = ((channel_sim > beta) & (channel_sim < gamma)).to(base.dtype)
+
         if not torch.any(mask):
             return base
 
+        # ─────────────────────────────────────────
         # Contributor mean
+        # ─────────────────────────────────────────
         contrib_mean = torch.mean(torch.stack(others, dim=0), dim=0)
 
+        # ─────────────────────────────────────────
         # Selective blend
-        result = torch.where(
-            mask,
-            base * (1.0 - alpha) + contrib_mean * alpha,
-            base,
+        # ─────────────────────────────────────────
+        out = base * (1.0 - alpha * mask) + contrib_mean * (alpha * mask)
+
+        return out.to(base.dtype)
+
+
+class HybridCascadeSimple(Operation):
+    """
+    HybridCascadeSimple (key-aware cascading hybrid merge):
+
+    Goal:
+      Automatically choose the safest / most appropriate merge operator
+      based on parameter key semantics.
+
+    This class is a *router*, not a math primitive.
+    Shape- or dimensionality-specific rules are enforced by child operators.
+    """
+
+    # Ultra-hard refuse: never do math here
+    FORBIDDEN_PATTERNS = (
+        "metadata",
+        "state_dict",
+        "__",
+    )
+
+    # Soft category hints (NOT policy)
+    NOISE_TIME_PATTERNS = (
+        "time_embed",
+        "time_embedding",
+        "timestep",
+        "time_in",
+        "sigma",
+        "noise",
+        "conv_in",
+        "input_blocks.0",
+        "skip_connection",
+    )
+
+    ATTENTION_PATTERNS = (
+        "attn",
+        "attention",
+        "to_q",
+        "to_k",
+        "to_v",
+        "proj",
+    )
+
+    def __init__(
+        self,
+        key,
+        weights,
+        *sources,
+        prefer_copy: int = 0,
+
+        # Global personality knob (0 stable -> 1 spicy)
+        confidence: float = 0.5,
+
+        # CLIP/VAE profile (gentler)
+        clip_vae_mix: float = 0.60,
+        clip_vae_conf: float = 0.35,
+        clip_vae_temp: float = 2.0,
+
+        # Noise/time profile (very gentle)
+        noise_mix: float = 0.40,
+        noise_conf: float = 0.25,
+        noise_temp: float = 2.5,
+
+        # UNet/general profile
+        unet_mix: float = 1.0,
+        unet_temp: float = 1.0,
+
+        # TrainDiff usage
+        use_traindiff: bool = True,
+        traindiff_top_k: int = 3,
+        traindiff_zero_center: bool = True,
+        traindiff_strength: float = 0.50,
+
+        # Optional: sparse agreement pre-pass
+        use_ties: bool = False,
+        ties_density: float = 0.35,
+        ties_seed: int = 42,
+
+        # DAREWISE knobs
+        dare_density: float = 0.35,
+        dare_dropout: float = 0.10,
+        wise_density: float = 0.35,
+        wise_dropout: float = 0.30,
+        seed: int = 42,
+    ):
+        super().__init__(key, *sources)
+
+        self.prefer_copy = int(prefer_copy)
+        self.confidence = float(max(0.0, min(1.0, confidence)))
+
+        self.clip_vae_mix = float(clip_vae_mix)
+        self.clip_vae_conf = float(clip_vae_conf)
+        self.clip_vae_temp = float(clip_vae_temp)
+
+        self.noise_mix = float(noise_mix)
+        self.noise_conf = float(noise_conf)
+        self.noise_temp = float(noise_temp)
+
+        self.unet_mix = float(unet_mix)
+        self.unet_temp = float(unet_temp)
+
+        self.use_traindiff = bool(use_traindiff)
+        self.traindiff_top_k = int(traindiff_top_k)
+        self.traindiff_zero_center = bool(traindiff_zero_center)
+        self.traindiff_strength = float(max(0.0, min(1.0, traindiff_strength)))
+
+        self.use_ties = bool(use_ties)
+        self.ties_density = float(ties_density)
+        self.ties_seed = int(ties_seed)
+
+        self.dare_density = float(dare_density)
+        self.dare_dropout = float(dare_dropout)
+        self.wise_density = float(wise_density)
+        self.wise_dropout = float(wise_dropout)
+        self.seed = int(seed)
+
+        # Normalize weights for AdaptiveLERP
+        if weights is None:
+            raise ValueError("HybridCascadeSimple requires weights")
+
+        w = [float(x) for x in weights]
+        if len(w) < len(sources):
+            w += [0.0] * (len(sources) - len(w))
+
+        total = sum(max(0.0, x) for x in w)
+        if total <= 0.0:
+            w = [1.0] + [0.0] * (len(sources) - 1)
+            total = 1.0
+
+        self.weights = [max(0.0, x) / total for x in w]
+
+    # -------------------------------------------------
+    # Key categorization
+    # -------------------------------------------------
+
+    def _is_clip_or_vae(self, key_lower: str) -> bool:
+        try:
+            if cmn.is_clip_key(self.key) or cmn.is_vae_key(self.key):
+                return True
+        except Exception:
+            pass
+
+        return (
+            "first_stage_model" in key_lower
+            or "vae" in key_lower
+            or "encoder" in key_lower
+            or "decoder" in key_lower
+            or "cond_stage_model" in key_lower
+            or "text_model" in key_lower
+            or "conditioner" in key_lower
         )
 
-        return result.to(base.dtype)
+    def _category(self) -> str:
+        k = self.key.lower()
 
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return "forbidden"
+        if self._is_clip_or_vae(k):
+            return "clip_vae"
+        if any(p in k for p in self.NOISE_TIME_PATTERNS):
+            return "noise_time"
+        if any(p in k for p in self.ATTENTION_PATTERNS):
+            return "attention"
+        return "unet_general"
 
-class WeightsCache:
-    def __init__(self, size_mb, max_items=None):
-        self.mapping = OrderedDict()
-        self.size_cap = min(size_mb, 8192) * 1024 * 1024  # bytes
-        self.size = 0
-        self.max_items = max_items
-        self.lock = threading.Lock()
+    # -------------------------------------------------
+    # Operator wrappers
+    # -------------------------------------------------
 
-        # Optional stats
-        self.hits = 0
-        self.misses = 0
-        self.evictions = 0
+    def _copy(self, tensors):
+        from scripts.untitled.operators import COPY
+        return COPY(self.key, *tensors, prefer=self.prefer_copy).oper(*tensors)
 
-    def __setitem__(self, key, t):
-        with self.lock:
-            # Defensive: keys must be hash-stable
-            if not hasattr(key, "__hash__"):
-                raise TypeError("WeightsCache key must be hashable")
+    def _adaptive_lerp(self, tensors, *, base_mix, confidence, temperature):
+        from scripts.untitled.operators import AdaptiveLERP
+        return AdaptiveLERP(
+            self.key,
+            self.weights,
+            *tensors,
+            base_mix=base_mix,
+            confidence=confidence,
+            temperature=temperature,
+        ).oper(*tensors)
 
-            # Remove existing entry
-            if key in self.mapping:
-                old = self.mapping.pop(key)
-                self.size -= tensor_size(old)
+    def _adaptive_darewise(self, tensors, *, aggression_bias):
+        from scripts.untitled.operators import AdaptiveDAREWISE
+        return AdaptiveDAREWISE(
+            self.key,
+            self.dare_density,
+            self.dare_dropout,
+            self.wise_density,
+            self.wise_dropout,
+            aggression_bias,
+            self.seed,
+            *tensors,
+        ).oper(*tensors)
 
-            # Store CPU, detached tensor
-            t_cpu = t.detach().cpu()
-            self.mapping[key] = t_cpu
-            self.mapping.move_to_end(key)
-            self.size += tensor_size(t_cpu)
+    def _maybe_ties(self, tensors):
+        if not self.use_ties or len(tensors) < 2:
+            return tensors
+        try:
+            from scripts.untitled.operators import TIES
+            out = TIES(
+                self.key,
+                *tensors,
+                density=self.ties_density,
+                seed=self.ties_seed,
+            ).oper(*tensors)
+            return [out] + list(tensors[1:])
+        except Exception:
+            return tensors
 
-            # Evict LRU until under limits
-            while (
-                self.mapping and
-                (self.size >= self.size_cap or
-                 (self.max_items and len(self.mapping) > self.max_items))
-            ):
-                _, tensor = self.mapping.popitem(last=False)
-                self.size -= tensor_size(tensor)
-                self.evictions += 1
+    def _train_diff_then_stabilize(self, tensors):
+        if len(tensors) < 3 or self.traindiff_strength <= 0.0:
+            return None
+        try:
+            from scripts.untitled.operators import TrainDiff
+            td = TrainDiff(
+                self.key,
+                tensors[0], tensors[1], tensors[2],
+                *tensors[3:],
+                top_k=self.traindiff_top_k,
+                zero_center=self.traindiff_zero_center,
+            ).oper(*tensors)
 
-    def __getitem__(self, key: Operation) -> torch.Tensor:
-        with self.lock:
-            if key not in self.mapping:
-                self.misses += 1
-                raise KeyError(f"WeightsCache miss for key: {key}")
+            stab = self._adaptive_lerp(
+                tensors,
+                base_mix=self.unet_mix,
+                confidence=self.confidence,
+                temperature=self.unet_temp,
+            )
+            return torch.lerp(stab, td.to(stab.dtype), self.traindiff_strength)
+        except Exception:
+            return None
 
-            t = self.mapping[key]
-            self.mapping.move_to_end(key)
-            self.hits += 1
-
-        return t.clone().to(
-            device=cmn.get_device(),
-            dtype=cmn.get_dtype()
-        )
-
-weights_cache = WeightsCache(4096, max_items=100_000)
-
-class SmartResize(Operation):
-    """
-    SmartResize:
-      - Sacred keys: NEVER interpolate (pad/slice only)
-      - Non-sacred:
-          * 1D: linear
-          * 2D: bilinear (special-case large vocab as row-wise linear on dim)
-          * 3D: resize last dim with linear; pad/slice first dims (safe + deterministic)
-          * 4D (OIHW conv): resize H/W per-kernel; pad/slice O/I channels
-      - Any weird rank mismatch: safe pad/slice or return as-is
-    """
-    def __init__(self, key, target_shape, source_tensor=None, orig_key=None):
-        super().__init__(key)
-        self.target_shape = tuple(target_shape) if target_shape is not None else None
-        self.source_tensor = source_tensor
-
-        # 🔧 CHANGE 1: always preserve the *true* tensor key for policy checks
-        self.orig_key = orig_key if orig_key is not None else key
+    # -------------------------------------------------
+    # Main
+    # -------------------------------------------------
 
     @multi_cache_operation
     def oper(self, *tensors):
         if not tensors:
-            return torch.zeros(
-                self.target_shape,
-                dtype=cmn.get_dtype(),
-                device=cmn.get_device()
+            return None
+
+        base = tensors[0]
+        if base is None:
+            return None
+
+        if not isinstance(base, torch.Tensor):
+            return base
+
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return base
+
+        if not base.is_floating_point():
+            return self._copy(tensors)
+
+        valid = [
+            t for t in tensors
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.shape == base.shape
+                and t.numel() > 0
+            )
+        ]
+        if not valid:
+            return base
+        if len(valid) == 1:
+            return valid[0]
+
+        cat = self._category()
+
+        if cat == "clip_vae":
+            return self._adaptive_lerp(
+                valid,
+                base_mix=self.clip_vae_mix,
+                confidence=self.clip_vae_conf,
+                temperature=self.clip_vae_temp,
+            ).to(base.dtype)
+
+        if cat == "noise_time":
+            return self._adaptive_lerp(
+                valid,
+                base_mix=self.noise_mix,
+                confidence=self.noise_conf,
+                temperature=self.noise_temp,
+            ).to(base.dtype)
+
+        if cat == "attention":
+            return self._adaptive_darewise(
+                valid,
+                aggression_bias=self.confidence,
+            ).to(base.dtype)
+
+        # UNet general
+        valid2 = self._maybe_ties(valid)
+
+        if self.use_traindiff:
+            out = self._train_diff_then_stabilize(valid2)
+            if out is not None:
+                return out.to(base.dtype)
+
+        if self.confidence >= 0.55:
+            return self._adaptive_darewise(
+                valid2,
+                aggression_bias=self.confidence,
+            ).to(base.dtype)
+
+        return self._adaptive_lerp(
+            valid2,
+            base_mix=self.unet_mix,
+            confidence=self.confidence,
+            temperature=self.unet_temp,
+        ).to(base.dtype)
+
+
+class HybridCascade(Operation):
+    """
+    HybridCascade (block-aware, depth-biased cascading hybrid merge):
+
+    Adds:
+      • Key-based depth estimation across SD1.5 / SDXL / Flux-like UNet naming.
+      • Depth-biased routing:
+          - Early blocks: stabilize (favor MEAN / gentle AdaptiveLERP)
+          - Mid blocks: balanced
+          - Late blocks: more expressive (allow more DAREWISE / TrainDiff)
+      • Depth-biased AdaptiveLERP confidence curves (separate from UNet global confidence)
+      • Attention-head selective TIES:
+          - Optionally sparsify ONLY value projections (to_v / v_proj)
+          - (Optionally) include output projections too
+      • Learned depth profiles:
+          - Derive a "disagreement score" from tensor deltas (variance/magnitude)
+          - Blend with key-depth to auto-stabilize fragile layers
+    """
+
+    FORBIDDEN_PATTERNS = (
+        "metadata",
+        "state_dict",
+        "__",
+    )
+
+    NOISE_TIME_PATTERNS = (
+        "time_embed",
+        "time_embedding",
+        "timestep",
+        "time_in",
+        "sigma",
+        "noise",
+        "conv_in",
+        "input_blocks.0",
+        "skip_connection",
+    )
+
+    ATTENTION_PATTERNS = (
+        "attn",
+        "attention",
+        "to_q",
+        "to_k",
+        "to_v",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "proj",
+        "out_proj",
+    )
+
+    # Attention-selective TIES filters
+    ATTENTION_VALUE_PATTERNS = (
+        "to_v",
+        "v_proj",
+    )
+    ATTENTION_OUTPROJ_PATTERNS = (
+        "out_proj",
+        "proj_out",
+        "proj",
+    )
+
+    def __init__(
+        self,
+        key,
+        weights,
+        *sources,
+        prefer_copy: int = 0,
+
+        # Global personality knob (0 stable -> 1 spicy)
+        confidence: float = 0.5,
+
+        # CLIP/VAE profile (gentler)
+        clip_vae_mix: float = 0.60,
+        clip_vae_conf: float = 0.35,
+        clip_vae_temp: float = 2.0,
+
+        # Noise/time profile (very gentle)
+        noise_mix: float = 0.40,
+        noise_conf: float = 0.25,
+        noise_temp: float = 2.5,
+
+        # UNet/general profile (base)
+        unet_mix: float = 1.0,
+        unet_temp: float = 1.0,
+
+        # TrainDiff usage
+        use_traindiff: bool = True,
+        traindiff_top_k: int = 3,
+        traindiff_zero_center: bool = True,
+        traindiff_strength: float = 0.50,
+
+        # Optional: TIES before detail ops
+        use_ties: bool = False,
+        ties_density: float = 0.35,
+        ties_seed: int = 42,
+
+        # -----------------------------
+        # 🆕 Depth-biased TIES controls
+        # -----------------------------
+        ties_depth_bias_enabled: bool = True,
+        ties_density_early: float = 0.45,   # early: stronger sparsity
+        ties_density_late: float = 0.15,    # late: gentler sparsity
+        ties_depth_curve: float = 1.25,
+
+        # -----------------------------
+        # 🆕 Attention-selective TIES
+        # -----------------------------
+        ties_attention_selective: bool = True,     # only prune value proj (and optional out proj)
+        ties_attention_include_outproj: bool = False,
+        ties_attention_density_scale: float = 0.75,  # extra gentleness for attention even when active
+
+        # DAREWISE / AdaptiveDAREWISE knobs
+        dare_density: float = 0.35,
+        dare_dropout: float = 0.10,
+        wise_density: float = 0.35,
+        wise_dropout: float = 0.30,
+        seed: int = 42,
+
+        # -----------------------------
+        # 🆕 Depth bias controls
+        # -----------------------------
+        depth_bias_enabled: bool = True,
+
+        # How much depth changes general "confidence" (detail ops willingness)
+        depth_conf_strength: float = 0.35,
+
+        # How much depth changes "mix" (LERP vs MEAN)
+        depth_mix_strength: float = 0.25,
+
+        # Optional: scale TrainDiff strength with depth
+        depth_traindiff_strength: float = 0.40,
+
+        # Curve shaping ( >1 concentrates deeper; <1 spreads earlier )
+        depth_curve: float = 1.25,
+
+        # -----------------------------
+        # 🆕 Depth-biased AdaptiveLERP confidence curve (separate from global)
+        # -----------------------------
+        unet_lerp_conf_early: float = 0.30,   # early blocks: lower confidence = more stabilization
+        unet_lerp_conf_late: float = 0.70,    # late blocks: higher confidence = more identity/detail
+        unet_lerp_conf_curve: float = 1.35,   # shape
+
+        # -----------------------------
+        # 🆕 Learned depth profile (auto-stabilize fragile layers)
+        # -----------------------------
+        learned_depth_enabled: bool = True,
+        learned_depth_blend: float = 0.50,    # 0=only key-depth, 1=only learned profile
+        learned_depth_curve: float = 1.20,    # shape learned depth signal
+        learned_depth_eps: float = 1e-8,
+    ):
+        super().__init__(key, *sources)
+
+        self.disable_cache = True
+
+        self.prefer_copy = int(prefer_copy)
+
+        self.confidence = float(max(0.0, min(1.0, confidence)))
+
+        self.clip_vae_mix = float(clip_vae_mix)
+        self.clip_vae_conf = float(clip_vae_conf)
+        self.clip_vae_temp = float(clip_vae_temp)
+
+        self.noise_mix = float(noise_mix)
+        self.noise_conf = float(noise_conf)
+        self.noise_temp = float(noise_temp)
+
+        self.unet_mix = float(unet_mix)
+        self.unet_temp = float(unet_temp)
+
+        self.use_traindiff = bool(use_traindiff)
+        self.traindiff_top_k = int(traindiff_top_k)
+        self.traindiff_zero_center = bool(traindiff_zero_center)
+        self.traindiff_strength = float(max(0.0, min(1.0, traindiff_strength)))
+
+        self.use_ties = bool(use_ties)
+        self.ties_density = float(max(0.0, min(1.0, ties_density)))
+        self.ties_seed = int(ties_seed)
+
+        # Depth-biased TIES knobs
+        self.ties_depth_bias_enabled = bool(ties_depth_bias_enabled)
+        self.ties_density_early = float(max(0.0, min(1.0, ties_density_early)))
+        self.ties_density_late = float(max(0.0, min(1.0, ties_density_late)))
+        self.ties_depth_curve = float(max(0.1, ties_depth_curve))
+
+        # Attention-selective TIES knobs
+        self.ties_attention_selective = bool(ties_attention_selective)
+        self.ties_attention_include_outproj = bool(ties_attention_include_outproj)
+        self.ties_attention_density_scale = float(max(0.0, min(2.0, ties_attention_density_scale)))
+
+        self.dare_density = float(dare_density)
+        self.dare_dropout = float(dare_dropout)
+        self.wise_density = float(wise_density)
+        self.wise_dropout = float(wise_dropout)
+        self.seed = int(seed)
+
+        # Depth bias knobs
+        self.depth_bias_enabled = bool(depth_bias_enabled)
+        self.depth_conf_strength = float(max(0.0, min(1.0, depth_conf_strength)))
+        self.depth_mix_strength = float(max(0.0, min(1.0, depth_mix_strength)))
+        self.depth_traindiff_strength = float(max(0.0, min(1.0, depth_traindiff_strength)))
+        self.depth_curve = float(max(0.1, depth_curve))
+
+        # Depth-biased AdaptiveLERP confidence curve
+        self.unet_lerp_conf_early = float(max(0.0, min(1.0, unet_lerp_conf_early)))
+        self.unet_lerp_conf_late = float(max(0.0, min(1.0, unet_lerp_conf_late)))
+        self.unet_lerp_conf_curve = float(max(0.1, unet_lerp_conf_curve))
+
+        # Learned depth profile
+        self.learned_depth_enabled = bool(learned_depth_enabled)
+        self.learned_depth_blend = float(max(0.0, min(1.0, learned_depth_blend)))
+        self.learned_depth_curve = float(max(0.1, learned_depth_curve))
+        self.learned_depth_eps = float(learned_depth_eps)
+
+        # weights used for AdaptiveLERP / linear-ish blending
+        if weights is None:
+            raise ValueError("HybridCascade requires weights")
+
+        w = [float(x) for x in weights]
+        if len(w) < len(sources):
+            w += [0.0] * (len(sources) - len(w))
+
+        total = sum(max(0.0, x) for x in w)
+        if total <= 0.0:
+            w = [1.0] + [0.0] * (len(sources) - 1)
+            total = 1.0
+
+        self.weights = [max(0.0, x) / total for x in w]
+
+    # -------------------------------------------------
+    # Key helpers
+    # -------------------------------------------------
+    def _is_clip_or_vae(self, key_lower: str) -> bool:
+        try:
+            if cmn.is_clip_key(self.key) or cmn.is_vae_key(self.key):
+                return True
+        except Exception:
+            pass
+
+        return (
+            "first_stage_model" in key_lower
+            or "vae" in key_lower
+            or "encoder" in key_lower
+            or "decoder" in key_lower
+            or "cond_stage_model" in key_lower
+            or "text_model" in key_lower
+            or "conditioner" in key_lower
+        )
+
+    def _is_attention_key(self, key_lower: str) -> bool:
+        return any(p in key_lower for p in self.ATTENTION_PATTERNS)
+
+    def _is_attention_value_key(self, key_lower: str) -> bool:
+        if any(p in key_lower for p in self.ATTENTION_VALUE_PATTERNS):
+            return True
+        if self.ties_attention_include_outproj and any(p in key_lower for p in self.ATTENTION_OUTPROJ_PATTERNS):
+            return True
+        return False
+
+    def _category(self) -> str:
+        k = self.key.lower()
+
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return "forbidden"
+
+        if self._is_clip_or_vae(k):
+            return "clip_vae"
+
+        if any(p in k for p in self.NOISE_TIME_PATTERNS):
+            return "noise_time"
+
+        if self._is_attention_key(k):
+            return "attention"
+
+        return "unet_general"
+
+    # -------------------------------------------------
+    # Depth estimation (SD1.5 / SDXL / Flux-ish)
+    # -------------------------------------------------
+    def _extract_int(self, s: str, token: str):
+        try:
+            m = re.search(rf"{re.escape(token)}[\.|_](\d+)", s)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+        return None
+
+    def _estimate_depth_norm_from_key(self) -> float:
+        k = self.key.lower()
+
+        if "middle_block" in k or "mid_block" in k:
+            return 0.85
+
+        ib = self._extract_int(k, "input_blocks")
+        ob = self._extract_int(k, "output_blocks")
+        if ib is not None:
+            return min(1.0, max(0.0, ib / 12.0)) * 0.75
+        if ob is not None:
+            return 0.75 + min(1.0, max(0.0, ob / 12.0)) * 0.25
+
+        db = self._extract_int(k, "down_blocks")
+        ub = self._extract_int(k, "up_blocks")
+        if db is not None:
+            return min(1.0, max(0.0, db / 4.0)) * 0.75
+        if ub is not None:
+            return 0.75 + min(1.0, max(0.0, ub / 4.0)) * 0.25
+
+        tb = self._extract_int(k, "transformer_blocks")
+        if tb is not None:
+            return min(1.0, max(0.0, tb / 24.0))
+
+        db2 = self._extract_int(k, "double_blocks")
+        sb2 = self._extract_int(k, "single_blocks")
+        if db2 is not None:
+            return min(1.0, max(0.0, db2 / 24.0))
+        if sb2 is not None:
+            return min(1.0, max(0.0, sb2 / 24.0))
+
+        return 0.5
+
+    def _learned_depth_norm(self, tensors) -> float:
+        """
+        "Learned depth": estimate fragility/disagreement from tensor deltas.
+
+        Output is [0,1]:
+          • 0.0 = low disagreement (safe to be expressive)
+          • 1.0 = high disagreement (be conservative)
+        """
+        if not self.learned_depth_enabled or not tensors or len(tensors) < 2:
+            return 0.5
+
+        try:
+            base = tensors[0]
+            if not isinstance(base, torch.Tensor) or not base.is_floating_point():
+                return 0.5
+
+            # Use mean as baseline to reduce bias toward any single source
+            mean_t = torch.mean(torch.stack([t.float() for t in tensors], dim=0), dim=0)
+            deltas = [t.float() - mean_t for t in tensors]
+
+            # Disagreement magnitude proxy:
+            # variance across sources, normalized by mean absolute magnitude
+            stacked = torch.stack(deltas, dim=0)  # [M, ...]
+            var = stacked.var(dim=0)
+
+            # Reduce to a scalar (channel-friendly but cheap)
+            if var.ndim > 1:
+                var_s = var.mean(dim=tuple(range(1, var.ndim)))
+                var_s = var_s.mean()
+            else:
+                var_s = var.mean()
+
+            mag = mean_t.abs().mean().clamp_min(self.learned_depth_eps)
+            score = (var_s / mag).clamp_min(0.0)
+
+            # Map to [0,1] smoothly
+            #  score ~0 => 0, big => ->1
+            learned = (score / (score + 1.0)).item()
+            learned = max(0.0, min(1.0, float(learned)))
+            learned = learned ** self.learned_depth_curve
+            return learned
+
+        except Exception:
+            return 0.5
+
+    def _combined_depth(self, tensors) -> float:
+        """
+        Depth signal in [0,1], where:
+          0.0 = early-ish / safe-ish
+          1.0 = late-ish OR fragile (depending on learned blend)
+        """
+        key_d = self._estimate_depth_norm_from_key()
+        key_d = max(0.0, min(1.0, key_d))
+        key_d = key_d ** self.depth_curve
+
+        learned = self._learned_depth_norm(tensors)
+
+        # learned is "fragility" (1=fragile=be conservative)
+        # Convert to a "depth-like" signal where fragile behaves like early:
+        # fragile -> lower effective depth
+        learned_depthlike = 1.0 - learned  # fragile => 0, safe => 1
+        learned_depthlike = max(0.0, min(1.0, float(learned_depthlike)))
+
+        if not self.learned_depth_enabled or self.learned_depth_blend <= 0.0:
+            return key_d
+
+        b = self.learned_depth_blend
+        return (1.0 - b) * key_d + b * learned_depthlike
+
+    # -------------------------------------------------
+    # Depth-biased parameter shaping
+    # -------------------------------------------------
+    def _depth_signed(self, tensors) -> float:
+        """
+        Signed depth in [-1,+1] centered at 0 mid-depth.
+        """
+        d = self._combined_depth(tensors)
+        d = max(0.0, min(1.0, d))
+        return (d - 0.5) * 2.0
+
+    def _depth_biased_unet_lerp_conf(self, tensors) -> float:
+        """
+        Separate curve for AdaptiveLERP confidence on UNet/general layers.
+
+        Early -> unet_lerp_conf_early
+        Late  -> unet_lerp_conf_late
+        """
+        d = self._combined_depth(tensors)
+        d = max(0.0, min(1.0, d))
+        d = d ** self.unet_lerp_conf_curve
+        return (
+            self.unet_lerp_conf_early * (1.0 - d)
+            + self.unet_lerp_conf_late * d
+        )
+
+    def _apply_depth_bias(self, tensors, *, base_mix: float, confidence: float, traindiff_strength: float):
+        """
+        Returns depth-biased (base_mix, confidence, traindiff_strength).
+
+        Uses combined depth (key-depth blended with learned fragility).
+        """
+        if not self.depth_bias_enabled:
+            return base_mix, confidence, traindiff_strength
+
+        signed = self._depth_signed(tensors)  # -1..+1
+
+        conf = confidence + signed * self.depth_conf_strength
+        mix = base_mix + signed * self.depth_mix_strength
+        td  = traindiff_strength + signed * self.depth_traindiff_strength
+
+        conf = float(max(0.0, min(1.0, conf)))
+        mix  = float(max(0.0, min(1.0, mix)))
+        td   = float(max(0.0, min(1.0, td)))
+        return mix, conf, td
+
+    def _depth_biased_ties_density(self, tensors) -> float:
+        """
+        Interpolates TIES density based on combined depth.
+
+        Early blocks -> ties_density_early
+        Late blocks  -> ties_density_late
+        """
+        if not self.ties_depth_bias_enabled:
+            return self.ties_density
+
+        d = self._combined_depth(tensors)
+        d = max(0.0, min(1.0, d))
+        d = d ** self.ties_depth_curve
+        return (
+            self.ties_density_early * (1.0 - d)
+            + self.ties_density_late * d
+        )
+
+    # -------------------------------------------------
+    # Operator wrappers
+    # -------------------------------------------------
+    def _copy(self, tensors):
+        from scripts.untitled.operators import COPY
+        return COPY(self.key, *tensors, prefer=self.prefer_copy).oper(*tensors)
+
+    def _adaptive_lerp(self, tensors, *, base_mix, confidence, temperature):
+        from scripts.untitled.operators import AdaptiveLERP
+        return AdaptiveLERP(
+            self.key,
+            self.weights,
+            *tensors,
+            base_mix=base_mix,
+            confidence=confidence,
+            temperature=temperature,
+        ).oper(*tensors)
+
+    def _adaptive_darewise(self, tensors, *, aggression_bias):
+        from scripts.untitled.operators import AdaptiveDAREWISE
+        return AdaptiveDAREWISE(
+            self.key,
+            self.dare_density,
+            self.dare_dropout,
+            self.wise_density,
+            self.wise_dropout,
+            aggression_bias,
+            self.seed,
+            *tensors,
+        ).oper(*tensors)
+
+    def _maybe_ties(self, tensors, *, category: str):
+        if not self.use_ties or len(tensors) < 2:
+            return tensors
+
+        # Attention-selective rule:
+        # only apply TIES on value projections (optionally out proj)
+        k = self.key.lower()
+        if category == "attention" and self.ties_attention_selective:
+            if not self._is_attention_value_key(k):
+                return tensors
+
+        try:
+            from scripts.untitled.operators import TIES
+
+            density = self._depth_biased_ties_density(tensors)
+
+            # Extra gentleness in attention even when allowed
+            if category == "attention":
+                density = float(max(0.0, min(1.0, density * self.ties_attention_density_scale)))
+
+            out = TIES(
+                self.key,
+                *tensors,
+                density=density,
+                seed=self.ties_seed
+            ).oper(*tensors)
+
+            return [out] + list(tensors[1:])
+        except Exception:
+            return tensors
+
+    def _train_diff_then_stabilize(self, tensors, *, td_strength, unet_mix, unet_conf, unet_temp):
+        if len(tensors) < 3 or td_strength <= 0.0:
+            return None
+
+        try:
+            from scripts.untitled.operators import TrainDiff
+
+            td = TrainDiff(
+                self.key,
+                tensors[0], tensors[1], tensors[2],
+                *tensors[3:],
+                # If your TrainDiff supports these, great; otherwise remove:
+                top_k=self.traindiff_top_k,
+                zero_center=self.traindiff_zero_center,
+            ).oper(*tensors)
+
+            stab = self._adaptive_lerp(
+                tensors,
+                base_mix=unet_mix,
+                confidence=unet_conf,
+                temperature=unet_temp,
             )
 
-        t = tensors[0]
-        device = t.device
-        dtype = t.dtype
+            return torch.lerp(stab, td.to(stab.dtype), td_strength)
+        except Exception:
+            return None
 
-        # --------------------------
-        # Safety first
-        # --------------------------
-        target = self.target_shape
-        if (not target) or (len(target) == 0) or any(s > 100_000 for s in target):
-            return t
+    # -------------------------------------------------
+    # Main
+    # -------------------------------------------------
+    @multi_cache_operation
+    def oper(self, *tensors):
+        if not tensors:
+            return torch.zeros([], dtype=cmn.get_dtype(), device=cmn.get_device())
 
-        if t.numel() == 0:
-            return torch.zeros(target, device=device, dtype=dtype)
+        base = tensors[0]
+        if base is None:
+            return None
+        if not isinstance(base, torch.Tensor):
+            return base
 
-        # 🔧 CHANGE 2: sacred check uses canonical key only
-        # (no local lowercase copies, no prefixed keys)
-        is_sacred = cmn.is_sacred_key(self.orig_key)
+        if any(p in self.key for p in self.FORBIDDEN_PATTERNS):
+            return base
 
-        # --------------------------
-        # Helpers
-        # --------------------------
-        def _pad_slice_to_target(x: torch.Tensor, tgt_shape: tuple) -> torch.Tensor:
-            if x.ndim != len(tgt_shape):
-                if x.ndim == 0 and len(tgt_shape) == 0:
-                    return x
-                return x
+        if not base.is_floating_point():
+            return self._copy(tensors)
 
-            out = torch.zeros(tgt_shape, device=x.device, dtype=x.dtype)
-            slices_out = []
-            slices_in = []
-            for src, tgt in zip(x.shape, tgt_shape):
-                n = min(src, tgt)
-                slices_out.append(slice(0, n))
-                slices_in.append(slice(0, n))
-            out[tuple(slices_out)] = x[tuple(slices_in)]
-            return out
+        valid = [
+            t for t in tensors
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.shape == base.shape
+                and t.numel() > 0
+            )
+        ]
+        if not valid:
+            return base
+        if len(valid) == 1:
+            return valid[0]
 
-        def _interp_last_dim(block: torch.Tensor, new_last: int) -> torch.Tensor:
-            if block.shape[-1] == new_last:
-                return block
-            flat = block.reshape(-1, 1, block.shape[-1])
-            resized = F.interpolate(flat, size=new_last, mode="linear", align_corners=False)
-            return resized.reshape(*block.shape[:-1], new_last)
+        cat = self._category()
 
-        def _is_floatish(x: torch.Tensor) -> bool:
-            return x.is_floating_point() or x.is_complex()
+        # -----------------------------
+        # CLIP / VAE: conservative profile (no depth bias)
+        # -----------------------------
+        if cat == "clip_vae":
+            return self._adaptive_lerp(
+                valid,
+                base_mix=self.clip_vae_mix,
+                confidence=self.clip_vae_conf,
+                temperature=self.clip_vae_temp,
+            ).to(base.dtype)
 
-        # ===============================================================
-        # SACRED: NEVER interpolate, only pad/slice
-        # ===============================================================
-        if is_sacred:
-            if t.shape == target:
-                return t.to(dtype)
+        # -----------------------------
+        # Noise/time: ultra stable (no depth bias)
+        # -----------------------------
+        if cat == "noise_time":
+            return self._adaptive_lerp(
+                valid,
+                base_mix=self.noise_mix,
+                confidence=self.noise_conf,
+                temperature=self.noise_temp,
+            ).to(base.dtype)
 
-            if t.ndim != len(target):
-                return t.to(dtype)
+        # -----------------------------
+        # Attention:
+        #   • optional TIES only on value proj (and optional out proj)
+        #   • depth+learned bias controls how spicy detail ops can get
+        # -----------------------------
+        if cat == "attention":
+            valid2 = self._maybe_ties(valid, category=cat)
 
-            result = _pad_slice_to_target(t, target)
-            merge_stats.smart_resized += 1
-            print(f"[SANCTUARY] Preserved sacred tensor: {self.orig_key} → {tuple(result.shape)}")
-            return result.to(dtype)
+            _mix, conf, _td = self._apply_depth_bias(
+                valid2,
+                base_mix=1.0,
+                confidence=self.confidence,
+                traindiff_strength=0.0,
+            )
+            aggression_bias = conf
+            return self._adaptive_darewise(valid2, aggression_bias=aggression_bias).to(base.dtype)
 
-        # ===============================================================
-        # NORMAL: interpolation allowed
-        # ===============================================================
+        # -----------------------------
+        # UNet general:
+        #   • depth-biased TIES (optional)
+        #   • depth-biased TrainDiff
+        #   • depth-biased AdaptiveDAREWISE vs AdaptiveLERP routing
+        #   • separate AdaptiveLERP confidence curve (unet_lerp_conf_early/late)
+        # -----------------------------
+        valid2 = self._maybe_ties(valid, category=cat)
 
-        if t.ndim != len(target):
-            return t.to(dtype)
+        unet_mix, unet_conf, td_strength = self._apply_depth_bias(
+            valid2,
+            base_mix=self.unet_mix,
+            confidence=self.confidence,
+            traindiff_strength=self.traindiff_strength,
+        )
 
-        if not _is_floatish(t):
-            result = _pad_slice_to_target(t, target)
-            merge_stats.smart_resized += 1
-            return result.to(dtype)
+        # Separate curve for AdaptiveLERP confidence (this is the big “no cosine required” UX win)
+        lerp_conf = self._depth_biased_unet_lerp_conf(valid2)
 
-        # 1D
-        if t.ndim == 1:
-            if t.shape == target:
-                return t.to(dtype)
-            tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-            tmp = F.interpolate(tmp[None, None, :], size=target[0], mode="linear", align_corners=False)[0, 0]
-            merge_stats.smart_resized += 1
-            return tmp.to(dtype)
+        # TrainDiff injection (depth-biased)
+        if self.use_traindiff:
+            out = self._train_diff_then_stabilize(
+                valid2,
+                td_strength=td_strength,
+                unet_mix=unet_mix,
+                unet_conf=lerp_conf,   # stabilization uses the lerp-specific curve
+                unet_temp=self.unet_temp,
+            )
+            if out is not None:
+                return out.to(base.dtype)
 
-        # 2D
-        if t.ndim == 2:
-            if t.shape == target:
-                return t.to(dtype)
+        # If confident (after depth bias), use detail op
+        if unet_conf >= 0.55:
+            return self._adaptive_darewise(valid2, aggression_bias=unet_conf).to(base.dtype)
 
-            if target[0] > 20_000:
-                rows = min(t.shape[0], target[0])
-                tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-                new_t = torch.zeros(target, device=device, dtype=tmp.dtype)
+        # Otherwise stabilize with AdaptiveLERP (depth-biased mix + lerp-specific confidence curve)
+        return self._adaptive_lerp(
+            valid2,
+            base_mix=unet_mix,
+            confidence=lerp_conf,
+            temperature=self.unet_temp,
+        ).to(base.dtype)
 
-                for i in range(rows):
-                    row = tmp[i:i + 1].unsqueeze(0).unsqueeze(0)
-                    resized = F.interpolate(
-                        row,
-                        size=(1, target[1]),
-                        mode="bilinear",
-                        align_corners=False
-                    )[0, 0, 0]
-                    new_t[i] = resized
+class HybridCascadeLite(Operation):
+    """
+    HybridCascadeLite (fallback-safe hybrid merge):
 
-                merge_stats.smart_resized += 1
-                return new_t.to(dtype)
+    • Key-aware routing
+    • Depth-biased confidence & mix
+    • Uses ONLY AdaptiveLERP + COPY
+    • Deterministic, low-memory, low-compute
+    • Safe as fallback AND calc mode
+    """
 
-            tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-            out = F.interpolate(tmp[None, None, :, :], size=target, mode="bilinear", align_corners=False)[0, 0]
-            merge_stats.smart_resized += 1
-            return out.to(dtype)
+    FORBIDDEN_PATTERNS = (
+        "metadata",
+        "state_dict",
+        "__",
+    )
 
-        # 3D
-        if t.ndim == 3:
-            if t.shape == target:
-                return t.to(dtype)
+    NOISE_TIME_PATTERNS = (
+        "time_embed",
+        "time_embedding",
+        "timestep",
+        "time_in",
+        "sigma",
+        "noise",
+        "conv_in",
+        "input_blocks.0",
+        "skip_connection",
+    )
 
-            tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-            out = torch.zeros(target, device=device, dtype=tmp.dtype)
+    ATTENTION_PATTERNS = (
+        "attn",
+        "attention",
+        "to_q",
+        "to_k",
+        "to_v",
+        "proj",
+    )
 
-            a = min(tmp.shape[0], target[0])
-            b = min(tmp.shape[1], target[1])
-            block = tmp[:a, :b, :]
-            block = _interp_last_dim(block, target[2])
-            out[:a, :b, :] = block
+    def __init__(
+        self,
+        key,
+        weights,
+        *sources,
+        prefer_copy: int = 0,
 
-            merge_stats.smart_resized += 1
-            return out.to(dtype)
+        # Global personality
+        base_mix: float = 1.0,
+        confidence: float = 0.5,
 
-        # 4D (OIHW conv)
-        if t.ndim == 4:
-            if t.shape == target:
-                return t.to(dtype)
+        # CLIP / VAE (safe)
+        clip_mix: float = 0.6,
+        clip_conf: float = 0.35,
+        clip_temp: float = 2.0,
 
-            tmp = t.to(torch.float32) if t.dtype in (torch.float16, torch.bfloat16) else t
-            tgt_o, tgt_i, tgt_h, tgt_w = target
-            src_o, src_i, src_h, src_w = tmp.shape
+        # Noise / timestep (ultra-safe)
+        noise_mix: float = 0.4,
+        noise_conf: float = 0.25,
+        noise_temp: float = 2.5,
 
-            inter = torch.zeros((tgt_o, tgt_i, src_h, src_w), device=device, dtype=tmp.dtype)
-            o = min(src_o, tgt_o)
-            i = min(src_i, tgt_i)
-            inter[:o, :i, :, :] = tmp[:o, :i, :, :]
+        # Depth bias
+        depth_bias: float = 0.35,
+        depth_curve: float = 1.25,
+    ):
+        super().__init__(key, *sources)
 
-            if (src_h, src_w) != (tgt_h, tgt_w):
-                flat = inter.reshape(-1, 1, src_h, src_w)
-                flat = F.interpolate(flat, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
-                inter = flat.reshape(tgt_o, tgt_i, tgt_h, tgt_w)
+        # Fallback ops are not safely cacheable across merges unless you salt/clear the cache.
+        # This prevents stale-tensor reuse.
+        self.disable_cache = True
 
-            merge_stats.smart_resized += 1
-            return inter.to(dtype)
+        self.prefer_copy = int(prefer_copy)
 
-        result = _pad_slice_to_target(t, target)
-        merge_stats.smart_resized += 1
-        return result.to(dtype)
+        def _clamp01(x):
+            return float(max(0.0, min(1.0, float(x))))
+
+        self.base_mix = _clamp01(base_mix)
+        self.confidence = _clamp01(confidence)
+
+        self.clip_mix = _clamp01(clip_mix)
+        self.clip_conf = _clamp01(clip_conf)
+        self.clip_temp = float(max(0.1, float(clip_temp)))
+
+        self.noise_mix = _clamp01(noise_mix)
+        self.noise_conf = _clamp01(noise_conf)
+        self.noise_temp = float(max(0.1, float(noise_temp)))
+
+        self.depth_bias = _clamp01(depth_bias)
+        self.depth_curve = float(max(0.1, float(depth_curve)))
+
+        # Normalize weights
+        if not weights:
+            raise ValueError("HybridCascadeLite requires weights")
+
+        w = [max(0.0, float(x)) for x in weights]
+        if len(w) < len(sources):
+            w += [0.0] * (len(sources) - len(w))
+        elif len(w) > len(sources):
+            w = w[:len(sources)]
+
+        total = sum(w)
+        if total <= 0.0:
+            w = [1.0] + [0.0] * (len(sources) - 1)
+            total = 1.0
+
+        self.weights = [x / total for x in w]
+
+    # -------------------------------------------------
+    # Helpers
+    # -------------------------------------------------
+    def _category(self):
+        k = (self.key or "").lower()
+
+        if any(p in k for p in self.FORBIDDEN_PATTERNS):
+            return "forbidden"
+
+        try:
+            if cmn.is_clip_key(self.key) or cmn.is_vae_key(self.key):
+                return "clip_vae"
+        except Exception:
+            pass
+
+        if any(p in k for p in self.NOISE_TIME_PATTERNS):
+            return "noise"
+
+        if any(p in k for p in self.ATTENTION_PATTERNS):
+            return "attention"
+
+        return "unet"
+
+    def _estimate_depth(self):
+        k = (self.key or "").lower()
+
+        for token in ("input_blocks", "output_blocks", "down_blocks", "up_blocks"):
+            m = re.search(rf"{token}[._](\d+)", k)
+            if m:
+                idx = int(m.group(1))
+                norm = min(1.0, idx / 12.0)
+                return norm ** self.depth_curve
+
+        if "middle_block" in k or "mid_block" in k:
+            return 0.85
+
+        return 0.5
+
+    def _depth_adjust(self, mix, conf):
+        d = self._estimate_depth()
+        signed = (d - 0.5) * 2.0
+
+        mix = mix + signed * self.depth_bias
+        conf = conf + signed * self.depth_bias
+
+        mix = float(max(0.0, min(1.0, mix)))
+        conf = float(max(0.0, min(1.0, conf)))
+        return mix, conf
+
+    def _copy(self, tensors):
+        # Avoid importing this module from itself
+        return COPY(self.key, *tensors, prefer=self.prefer_copy).oper(*tensors)
+
+    def _lerp(self, tensors, weights, *, mix, conf, temp):
+        # Avoid importing this module from itself
+        return AdaptiveLERP(
+            self.key,
+            weights,
+            *tensors,
+            base_mix=mix,
+            confidence=conf,
+            temperature=temp,
+        ).oper(*tensors)
+
+    # -------------------------------------------------
+    # Main
+    # -------------------------------------------------
+    @multi_cache_operation
+    def oper(self, *tensors):
+        if not tensors or tensors[0] is None:
+            return None
+
+        base = tensors[0]
+        if not isinstance(base, torch.Tensor):
+            return base
+
+        k = (self.key or "").lower()
+        if any(p in k for p in self.FORBIDDEN_PATTERNS):
+            return base
+
+        if not base.is_floating_point():
+            return self._copy(tensors)
+
+        # Filter tensors AND their corresponding weights together
+        valid = []
+        valid_w = []
+        for t, w in zip(tensors, self.weights):
+            if (
+                isinstance(t, torch.Tensor)
+                and t.is_floating_point()
+                and t.shape == base.shape
+                and t.numel() > 0
+            ):
+                valid.append(t)
+                valid_w.append(float(w))
+
+        if not valid:
+            return base
+        if len(valid) == 1:
+            return valid[0]
+
+        # Renormalize weights for the valid subset
+        total = sum(valid_w)
+        if total <= 0.0:
+            valid_w = [1.0] + [0.0] * (len(valid) - 1)
+        else:
+            valid_w = [x / total for x in valid_w]
+
+        cat = self._category()
+
+        if cat == "clip_vae":
+            out = self._lerp(valid, valid_w, mix=self.clip_mix, conf=self.clip_conf, temp=self.clip_temp)
+            return out.to(base.dtype)
+
+        if cat == "noise":
+            out = self._lerp(valid, valid_w, mix=self.noise_mix, conf=self.noise_conf, temp=self.noise_temp)
+            return out.to(base.dtype)
+
+        mix, conf = self._depth_adjust(self.base_mix, self.confidence)
+        out = self._lerp(valid, valid_w, mix=mix, conf=conf, temp=1.0)
+        return out.to(base.dtype)
