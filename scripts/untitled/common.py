@@ -503,72 +503,115 @@ def bake_component_into_state_dict(
     return target_state_dict
 
 def load_safetensors_state_dict(path: str, *, device="cpu"):
-    sd = {}
-    meta = {}
+    """
+    Load a safetensors file into a plain state_dict + metadata.
+
+    Guarantees:
+      • All values are torch.Tensors
+      • Metadata is always a dict
+      • No silent partial reads
+    """
+    sd: dict[str, torch.Tensor] = {}
+
     with safe_open(path, framework="pt", device=device) as f:
         meta = f.metadata() or {}
+
         for k in f.keys():
-            sd[k] = f.get_tensor(k)
+            t = f.get_tensor(k)
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(
+                    f"[Safetensors ERROR] Key '{k}' did not yield a torch.Tensor "
+                    f"(got {type(t).__name__})"
+                )
+            sd[k] = t
+
     return sd, meta
 
+
 def has_tensor(file, key: str) -> bool:
+    """
+    Return True if the tensor source contains `key`.
+
+    Supports:
+      • safetensors safe_open handles
+      • custom wrappers with has_tensor()
+      • dict-like objects
+    """
     if file is None:
         return False
 
-    # safetensors safe_open handle
+    # Preferred: explicit method
+    if hasattr(file, "has_tensor"):
+        try:
+            return bool(file.has_tensor(key))
+        except Exception:
+            return False
+
+    # safetensors handle
     if hasattr(file, "keys"):
         try:
             return key in file.keys()
         except Exception:
             return False
 
-    # custom wrapper with explicit method
-    if hasattr(file, "has_tensor"):
-        return file.has_tensor(key)
-
-    # plain dict-like fallback
+    # dict-like fallback
     try:
         return key in file
-    except TypeError:
+    except Exception:
         return False
 
 
-def get_tensor(file, key: str):
+
+def get_tensor(file, key: str) -> torch.Tensor:
+    """
+    Retrieve tensor `key` from a tensor source.
+
+    Guarantees:
+      • Always returns a torch.Tensor
+      • Raises loudly on failure
+    """
     if file is None:
-        raise KeyError(f"Tensor source is None (key={key})")
+        raise KeyError(f"[get_tensor] Tensor source is None (key='{key}')")
 
     if hasattr(file, "get_tensor"):
         t = file.get_tensor(key)
     else:
         t = file[key]
 
-    # Defensive: ensure we always return a Tensor
     if not isinstance(t, torch.Tensor):
         raise TypeError(
-            f"Object for key '{key}' is not a torch.Tensor "
+            f"[get_tensor ERROR] Object for key '{key}' is not a torch.Tensor "
             f"(got {type(t).__name__})"
         )
 
     return t
 
+
 def is_mergeable_tensor(t: torch.Tensor) -> bool:
+    """
+    Mergeable tensors must be floating-point torch.Tensors.
+    """
     return isinstance(t, torch.Tensor) and t.is_floating_point()
+
 
 def handle_non_mergeable_tensor(
     key: str,
     tensors: list[torch.Tensor],
     *,
-    prefer: int = 0
+    prefer: int = 0,
 ) -> torch.Tensor:
     """
-    Policy for non-floating tensors.
+    Policy for non-floating or non-mergeable tensors.
 
-    Default behavior:
-      • Return preferred tensor (default primary)
-      • Clone to avoid aliasing
+    Behavior:
+      • Select preferred tensor (default: primary)
+      • Clone to prevent aliasing
+      • Fail loudly on invalid inputs
     """
     if not tensors:
-        raise RuntimeError(f"No tensors available for non-mergeable key '{key}'")
+        raise RuntimeError(
+            f"[NonMergeable ERROR] No tensors available for key '{key}'"
+        )
 
     if prefer < 0 or prefer >= len(tensors):
         prefer = 0
@@ -577,15 +620,21 @@ def handle_non_mergeable_tensor(
 
     if not isinstance(t, torch.Tensor):
         raise TypeError(
-            f"Non-mergeable object for key '{key}' is not a Tensor "
+            f"[NonMergeable ERROR] Object for key '{key}' is not a torch.Tensor "
             f"(got {type(t).__name__})"
         )
 
     return t.clone()
 
 
+
 def is_sacred_key(key: str) -> bool:
-    return any(p in key for p in SACRED_PATTERNS)
+    """
+    Return True if the key is considered sacred / non-mergeable
+    by global policy.
+    """
+    return bool(SACRED_PATTERNS) and any(p in key for p in SACRED_PATTERNS)
+
 
 def bake_vae_from_file(
     target_state_dict: dict,

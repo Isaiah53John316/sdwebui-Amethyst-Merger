@@ -351,43 +351,56 @@ def assign_weights_to_keys(
         specific_selectors_first = cmn.opts.get(
             "specific_selectors_first", False
         )
-    #Selector precedence policy:
-    #------------------------------------------------------------
-    #specific_selectors_first = False (DEFAULT, safer)
-        #• Broad selectors (e.g. "model.*", ".*attn.*") apply first
-        #• Narrow selectors only fill gaps
-        #• Produces more uniform, conservative merges
-        #• Best when:
-            #- Copy VAE from Primary = ON
-            #- Copy CLIP from Primary = ON
-            #- User wants structural stability and re-merge safety
 
-    #specific_selectors_first = True (style-forward)
-        #• Narrow selectors apply first (block- or layer-specific)
-        #• Broad selectors act as fallback
-        #• Stronger stylistic and attention-level transfer
-        #• Especially impacts:
-            #- UNet attention blocks (composition, texture, style)
-            #- CLIP-related weights *when CLIP merging is enabled*
-            #- Cross-model stylistic dominance
+    # ─────────────────────────────────────────────
+    # Selector precedence policy:
+    # ------------------------------------------------------------
+    # specific_selectors_first = False (DEFAULT, safer)
+    #   • Broad selectors (e.g. "model.*", ".*attn.*") apply first
+    #   • Narrow selectors only fill gaps
+    #   • Produces more uniform, conservative merges
+    #   • Best when:
+    #       - Copy VAE from Primary = ON
+    #       - Copy CLIP from Primary = ON
+    #       - User wants structural stability and re-merge safety
+    #
+    # specific_selectors_first = True (style-forward)
+    #   • Narrow selectors apply first (block- or layer-specific)
+    #   • Broad selectors act as fallback
+    #   • Stronger stylistic and attention-level transfer
+    #   • Especially impacts:
+    #       - UNet attention blocks (composition, texture, style)
+    #       - CLIP-related weights *when CLIP merging is enabled*
+    #       - Cross-model stylistic dominance
+    #
+    # IMPORTANT CLARIFICATION:
+    #   • This toggle does NOT force copying or merging of VAE or CLIP
+    #   • VAE and CLIP behavior is controlled separately by user options
+    #   • When VAE / CLIP are merged (not copied), this toggle
+    #     directly affects how strongly their associated weights dominate
+    #   • When VAE / CLIP are copied from primary (default),
+    #     this toggle influences how the UNet aligns stylistically with them
+    # ─────────────────────────────────────────────
 
-    #IMPORTANT CLARIFICATION:
-        #• This toggle does NOT force copying or merging of VAE or CLIP
-        #• VAE and CLIP behavior is controlled separately by user options
-        #• When VAE / CLIP are merged (not copied), this toggle
-          #directly affects how strongly their associated weights dominate
-        #• When VAE / CLIP are copied from primary (default),
-          #this toggle influences how the UNet aligns stylistically with them
-
-
+    # ─────────────────────────────────────────────
+    # Early exits
+    # ─────────────────────────────────────────────
     if not targets or not keys:
-        return already_assigned or {}
+        return already_assigned.copy() if already_assigned else {}
+
+    # Start with already-assigned keys (never overwritten)
+    result = already_assigned.copy() if already_assigned else {}
 
     # ─────────────────────────────────────────────
     # Precompile regex selectors (FAST PATH)
     # ─────────────────────────────────────────────
     assigners = []
     for selector, weights in targets.items():
+        # Defensive: selectors must map to dict-like weights
+        if not isinstance(weights, dict):
+            print(f"[Merger WARNING] Selector '{selector}' has invalid weights, skipping")
+            continue
+
         try:
             regex = mutil.target_to_regex(selector)
             pattern = re.compile(regex)
@@ -396,40 +409,49 @@ def assign_weights_to_keys(
             print(f"[Merger] Invalid selector regex '{selector}': {e}")
 
     if not assigners:
-        return already_assigned or {}
+        return result
 
     # ─────────────────────────────────────────────
-    # Match selectors against keys (key-by-key only)
+    # Match selectors against keys
+    # (only keys not already assigned are considered)
     # ─────────────────────────────────────────────
     matches = []
+    unassigned_keys = [k for k in keys if k not in result]
+
     for pattern, weights, selector in assigners:
-        matched_keys = [k for k in keys if pattern.search(k)]
+        matched_keys = [k for k in unassigned_keys if pattern.search(k)]
         if matched_keys:
             matches.append((matched_keys, weights, selector))
+
+    if not matches:
+        print("[Merger WARNING] No selectors matched any keys")
+        return result
 
     # ─────────────────────────────────────────────
     # Selector precedence policy
     # ─────────────────────────────────────────────
     if specific_selectors_first:
-        # Narrow selectors first → stronger style control
-        matches.sort(key=lambda x: len(x[0]))
+        # Narrow selectors first → stronger stylistic control
+        # Tie-break on selector string for determinism
+        matches.sort(key=lambda x: (len(x[0]), x[2]))
         policy = "SPECIFIC → BROAD (style-forward)"
     else:
         # Broad selectors first → safer, more uniform merges
-        matches.sort(key=lambda x: len(x[0]), reverse=True)
+        matches.sort(key=lambda x: (-len(x[0]), x[2]))
         policy = "BROAD → SPECIFIC (safe-default)"
 
     print(f"[Merger] Selector precedence policy: {policy}")
 
     # ─────────────────────────────────────────────
-    # Build assignment map (first-wins, never overwritten)
+    # Build assignment map
+    # First-wins semantics: assignments are NEVER overwritten
     # ─────────────────────────────────────────────
-    result = already_assigned.copy() if already_assigned else {}
     assigned_count = 0
 
     for key_list, weights, selector in matches:
         for key in key_list:
             if key not in result:
+                # Defensive copy of weights
                 result[key] = dict(weights)
                 assigned_count += 1
 
@@ -442,78 +464,149 @@ def assign_weights_to_keys(
 
 
 def create_tasks(
-    progress, mergemode, calcmode, keys, assigned_keys, discard_keys,
-    checkpoints, merge_stats,
-    alpha, beta, gamma, delta, epsilon,
-    keep_zero_fill=True, bloat_mode=False
+    progress,
+    mergemode,
+    calcmode,
+    keys,
+    assigned_keys,
+    discard_keys,
+    checkpoints,
+    merge_stats,
+    alpha,
+    beta,
+    gamma,
+    delta,
+    epsilon,
+    keep_zero_fill=True,
+    bloat_mode=False,
 ):
     """
     2025 KITCHEN-SINK MAXIMALISM — FINAL FORM
 
     Precedence:
-      1. Per-key rules
+      1. Per-key rules (weight editor / selectors)
       2. Global sliders
       3. FAIL LOUDLY
 
-    No silent fallbacks. No defaults.
+    Design principles:
+      • No silent fallbacks
+      • No implicit defaults
+      • Deterministic, auditable behavior
+      • Every key must have an explicit merge path
     """
 
     tasks = []
     custom_count = 0
 
-    sliders_active = any(v != 0 for v in (alpha, beta, gamma, delta, epsilon))
+    # Treat sliders as active if *any* contributes non-zero signal
+    sliders_active = any(
+        float(v) != 0.0 for v in (alpha, beta, gamma, delta, epsilon)
+    )
+
+    # Defensive normalization
+    assigned_keys = assigned_keys or {}
+    discard_keys = discard_keys or set()
 
     for key in sorted(keys):
+        # -------------------------------------------------
+        # Discard policy (absolute)
+        # -------------------------------------------------
         if key in discard_keys:
             continue
 
-        # 1. Per-key rules (highest priority)
+        # -------------------------------------------------
+        # 1. Per-key rule (highest priority)
+        # -------------------------------------------------
         if key in assigned_keys:
+            rule = assigned_keys[key]
             try:
                 custom_count += 1
+
                 base_recipe = mergemode.create_recipe(
-                    key, *checkpoints, **assigned_keys[key]
+                    key,
+                    *checkpoints,
+                    **rule,
                 )
+
                 final_recipe = calcmode.modify_recipe(
-                    base_recipe, key, *checkpoints, **assigned_keys[key]
+                    base_recipe,
+                    key,
+                    *checkpoints,
+                    **rule,
                 )
+
                 tasks.append(final_recipe)
                 continue
+
             except Exception as e:
                 raise RuntimeError(
-                    f"Custom rule failed for key '{key}': {e}\n"
-                    f"   Rule data: {assigned_keys[key]}"
+                    f"[TaskBuild ERROR] Per-key rule failed\n"
+                    f"  • Key      : {key}\n"
+                    f"  • Rule     : {rule}\n"
+                    f"  • Error    : {e}"
                 ) from e
 
-        # 2. Global sliders
+        # -------------------------------------------------
+        # 2. Global sliders (fallback)
+        # -------------------------------------------------
         if sliders_active:
             try:
                 custom_count += 1
+
                 base_recipe = mergemode.create_recipe(
-                    key, *checkpoints,
-                    alpha=alpha, beta=beta, gamma=gamma, delta=delta, epsilon=epsilon
+                    key,
+                    *checkpoints,
+                    alpha=alpha,
+                    beta=beta,
+                    gamma=gamma,
+                    delta=delta,
+                    epsilon=epsilon,
                 )
+
                 final_recipe = calcmode.modify_recipe(
-                    base_recipe, key, *checkpoints,
-                    alpha=alpha, beta=beta, gamma=gamma, delta=delta, epsilon=epsilon
+                    base_recipe,
+                    key,
+                    *checkpoints,
+                    alpha=alpha,
+                    beta=beta,
+                    gamma=gamma,
+                    delta=delta,
+                    epsilon=epsilon,
                 )
+
                 tasks.append(final_recipe)
                 continue
+
             except Exception as e:
                 raise RuntimeError(
-                    f"Global merge failed for key '{key}': {e}\n"
-                    f"   Sliders: α={alpha}, β={beta}, γ={gamma}, δ={delta}, ε={epsilon}"
+                    f"[TaskBuild ERROR] Global merge failed\n"
+                    f"  • Key      : {key}\n"
+                    f"  • Sliders  : "
+                    f"α={alpha}, β={beta}, γ={gamma}, δ={delta}, ε={epsilon}\n"
+                    f"  • Error    : {e}"
                 ) from e
 
-        # 3. No rule applies → hard fail
+        # -------------------------------------------------
+        # 3. No rule applies → HARD FAIL (by design)
+        # -------------------------------------------------
         raise RuntimeError(
-            f"No merge rule for key '{key}' and all sliders are 0.\n"
-            f"   Set at least one slider ≠ 0 or use a weight editor rule."
+            f"[TaskBuild ERROR] No merge rule for key '{key}'.\n"
+            f"  • All sliders are zero\n"
+            f"  • No per-key rule assigned\n\n"
+            f"Fix one of the following:\n"
+            f"  • Enable at least one global slider\n"
+            f"  • Add a weight-editor rule for this key\n"
+            f"  • Explicitly discard the key"
         )
 
-    # Freeze task list immediately
+    # -------------------------------------------------
+    # Freeze task list immediately (immutability guarantee)
+    # -------------------------------------------------
     tasks = tuple(tasks)
 
+    # -------------------------------------------------
+    # Reporting
+    # -------------------------------------------------
     progress("Assigned tasks:")
     progress(f"  • Custom merges (rules/sliders) : {custom_count:,}")
     progress(f"  • Total keys processed          : {len(tasks):,}")
