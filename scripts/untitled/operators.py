@@ -13,7 +13,84 @@ import threading
 import math
 from typing import List, Optional
 
+# Scalar merge policy (advanced, OFF by default)
+# Scalars are routed via ScalarGuard / ScaleOnly in initialize_task()
+cmn.allow_scalar_merges = False  # UI toggle (default OFF)
 
+cmn.scalar_whitelist = {
+    "logit_scale",
+    "temperature",
+    "alpha",
+    "gain",
+    "scale",
+}
+
+    
+def tensor_size(t):
+    """Return tensor size in bytes (safe for all tensor dtypes)."""
+    if not isinstance(t, torch.Tensor):
+        return 0
+    return t.element_size() * t.nelement()
+
+
+def recurse(operation):
+    source_tensors = []
+
+    for idx, source in enumerate(operation.sources):
+        try:
+            # -------------------------------------------------
+            # Resolve source
+            # -------------------------------------------------
+            if isinstance(source, Operation):
+                t = source.merge()
+            elif isinstance(source, torch.Tensor):
+                t = source
+            else:
+                t = torch.as_tensor(source)
+
+            if t is None:
+                raise RuntimeError(
+                    f"Source resolved to None (index {idx}, source={source})"
+                )
+
+            if not isinstance(t, torch.Tensor):
+                raise RuntimeError(
+                    f"Resolved source is not a torch.Tensor "
+                    f"(index {idx}, got {type(t).__name__})"
+                )
+
+            # -------------------------------------------------
+            # Operator-level validation (canonical)
+            # -------------------------------------------------
+            validated = operation.validate_base(t)
+            if validated is None:
+                raise RuntimeError(
+                    f"Source rejected by validate_base "
+                    f"(index {idx}, key={operation.key})"
+                )
+
+            t = validated
+
+            # -------------------------------------------------
+            # Normalize device / dtype
+            # -------------------------------------------------
+            if t.is_floating_point():
+                t = t.to(device=cmn.get_device(), dtype=cmn.get_dtype())
+            else:
+                t = t.to(device=cmn.get_device())
+
+            source_tensors.append(t)
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed resolving source {idx} for operation '{operation.key}' "
+                f"(source={source})"
+            ) from e
+
+    return operation.oper(*source_tensors)
+
+
+# Optional debug toggle (global, cheap)
 class WeightsCache:
     def __init__(self, size_mb, max_items=None):
         self.mapping = OrderedDict()
@@ -76,65 +153,7 @@ class WeightsCache:
             device=cmn.get_device(),
             dtype=cmn.get_dtype()
         )
-    
-def tensor_size(t):
-    """Return tensor size in bytes (safe for all tensor dtypes)."""
-    if not isinstance(t, torch.Tensor):
-        return 0
-    return t.element_size() * t.nelement()
 
-
-def recurse(operation):
-    source_tensors = []
-
-    for idx, source in enumerate(operation.sources):
-        try:
-            # Resolve source
-            if hasattr(source, "merge"):
-                t = source.merge()
-            else:
-                t = torch.as_tensor(source)
-
-            if t is None:
-                raise RuntimeError(
-                    f"Source resolved to None (index {idx}, source={source})"
-                )
-
-            # 🚨 Scalar tensors are forbidden at execution boundary
-            if not isinstance(t, torch.Tensor) or t.ndim == 0:
-                raise RuntimeError(
-                    f"Invalid scalar or non-tensor source at index {idx} "
-                    f"for operation '{operation.key}'"
-                )
-
-            # Validate base tensor (operator-level policy)
-            validated = operation.validate_base(t)
-            if validated is None:
-                raise RuntimeError(
-                    f"Source rejected by validate_base "
-                    f"(index {idx}, key={operation.key})"
-                )
-
-            t = validated
-
-            # Normalize ONLY floating tensors
-            if t.is_floating_point():
-                t = t.to(device=cmn.get_device(), dtype=cmn.get_dtype())
-            else:
-                t = t.to(device=cmn.get_device())
-
-            source_tensors.append(t)
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed resolving source {idx} for operation '{operation.key}' "
-                f"(source={source})"
-            ) from e
-
-    return operation.oper(*source_tensors)
-
-
-# Optional debug toggle (global, cheap)
 CACHE_DEBUG = False
 _cache_lock = threading.Lock()
 
@@ -224,21 +243,59 @@ def multi_cache_operation(func):
 
 weights_cache = WeightsCache(4096, max_items=100_000)
 
+def extract_scalar(t: torch.Tensor) -> float:
+    if not isinstance(t, torch.Tensor):
+        raise TypeError("Expected tensor")
+    if t.ndim != 0:
+        raise ValueError("Not a scalar tensor")
+    return float(t.item())
+
+def route_scalar_op(key, *sources):
+    """
+    Decide how scalar tensors should be handled for this key.
+    Returns an Operation or None.
+    """
+
+    # Scalars disabled globally → copy primary via guard
+    if not cmn.allow_scalar_merges:
+        return ScalarGuard(key, *sources, mode="copy_primary")
+
+    # Scalars enabled, but key not whitelisted → guard
+    if key not in cmn.scalar_whitelist:
+        return ScalarGuard(key, *sources, mode="copy_primary")
+
+    # Scalars enabled AND whitelisted → allow numeric merge
+    return ScaleOnly(key, *sources)
 
 ###OPERATORS####
 
 class Operation:
+    """
+    Base class for all ops in the merge graph.
+
+    Key invariants:
+      • Sources may be torch.Tensors OR Operation nodes
+      • oper(*tensors) MUST receive only torch.Tensors (already resolved)
+      • resolve() is the canonical execution entrypoint
+      • merge() remains for backward compatibility (delegates to resolve)
+    """
     def __init__(self, key, *sources):
         self.key = key
         self.sources = tuple(sources)
+
+        # Optional knobs many ops use (kept for hashing stability)
         self.alpha = None
         self.beta = None
         self.gamma = None
         self.delta = None
         self.seed = None
-        self.merge_func = recurse  # ← still used by merge()
+
+        # Legacy executor (still supported)
+        self.merge_func = recurse  # still used by old code paths
 
     def __eq__(self, other):
+        if not isinstance(other, Operation):
+            return False
         return (
             self.key,
             self.alpha,
@@ -246,7 +303,8 @@ class Operation:
             self.gamma,
             self.delta,
             self.seed,
-            self.sources
+            self.sources,
+            self.__class__,
         ) == (
             other.key,
             other.alpha,
@@ -254,11 +312,14 @@ class Operation:
             other.gamma,
             other.delta,
             other.seed,
-            other.sources
+            other.sources,
+            other.__class__,
         )
 
     def __hash__(self):
+        # Include class so different ops with same fields never collide
         return hash((
+            self.__class__,
             self.key,
             self.alpha,
             self.beta,
@@ -269,11 +330,60 @@ class Operation:
         ))
 
     def oper(self, *tensors) -> torch.Tensor:
-        raise NotImplementedError("Subclasses must implement oper(self, *tensors)")
+        """
+        Subclasses implement math here.
 
+        IMPORTANT:
+          • tensors are already resolved (torch.Tensor only)
+          • do not assume >0 dims; if you require ndim >= 1 or >=2, enforce locally
+        """
+        raise NotImplementedError
+
+    # -------------------------------------------------
+    # CANONICAL graph executor
+    # -------------------------------------------------
+    def resolve(self):
+        """
+        Resolve this operation tree to a concrete torch.Tensor.
+
+        Rules:
+          • Recursively resolves Operation sources
+          • Rejects invalid source types loudly
+          • Calls oper() ONLY with torch.Tensors
+        """
+        resolved = []
+        for i, src in enumerate(self.sources):
+            if isinstance(src, Operation):
+                t = src.resolve()
+            elif isinstance(src, torch.Tensor):
+                t = src
+            elif src is None:
+                t = None
+            else:
+                raise TypeError(
+                    f"Failed resolving source {i} for operation '{self.key}' "
+                    f"(source={src!r}, type={type(src).__name__})"
+                )
+            resolved.append(t)
+
+        # Many of your ops already do "if not tensors or tensors[0] is None: return None"
+        # so we don't enforce non-None here globally.
+        return self.oper(*resolved)
+
+    # -------------------------------------------------
+    # Back-compat entrypoint
+    # -------------------------------------------------
     def merge(self):
-        out = self.merge_func(self)
-        return out
+        """
+        Legacy entrypoint. Prefer resolve() going forward.
+        """
+        # If old recursion engine exists and you want to keep it authoritative:
+        # return self.merge_func(self)
+
+        # But if you want to *actually* fix the "Operation passed to oper()" class of bugs,
+        # make merge() delegate to resolve() instead:
+        return self.resolve()
+
     # -------------------------------------------------
     # CANONICAL: cascade fallback validation helper
     # -------------------------------------------------
@@ -293,7 +403,6 @@ class Operation:
         if not isinstance(base, torch.Tensor):
             return None
 
-        # Non-floating tensors are safe passthroughs
         if not base.is_floating_point():
             return base
 
@@ -312,6 +421,69 @@ class Operation:
         Prevents broadcasting and catastrophic allocation.
         """
         return cmn.safe_apply(op, a, b, self.key)
+
+class ScalarGuard(Operation):
+    """
+    ScalarGuard:
+      • Handles 0-D tensors explicitly
+      • NEVER performs arithmetic
+      • Routes scalar values safely
+    """
+
+    def __init__(self, key, *sources, mode="copy_primary"):
+        super().__init__(key, *sources)
+        self.mode = mode  # "copy_primary", "copy_secondary", "reject"
+
+    def oper(self, *tensors):
+        # Expect tensors but allow None
+        tensors = [t for t in tensors if isinstance(t, torch.Tensor)]
+
+        if not tensors:
+            return None
+
+        base = tensors[0]
+
+        # Hard assert: scalar only
+        if base.ndim != 0:
+            raise RuntimeError(
+                f"ScalarGuard used on non-scalar tensor: {self.key} (ndim={base.ndim})"
+            )
+
+        if self.mode == "copy_primary":
+            return tensors[0]
+
+        if self.mode == "copy_secondary" and len(tensors) > 1:
+            return tensors[1]
+
+        # reject → force cascade fallback
+        return None
+
+class ScaleOnly(Operation):
+    """
+    ScaleOnly:
+      • Operates ONLY on 0-D tensors
+      • Explicitly authorized via policy
+    """
+
+    def oper(self, *tensors):
+        for t in tensors:
+            if t is not None and t.ndim != 0:
+                raise RuntimeError(
+                    f"ScaleOnly received non-scalar tensor for key '{self.key}'"
+                )
+
+        scalars = [extract_scalar(t) for t in tensors if t is not None]
+        if not scalars:
+            return None
+
+        if len(scalars) == 1:
+            out = scalars[0]
+        else:
+            alpha = self.alpha if self.alpha is not None else 0.5
+            out = scalars[0] * alpha + scalars[1] * (1 - alpha)
+
+        return torch.tensor(out, device=cmn.device, dtype=cmn.dtype)
+
 
 class SmartResize(Operation):
     """

@@ -1288,7 +1288,7 @@ class HybridCascadeCalc(CalcMode):
         "the safest or most expressive operator per layer "
         "(AdaptiveLERP / DAREWISE / TrainDiff / TIES)"
     )
-    compatible_modes = ["Weight-Sum", "Add Difference"]
+    compatible_modes = ["Weight-Sum", "Add Difference", "QuadSum"]
     input_models = 4  # works with 2–4
 
     # ----------------------------------
@@ -1387,7 +1387,7 @@ CALCMODES_LIST.append(HybridCascadeCalc)
 class HybridCascadeLiteCalc(CalcMode):
     name = "Hybrid Cascade Lite"
     description = "Key-aware, depth-biased adaptive merge (fallback-safe)"
-    compatible_modes = ["Weight-Sum", "Add Difference"]
+    compatible_modes = ["Weight-Sum", "Add Difference",]
     input_models = 2
 
     slid_a_info = "Blend ratio (0 = A, 1 = B)"

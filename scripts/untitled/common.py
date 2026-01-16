@@ -120,7 +120,7 @@ def is_clip_key(key: str) -> bool:
 # === MERGE STATISTICS TRACKER — FINAL 2025 EDITION (HARDENED) ===
 class MergeStats:
     def __init__(self):
-        # ── Core accounting ─────────────────────────────────────
+        # ── Core merge execution accounting ─────────────────────
         self.custom_merges      = 0   # Successful custom / rule-based merges
         self.custom_failed      = 0   # Custom merges attempted but failed safely
 
@@ -129,20 +129,42 @@ class MergeStats:
         self.zero_filled        = 0   # Missing keys filled with zeros (kitchen-sink)
         self.smart_merge        = 0   # Sparse merges with multiple sources
 
+        # ── Scalar-specific execution ──────────────────────────
+        self.scalar_merges      = 0   # Explicit scalar merges (ScaleOnly / ScalarGuard paths)
+        self.scalar_failed      = 0   # Scalar merge attempted but failed safely
+        self.scalar_rejected    = 0   # Scalar handling rejected by policy / whitelist
+
         # ── Failure tracking ────────────────────────────────────
         self.skipped            = 0   # Truly missing keys (should be 0 in true kitchen-sink)
 
+        # ── Selector resolution diagnostics (ROUTING, not merging) ──
+        self.selector_regex     = 0   # Keys matched via regex selectors
+        self.selector_exact     = 0   # Keys matched via exact-key fallback
+        self.selector_glob      = 0   # Keys matched via glob fallback (dangerous / opt-in)
+        self.selector_failed    = 0   # Scalar merge attempted but failed or aborted safely
+
     # ── Safety net: never crash due to missing counters ─────────
     def __getattr__(self, name):
-        if name.endswith("_failed") or name.endswith("_applied") or name.endswith("_attempted"):
+        if (
+            name.endswith("_failed")
+            or name.endswith("_applied")
+            or name.endswith("_attempted")
+        ):
             setattr(self, name, 0)
             return 0
         raise AttributeError(name)
 
+    # ── Execution-only accounting ──────────────────────────────
     def total_processed(self):
+        """
+        Total tensors actually handled by the merge engine.
+        Selector routing and diagnostics are intentionally excluded.
+        """
         return (
             self.custom_merges +
             self.custom_failed +
+            self.scalar_merges +
+            self.scalar_failed +
             self.copied_primary +
             self.smart_resized +
             self.zero_filled +
@@ -153,25 +175,36 @@ class MergeStats:
     def __str__(self):
         total = self.total_processed()
 
-        kitchen_sink = "YES" if self.skipped == 0 else "ALMOST"
+        kitchen_sink  = "YES" if self.skipped == 0 else "ALMOST"
         resize_active = "YES" if self.smart_resized > 0 else "NO"
+        scalar_active = "YES" if self.scalar_merges > 0 else "NO"
 
         return (
             f"### AMETHYST MERGE COMPLETE ###\n"
-            f"  • Custom merges          : {self.custom_merges:,}\n"
-            f"  • Custom failed (safe)   : {self.custom_failed:,}\n"
-            f"  • Copied from Primary     : {self.copied_primary:,}  (metadata, missing keys)\n"
-            f"  • Smart-resized           : {self.smart_resized:,}  ({resize_active})\n"
+            f"  • Custom merges            : {self.custom_merges:,}\n"
+            f"  • Custom failed (safe)     : {self.custom_failed:,}\n"
+            f"  • Scalar merges            : {self.scalar_merges:,}  ({scalar_active})\n"
+            f"  • Scalar failed (safe)     : {self.scalar_failed:,}\n"
+            f"  • Scalar rejected (policy) : {self.scalar_rejected:,}\n"
+            f"  • Copied from Primary      : {self.copied_primary:,}  (metadata, missing keys)\n"
+            f"  • Smart-resized            : {self.smart_resized:,}  ({resize_active})\n"
             f"  • Zero-filled (kitchen-sink): {self.zero_filled:,}\n"
-            f"  • Smart sparse merges     : {self.smart_merge:,}\n"
-            f"  • Skipped (truly missing) : {self.skipped:,}\n"
-            f"  • Total keys processed    : {total:,}\n"
-            f"  • True Kitchen-Sink       : {kitchen_sink}"
+            f"  • Smart sparse merges      : {self.smart_merge:,}\n"
+            f"  • Skipped (truly missing)  : {self.skipped:,}\n"
+            f"  • Total keys processed     : {total:,}\n"
+            f"  • True Kitchen-Sink        : {kitchen_sink}\n"
+            f"\n"
+            f"── Selector Resolution ─────────────────────────\n"
+            f"  • Regex selectors matched  : {self.selector_regex:,}\n"
+            f"  • Exact-key fallbacks      : {self.selector_exact:,}\n"
+            f"  • Glob fallbacks (⚠️)       : {self.selector_glob:,}\n"
+            f"  • Selectors unmatched      : {self.selector_failed:,}"
         )
 
 
 # Global instance
 merge_stats = MergeStats()
+
 
 class MergerContext:
     def __init__(self):

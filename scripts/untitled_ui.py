@@ -693,14 +693,33 @@ def on_ui_tabs():
                                 value=False,
                                 info="Apply narrow regex rules before broad ones. Stronger style transfer; safer OFF by default."
                             )
+                            allow_exact_key_fallback = gr.Checkbox(
+                                label="Allow Exact-Key Selector Fallback",
+                                value=False,
+                                info=(
+                                "If a selector fails to compile as regex, treat it as an exact tensor key.\n"
+                                "Useful for copy-paste from logs or surgical fixes.\n"
+                                "Safe: affects only one tensor."
+                                )
+                            )
+                            allow_glob_fallback = gr.Checkbox(
+                                label="Allow Glob Selector Fallback (Expert)",
+                                value=False,
+                                info=(
+                                "If regex AND exact-key matching fail, treat selector as a glob (* ? []).\n"
+                                "⚠️ Can match many tensors.\n"
+                                "For expert artistic workflows only."
+                                )
+                            )
+
                             copy_vae = gr.Checkbox(
                                 label="Copy VAE from Primary (Recommended)",
-                                value=True,
+                                value=False,
                                 info="Preserve decoding stability and color fidelity"
                             )
                             copy_clip = gr.Checkbox(
                                 label="Copy CLIP from Primary (Recommended)",
-                                value=True,
+                                value=False,
                                 info="Preserve prompt semantics and text understanding"
                             )
                             allow_synthetic_custom_merge = gr.Checkbox(
@@ -713,7 +732,15 @@ def on_ui_tabs():
                                 value=False,
                                 info="Allow numeric merging of integer / boolean tensors "
                             )
+                            allow_scalar_merges = gr.Checkbox(
+                                label="Allow Scalar Tensor Merges (Advanced)",
+                                value=False,
+                                info=(
+                                "Enable controlled merging of 0-D tensors (scalars) such as logit_scale.\n"
+                                "Only whitelisted keys are allowed. Expert use only."
+                                )
 
+                            )
                         # Kitchen-Sink Mode (zero-fill) — save to options
 
                         keep_zero_fill.change(
@@ -726,19 +753,16 @@ def on_ui_tabs():
                             inputs=bloat_mode,
                             outputs=None
                         )
-
                         dual_soul_toggle.change(
                             fn=lambda _: cmn.opts.save(),
                             inputs=dual_soul_toggle,
                             outputs=None
                         )
-
                         sacred_keys_toggle.change(
                             fn=lambda _: cmn.opts.save(),
                             inputs=sacred_keys_toggle,
                             outputs=None
                         )
-
                         smartresize_toggle.change(
                             fn=lambda _: cmn.opts.save(),
                             inputs=smartresize_toggle,
@@ -749,6 +773,16 @@ def on_ui_tabs():
                             inputs=specific_selectors_first,
                             outputs=None
                         )
+                        allow_exact_key_fallback.change(
+                            fn=lambda _: cmn.opts.save(),
+                            inputs=allow_exact_key_fallback,
+                            outputs=None
+                        )
+                        allow_glob_fallback.change(
+                            fn=lambda _: cmn.opts.save(),
+                            inputs=allow_glob_fallback,
+                            outputs=None
+                        )   
                         copy_vae.change(
                             fn=lambda _: cmn.opts.save(),
                             inputs=copy_vae,        
@@ -760,16 +794,21 @@ def on_ui_tabs():
                             outputs=None
                         )
                         allow_synthetic_custom_merge.change(
-                            fn=lambda v: cmn.opts.set(),
+                            fn=lambda v: cmn.opts.save(),
                             inputs=allow_synthetic_custom_merge,
                             outputs=None
                         )
-
                         allow_non_float_merges.change(
-                            fn=lambda v: cmn.opts.set(),
+                            fn=lambda v: cmn.opts.save(),
                             inputs=allow_non_float_merges,
                             outputs=None
-                        )   
+                        )
+                        allow_scalar_merges.change(
+                            fn=lambda _: cmn.opts.save(),
+                            inputs=allow_scalar_merges,
+                            outputs=None
+                        )
+   
 
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
 
@@ -1196,13 +1235,54 @@ def on_ui_tabs():
                             False
                         )
                         cmn.opts.create_option(
+                            'allow_exact_key_fallback',
+                            gr.Checkbox,
+                        {
+                            "label": "Allow Exact-Key Selector Fallback",
+                            "info": (
+                            "If regex selector fails, treat selector as an exact tensor key.\n"
+                            "Safe, single-key only."
+                            )
+                        },
+                            False
+                        )
+
+                        cmn.opts.create_option(
+                            'allow_glob_fallback',
+                            gr.Checkbox,
+                        {
+                            "label": "Allow Glob Selector Fallback (Expert)",
+                            "info": (
+                            "If regex and exact-key matching fail, use glob patterns (* ? []).\n"
+                            "⚠️ Can affect many tensors. Expert use only."
+                            )
+                        },
+                            False
+                        )
+
+                        cmn.opts.create_option(
+                            'allow_scalar_merges',
+                            gr.Checkbox,
+                        {
+                            "label": "Allow Scalar Tensor Merges (Advanced)",
+                            "info": (
+                            "Enable explicit handling of 0-D (scalar) tensors such as logit_scale.\n"
+                            "• OFF: Scalars are copied from primary (default, safest)\n"
+                            "• ON: Whitelisted scalars may be numerically merged\n"
+                            "Applies only to approved scalar keys."
+                            )
+                        },
+                            False
+                        )
+
+                        cmn.opts.create_option(
                             'copy_vae_from_primary',
                             gr.Checkbox,
                         {
                             "label": "Copy VAE from Primary (Recommended)",
                             "info": "Preserve decoding stability and color fidelity"
                         },
-                            True
+                            False
                         )
 
                         cmn.opts.create_option(
@@ -1212,7 +1292,7 @@ def on_ui_tabs():
                             "label": "Copy CLIP from Primary (Recommended)",
                             "info": "Preserve prompt semantics and text understanding"
                         },
-                            True
+                            False
                         )
 
                         cmn.opts.create_option(
@@ -1474,8 +1554,11 @@ def on_ui_tabs():
                             sacred_keys_toggle,
                             smartresize_toggle,
                             specific_selectors_first,
+                            allow_glob_fallback,
+                            allow_exact_key_fallback,
                             allow_synthetic_custom_merge,
                             allow_non_float_merges,
+                            allow_scalar_merges,
                             *custom_sliders,
                         ],
                         outputs=status
@@ -2295,87 +2378,196 @@ script_callbacks.on_ui_tabs(on_ui_tabs)
 # ---------------------------
 # Helper functions
 # ---------------------------
-def start_merge(save_name, save_settings, finetune,
-                merge_mode_selector, calc_mode_selector,
-                model_a, model_b, model_c, model_d,
-                alpha, beta, gamma, delta, epsilon,
-                weight_editor, preset_output,
-                discard, clude, clude_mode,
-                merge_seed, enable_sliders, copy_vae_from_primary,
-                copy_clip_from_primary, dual_soul_toggle, sacred_keys_toggle, smartresize_toggle,
-                specific_selectors_first, allow_synthetic_custom_merge, allow_non_float_merges,
-                *custom_sliders):
-
+def start_merge(
+    save_name, save_settings, finetune,
+    merge_mode_selector, calc_mode_selector,
+    model_a, model_b, model_c, model_d,
+    alpha, beta, gamma, delta, epsilon,
+    weight_editor, preset_output,
+    discard, clude, clude_mode,
+    merge_seed, enable_sliders,
+    copy_vae_from_primary,
+    copy_clip_from_primary,
+    keep_zero_fill,
+    bloat_mode,
+    dual_soul_toggle,
+    sacred_keys_toggle,
+    smartresize_toggle,
+    specific_selectors_first,
+    allow_glob_fallback,
+    allow_exact_key_fallback,
+    allow_synthetic_custom_merge,
+    allow_non_float_merges,
+    *custom_sliders
+):
     progress = Progress()
 
     # ------------------------------------------------------------
     # Policy: UI inputs win. opts are fallback only.
     # ------------------------------------------------------------
     def pick(ui_value, opt_key, default):
-        # Treat None as "not provided"; otherwise trust UI.
+        """
+        UI value wins if provided.
+        Otherwise fall back to opts.
+        Final coercion to bool happens at call site.
+        """
         if ui_value is not None:
             return ui_value
         return cmn.opts.get(opt_key, default)
 
-    keep_zero_fill = cmn.opts.get("keep_zero_fill", True)
-    bloat_mode     = cmn.opts.get("bloat_mode", False)
-
-    # These MUST respect UI toggles
-    dual_soul_toggle              = pick(dual_soul_toggle, "force_cross_arch", False)
-    sacred_keys_toggle            = pick(sacred_keys_toggle, "force_sacred_keys", False)
-    smartresize_toggle            = pick(smartresize_toggle, "force_smartresize", True)
-    specific_selectors_first      = pick(specific_selectors_first, "specific_selectors_first", False)
-
-    copy_vae_from_primary         = pick(copy_vae_from_primary, "copy_vae_from_primary", True)
-    copy_clip_from_primary        = pick(copy_clip_from_primary, "copy_clip_from_primary", True)
-
-    allow_synthetic_custom_merge  = pick(allow_synthetic_custom_merge, "allow_synthetic_custom_merge", False)
-    allow_non_float_merges        = pick(allow_non_float_merges, "allow_non_float_merges", False)
-
-    # Optional: log what actually won (helps you sanity-check UI vs opts)
-    print(
-        f"[UI→Merge] dual_soul={dual_soul_toggle} sacred={sacred_keys_toggle} "
-        f"smartresize={smartresize_toggle} specific_first={specific_selectors_first} "
-        f"synthetic={allow_synthetic_custom_merge} non_float={allow_non_float_merges} "
-        f"copy_vae={copy_vae_from_primary} copy_clip={copy_clip_from_primary}"
+    # ------------------------------------------------------------
+    # USER-DRIVEN policy toggles (strict bool normalization)
+    # ------------------------------------------------------------
+    keep_zero_fill = bool(
+        pick(keep_zero_fill, "keep_zero_fill", True)
     )
+
+    bloat_mode = bool(
+        pick(bloat_mode, "bloat_mode", False)
+    )
+
+    dual_soul_toggle = bool(
+        pick(dual_soul_toggle, "force_cross_arch", False)
+    )
+
+    sacred_keys_toggle = bool(
+        pick(sacred_keys_toggle, "force_sacred_keys", False)
+    )
+
+    smartresize_toggle = bool(
+        pick(smartresize_toggle, "force_smartresize", True)
+    )
+
+    specific_selectors_first = bool(
+        pick(specific_selectors_first, "specific_selectors_first", False)
+    )
+
+    allow_glob_fallback = bool(
+        pick(allow_glob_fallback, "allow_glob_fallback", False)
+    )
+
+    allow_exact_key_fallback = bool(
+        pick(allow_exact_key_fallback, "allow_exact_key_fallback", False)
+    )
+
+    # Hard safety clamp
+    if allow_glob_fallback and not allow_exact_key_fallback:
+        print("[Policy Clamp] Disabling glob fallback (exact-key fallback is OFF)")
+        allow_glob_fallback = False
+
+    copy_vae_from_primary = bool(
+        pick(copy_vae_from_primary, "copy_vae_from_primary", False)
+    )
+
+    copy_clip_from_primary = bool(
+        pick(copy_clip_from_primary, "copy_clip_from_primary", False)
+    )
+
+    allow_synthetic_custom_merge = bool(
+        pick(allow_synthetic_custom_merge, "allow_synthetic_custom_merge", False)
+    )
+
+    allow_non_float_merges = bool(
+        pick(allow_non_float_merges, "allow_non_float_merges", False)
+    )
+
+    allow_scalar_merges = bool(
+        cmn.opts.get("allow_scalar_merges", False)
+    )
+
+    assert isinstance(allow_scalar_merges, bool), \
+        "allow_scalar_merges must be a boolean"
+
+    cmn.allow_scalar_merges = allow_scalar_merges
+
+    print(
+        f"[Policy] Scalar merges "
+        f"{'ENABLED' if cmn.allow_scalar_merges else 'DISABLED'}"
+    )
+
+    # ------------------------------------------------------------
+    # Debug: prove who won (UI vs opts)
+    # ------------------------------------------------------------
+    print(
+        "[UI→Merge] "
+        f"keep_zero={keep_zero_fill} | "
+        f"bloat={bloat_mode} | "
+        f"dual_soul={dual_soul_toggle} | "
+        f"sacred={sacred_keys_toggle} | "
+        f"smartresize={smartresize_toggle} | "
+        f"specific_first={specific_selectors_first} | "
+        f"glob_fallback={allow_glob_fallback} | "
+        f"exact_key_fallback={allow_exact_key_fallback} | "
+        f"synthetic={allow_synthetic_custom_merge} | "
+        f"non_float={allow_non_float_merges} | "
+        f"scalars={allow_scalar_merges} | "
+        f"copy_vae={copy_vae_from_primary} | "
+        f"copy_clip={copy_clip_from_primary}"
+    )
+
+    # ------------------------------------------------------------
+    # Seed normalization (UI-safe)
+    # ------------------------------------------------------------
+    if merge_seed in (None, "", "random", "auto"):
+        seed = -1
+    else:
+        try:
+            seed = int(merge_seed)
+            if seed < -1:
+                raise ValueError ("Seed must be -1 or a non-negative integer")
+        except Exception:
+            raise ValueError(f"Invalid seed value from UI: {merge_seed!r}")
 
     try:
         progress.start_merge(1000)
 
-        merge_args = [
+        merger.prepare_merge(
+            progress,
             save_name,
             save_settings,
             finetune,
             merge_mode_selector,
             calc_mode_selector,
-            model_a, model_b, model_c, model_d,
-            alpha, beta, gamma, delta, epsilon,
+            model_a,
+            model_b,
+            model_c,
+            model_d,
+            alpha,
+            beta,
+            gamma,
+            delta,
+            epsilon,
             weight_editor,
             preset_output or "",
             discard or "",
             clude or "",
             clude_mode,
-            merge_seed,
+            seed,
             enable_sliders,
-            keep_zero_fill,
-            bloat_mode,
-            copy_vae_from_primary,
-            copy_clip_from_primary,
-            dual_soul_toggle,
-            sacred_keys_toggle,
-            smartresize_toggle,
-            specific_selectors_first,
-            allow_synthetic_custom_merge,
-            allow_non_float_merges,
             *custom_sliders,
-        ]
 
-        merger.prepare_merge(progress, *merge_args)
+            # 🔐 keyword-only policy wall
+            keep_zero_fill=keep_zero_fill,
+            bloat_mode=bloat_mode,
+            copy_vae_from_primary=copy_vae_from_primary,
+            copy_clip_from_primary=copy_clip_from_primary,
+            dual_soul_toggle=dual_soul_toggle,
+            sacred_keys_toggle=sacred_keys_toggle,
+            smartresize_toggle=smartresize_toggle,
+            specific_selectors_first=specific_selectors_first,
+            allow_glob_fallback=allow_glob_fallback,
+            allow_exact_key_fallback=allow_exact_key_fallback,
+            allow_synthetic_custom_merge=allow_synthetic_custom_merge,
+            allow_non_float_merges=allow_non_float_merges,
+        )
 
+
+        # Lock UI checkpoint to primary
         try:
             if cmn.primary:
-                base_title = os.path.splitext(os.path.basename(cmn.primary))[0]
+                base_title = os.path.splitext(
+                    os.path.basename(cmn.primary)
+                )[0]
                 shared.opts.sd_model_checkpoint = base_title
                 print(f"[Amethyst] UI checkpoint locked → {base_title}")
         except Exception as e:
@@ -2383,11 +2575,12 @@ def start_merge(save_name, save_settings, finetune,
 
         save_to_history(
             {
-                "models": str(merge_args[3:7]),
-                "modes": f"{merge_args[2]}+{merge_args[1]}",
+                "models": str([model_a, model_b, model_c, model_d]),
+                "modes": f"{finetune}+{save_settings}",
             },
             "Success",
         )
+
 
     except Exception as error:
         merger.clear_cache()
@@ -2400,7 +2593,6 @@ def start_merge(save_name, save_settings, finetune,
             raise
 
     return progress.get_report()
-
 
 
 def universal_model_reload():

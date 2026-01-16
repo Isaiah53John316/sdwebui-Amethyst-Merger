@@ -9,6 +9,7 @@ import re
 import gc
 import random
 import threading
+import fnmatch
 import json
 import psutil
 import time
@@ -27,6 +28,7 @@ from scripts.untitled.common import CLIP_PREFIXES, VAE_PREFIXES, cmn
 from scripts.untitled.common import merge_stats
 from scripts.untitled.operators import WeightsCache
 from scripts.untitled.common import MergerContext
+from scripts.untitled.operators import route_scalar_op
 
 
 # Modern safe imports (2025+)
@@ -207,21 +209,24 @@ def parse_arguments(
     No merge validity checks.
     All enforcement happens downstream.
     """
+    print(f"[DEBUG parse_arguments] seed={seed!r} ({type(seed).__name__})")
 
     mergemode = safe_get_mergemode(mergemode_name)
     calcmode  = safe_get_calcmode(calcmode_name)
     parsed_targets = {}
 
-    # ─────────────────────────────────────────────
-    # Seed handling (STRICT, deterministic)
-    # ─────────────────────────────────────────────
-    try:
-        seed = int(float(seed))
-    except (ValueError, TypeError):
-        raise ValueError("Invalid seed value")
+    # Seed is already normalized upstream:
+    #   - int
+    #   - >= 0 or == -1 (random sentinel)
+    if not isinstance(seed, int):
+        raise ValueError(f"Invalid seed value (expected int): {seed!r}")
 
-    if seed < 0:
+    if seed < -1:
+        raise ValueError(f"Invalid seed value: {seed}")
+
+    if seed == -1:
         seed = random.randint(10**9, 10**10 - 1)
+
 
     cmn.last_merge_seed = seed
 
@@ -344,43 +349,84 @@ def parse_arguments(
 def assign_weights_to_keys(
     targets,
     keys,
-    already_assigned=None,
-    specific_selectors_first=None,
-):
-    if specific_selectors_first is None:
-        specific_selectors_first = cmn.opts.get(
-            "specific_selectors_first", False
-        )
+    specific_selectors_first: bool,
 
-    # ─────────────────────────────────────────────
-    # Selector precedence policy:
-    # ------------------------------------------------------------
-    # specific_selectors_first = False (DEFAULT, safer)
-    #   • Broad selectors (e.g. "model.*", ".*attn.*") apply first
-    #   • Narrow selectors only fill gaps
-    #   • Produces more uniform, conservative merges
-    #   • Best when:
-    #       - Copy VAE from Primary = ON
-    #       - Copy CLIP from Primary = ON
-    #       - User wants structural stability and re-merge safety
-    #
-    # specific_selectors_first = True (style-forward)
-    #   • Narrow selectors apply first (block- or layer-specific)
-    #   • Broad selectors act as fallback
-    #   • Stronger stylistic and attention-level transfer
-    #   • Especially impacts:
-    #       - UNet attention blocks (composition, texture, style)
-    #       - CLIP-related weights *when CLIP merging is enabled*
-    #       - Cross-model stylistic dominance
-    #
-    # IMPORTANT CLARIFICATION:
-    #   • This toggle does NOT force copying or merging of VAE or CLIP
-    #   • VAE and CLIP behavior is controlled separately by user options
-    #   • When VAE / CLIP are merged (not copied), this toggle
-    #     directly affects how strongly their associated weights dominate
-    #   • When VAE / CLIP are copied from primary (default),
-    #     this toggle influences how the UNet aligns stylistically with them
-    # ─────────────────────────────────────────────
+    # NEW selector handling toggles (UI-driven)
+    allow_exact_key_fallback: bool,
+    allow_glob_fallback: bool,
+
+    already_assigned=None,
+):
+    """
+    Assign per-key merge weights using selector rules.
+
+    ─────────────────────────────────────────────
+    SELECTOR RESOLUTION MODES (USER-CONTROLLED)
+    ─────────────────────────────────────────────
+
+    1) STRICT REGEX MODE (DEFAULT, safest)
+       allow_exact_key_fallback = False
+       allow_glob_fallback      = False
+
+       • Selectors MUST compile as regex
+       • Invalid selectors FAIL LOUDLY
+       • No guessing, no expansion
+       • Best for:
+           - Reproducibility
+           - Presets
+           - Cross-architecture merges
+           - Research / auditability
+
+    2) EXACT-KEY FALLBACK MODE
+       allow_exact_key_fallback = True
+       allow_glob_fallback      = False
+
+       • If regex compilation fails:
+           → selector is treated as a literal key
+       • Selector must exactly equal a model key
+       • Affects ONE tensor only
+       • Best for:
+           - Debugging
+           - Copy-paste from logs
+           - Surgical fixes
+
+    3) GLOB FALLBACK MODE (DANGEROUS, EXPLICIT)
+       allow_exact_key_fallback = True
+       allow_glob_fallback      = True
+
+       • If regex fails AND exact-key fails:
+           → selector treated as glob pattern (* ? [])
+       • Can match MANY keys
+       • Strong stylistic / structural impact
+       • Best for:
+           - Artistic exploration
+           - Expert-only workflows
+       • NEVER enable silently
+
+    IMPORTANT:
+      • Fallbacks are attempted IN ORDER:
+            regex → exact-key → glob
+      • Glob fallback is NEVER attempted unless exact-key fallback is enabled
+      • First-wins semantics are preserved (no overwrites)
+
+    ─────────────────────────────────────────────
+    SELECTOR PRECEDENCE POLICY
+    ─────────────────────────────────────────────
+
+    specific_selectors_first = False (DEFAULT, safer)
+      • Broad selectors apply first
+      • Narrow selectors fill gaps
+      • More uniform, conservative merges
+
+    specific_selectors_first = True (style-forward)
+      • Narrow selectors apply first
+      • Broad selectors act as fallback
+      • Stronger stylistic dominance
+
+      • This toggle does NOT force CLIP or VAE merging
+      • CLIP / VAE behavior is controlled elsewhere
+      • This only affects how UNet (and merged components) are weighted
+    """
 
     # ─────────────────────────────────────────────
     # Early exits
@@ -388,40 +434,76 @@ def assign_weights_to_keys(
     if not targets or not keys:
         return already_assigned.copy() if already_assigned else {}
 
-    # Start with already-assigned keys (never overwritten)
     result = already_assigned.copy() if already_assigned else {}
+    unassigned_keys = [k for k in keys if k not in result]
 
-    # ─────────────────────────────────────────────
-    # Precompile regex selectors (FAST PATH)
-    # ─────────────────────────────────────────────
-    assigners = []
+    # Each entry: (matched_keys, weights, selector, mode)
+    # mode ∈ {"regex", "exact", "glob"}
+    matches = []
+
     for selector, weights in targets.items():
-        # Defensive: selectors must map to dict-like weights
         if not isinstance(weights, dict):
-            print(f"[Merger WARNING] Selector '{selector}' has invalid weights, skipping")
-            continue
+            raise RuntimeError(
+                f"[Selector ERROR] Selector '{selector}' has invalid weights: {weights}"
+            )
 
+        # -------------------------
+        # 1) STRICT REGEX
+        # -------------------------
         try:
             regex = mutil.target_to_regex(selector)
             pattern = re.compile(regex)
-            assigners.append((pattern, weights, selector))
-        except re.error as e:
-            print(f"[Merger] Invalid selector regex '{selector}': {e}")
 
-    if not assigners:
-        return result
+            matched = [k for k in unassigned_keys if pattern.search(k)]
+            if matched:
+                matches.append((matched, weights, selector, "regex"))
+                merge_stats.selector_regex += len(matched)
+                continue
 
-    # ─────────────────────────────────────────────
-    # Match selectors against keys
-    # (only keys not already assigned are considered)
-    # ─────────────────────────────────────────────
-    matches = []
-    unassigned_keys = [k for k in keys if k not in result]
+        except re.error:
+            pass  # fall through intentionally
 
-    for pattern, weights, selector in assigners:
-        matched_keys = [k for k in unassigned_keys if pattern.search(k)]
-        if matched_keys:
-            matches.append((matched_keys, weights, selector))
+        # -------------------------
+        # 2) EXACT-KEY FALLBACK
+        # -------------------------
+        if allow_exact_key_fallback and selector in unassigned_keys:
+            matches.append(([selector], weights, selector, "exact"))
+            merge_stats.selector_exact += 1
+            continue
+
+        # -------------------------
+        # 3) GLOB FALLBACK (EXPLICIT)
+        # -------------------------
+        if allow_exact_key_fallback and allow_glob_fallback:
+            try:
+                globbed = [
+                    k for k in unassigned_keys
+                    if fnmatch.fnmatch(k, selector)
+                ]
+                if globbed:
+                    matches.append((globbed, weights, selector, "glob"))
+                    merge_stats.selector_glob += len(globbed)
+                    continue
+            except Exception as e:
+                raise RuntimeError(
+                    f"[Selector ERROR] Glob evaluation failed for '{selector}': {e}"
+                )
+
+        # -------------------------
+        # FAILURE (LOUD)
+        # -------------------------
+        merge_stats.selector_failed += 1
+        raise RuntimeError(
+            f"[Selector ERROR] Selector '{selector}' did not match any keys.\n"
+            f"Resolution attempted:\n"
+            f"  • regex             : FAILED\n"
+            f"  • exact-key fallback : {'ENABLED' if allow_exact_key_fallback else 'DISABLED'}\n"
+            f"  • glob fallback      : {'ENABLED' if allow_glob_fallback else 'DISABLED'}\n\n"
+            f"Fix one of the following:\n"
+            f"  • Correct the selector syntax\n"
+            f"  • Enable exact-key fallback and use a full key name\n"
+            f"  • Enable glob fallback (expert mode)"
+        )
 
     if not matches:
         print("[Merger WARNING] No selectors matched any keys")
@@ -431,36 +513,40 @@ def assign_weights_to_keys(
     # Selector precedence policy
     # ─────────────────────────────────────────────
     if specific_selectors_first:
-        # Narrow selectors first → stronger stylistic control
-        # Tie-break on selector string for determinism
         matches.sort(key=lambda x: (len(x[0]), x[2]))
         policy = "SPECIFIC → BROAD (style-forward)"
     else:
-        # Broad selectors first → safer, more uniform merges
         matches.sort(key=lambda x: (-len(x[0]), x[2]))
         policy = "BROAD → SPECIFIC (safe-default)"
 
     print(f"[Merger] Selector precedence policy: {policy}")
 
     # ─────────────────────────────────────────────
-    # Build assignment map
-    # First-wins semantics: assignments are NEVER overwritten
+    # Build assignment map (first-wins)
     # ─────────────────────────────────────────────
     assigned_count = 0
 
-    for key_list, weights, selector in matches:
+    for key_list, weights, selector, mode in matches:
         for key in key_list:
             if key not in result:
-                # Defensive copy of weights
                 result[key] = dict(weights)
                 assigned_count += 1
 
+        if mode == "glob":
+            print(
+                f"[Merger WARNING] Glob selector '{selector}' matched "
+                f"{len(key_list)} keys"
+            )
+
     print(
         f"[Merger] Weight assignment → {assigned_count}/{len(keys)} keys matched "
-        f"(specific_first={specific_selectors_first})"
+        f"(specific_first={specific_selectors_first}, "
+        f"exact_fallback={allow_exact_key_fallback}, "
+        f"glob_fallback={allow_glob_fallback})"
     )
 
     return result
+
 
 
 def create_tasks(
@@ -471,15 +557,14 @@ def create_tasks(
     assigned_keys,
     discard_keys,
     checkpoints,
-    merge_stats,
     alpha,
     beta,
     gamma,
     delta,
     epsilon,
-    keep_zero_fill=True,
-    bloat_mode=False,
+    
 ):
+
     """
     2025 KITCHEN-SINK MAXIMALISM — FINAL FORM
 
@@ -618,22 +703,45 @@ def prepare_merge(
     progress, save_name, save_settings, finetune,
     merge_mode_selector, calc_mode_selector,
     model_a, model_b, model_c, model_d,
+
     alpha, beta, gamma, delta, epsilon,
+
     weight_editor, preset_output,
     discard, clude, clude_mode,
-    merge_seed, enable_sliders,
-    keep_zero_fill=True,
-    bloat_mode=False,
-    copy_vae_from_primary=True,
-    copy_clip_from_primary=True,
-    dual_soul_toggle=False,
-    sacred_keys_toggle=False,
-    smartresize_toggle=True,
-    specific_selectors_first=False,
-    allow_synthetic_custom_merge=False,
-    allow_non_float_merges=False,
+    seed, enable_sliders,
+
     *custom_sliders,
+
+    copy_vae_from_primary: bool,
+    copy_clip_from_primary: bool,
+    keep_zero_fill: bool,
+    bloat_mode: bool,
+    dual_soul_toggle: bool,
+    sacred_keys_toggle: bool,
+    smartresize_toggle: bool,
+    specific_selectors_first: bool,
+    allow_glob_fallback: bool,
+    allow_exact_key_fallback: bool,
+    allow_synthetic_custom_merge: bool,
+    allow_non_float_merges: bool,
 ):
+
+    # ------------------------------------------------------------
+    # Seed normalization (defensive, internal contract)
+    # ------------------------------------------------------------
+    if seed in (None, "", "random", "auto"):
+        seed = -1
+    else:
+        try:
+            seed = int(seed)
+            if seed < -1:
+                raise ValueError
+        except Exception:
+            raise ValueError(f"Invalid seed value passed to prepare_merge: {seed!r}")
+        
+    progress(f"[DEBUG prepare_merge] normalized seed={seed!r} ({type(seed).__name__})")
+
+
     progress("\n### Preparing merge ###")
     print(
         f"[Policy] copy_vae={copy_vae_from_primary} | "
@@ -646,7 +754,7 @@ def prepare_merge(
 
     # Reset merge stats (safe, no-op if unsupported)
     try:
-        merge_stats.reset()
+        cmn.merge_stats.reset()
     except Exception:
         pass
 
@@ -667,7 +775,7 @@ def prepare_merge(
         discard,
         clude,
         clude_mode,
-        merge_seed,
+        seed,
         enable_sliders,
         *custom_sliders
     )
@@ -762,6 +870,8 @@ def prepare_merge(
             targets,
             keys,
             specific_selectors_first=specific_selectors_first,
+            allow_exact_key_fallback=allow_exact_key_fallback,
+            allow_glob_fallback=allow_glob_fallback,
         )
 
         tasks = create_tasks(
@@ -772,14 +882,12 @@ def prepare_merge(
             assigned_keys,
             discard_keys,
             checkpoints,
-            merge_stats,
+
             alpha=alpha,
             beta=beta,
             gamma=gamma,
             delta=delta,
             epsilon=epsilon,
-            keep_zero_fill=keep_zero_fill,
-            bloat_mode=bloat_mode,
         )
 
         if not tasks:
@@ -794,15 +902,9 @@ def prepare_merge(
             tasks,
             {},
             progress,
-            mergemode,
-            calcmode,
-            alpha, beta, gamma, delta, epsilon,
-            weight_editor,
-            discard,
-            clude,
-            clude_mode,
-            timer,
-            threads=cmn.opts.get("threads", 8),
+
+            merge_stats=merge_stats,
+
             keep_zero_fill=keep_zero_fill,
             bloat_mode=bloat_mode,
             copy_vae_from_primary=copy_vae_from_primary,
@@ -978,14 +1080,21 @@ def prepare_merge(
 def do_merge(
     model_a, model_b, model_c, model_d,
     checkpoints, tasks, state_dict, progress,
-    merge_mode, calc_mode,
-    alpha=0, beta=0, gamma=0, delta=0, epsilon=0,
-    weight_editor="", discard="", clude="", clude_mode="Exclude",
-    timer=None, threads=8, keep_zero_fill=True, bloat_mode=False,
-    copy_vae_from_primary=True, copy_clip_from_primary=True,
-    dual_soul_toggle=False, sacred_keys_toggle=False, smartresize_toggle=True,
-    allow_synthetic_custom_merge=False, allow_non_float_merges=False,
+    *,
+    merge_stats,
+    copy_vae_from_primary: bool,
+    copy_clip_from_primary: bool,
+    keep_zero_fill: bool,
+    bloat_mode: bool,
+    dual_soul_toggle: bool,
+    sacred_keys_toggle: bool,
+    smartresize_toggle: bool,
+    allow_synthetic_custom_merge: bool,
+    allow_non_float_merges: bool,
+    timer=None,
+
 ):
+
     """
     2025 KITCHEN-SINK MERGE ENGINE
     do_merge is a dispatcher only:
@@ -1000,6 +1109,8 @@ def do_merge(
     # - device/dtype correctness
     """
     progress("### Starting merge ###")
+
+    threads = int(cmn.opts.get("threads", 8))
 
     # ------------------------------------------------------------
     # 0. Disk IO monitor (optional)
@@ -1144,6 +1255,11 @@ def do_merge(
     cmn.dual_soul_enabled   = bool(dual_soul_toggle)
     cmn.sacred_enabled      = bool(sacred_keys_toggle)
     cmn.smartresize_enabled = bool(smartresize_toggle)
+    cmn.keep_zero_fill = bool(keep_zero_fill)
+    cmn.bloat_mode     = bool(bloat_mode)
+    cmn.allow_synthetic_custom_merge = bool(allow_synthetic_custom_merge)
+    cmn.allow_non_float_merges       = bool(allow_non_float_merges)
+
 
     if cmn.dual_soul_enabled:
         progress("[Policy Override] Dual-Soul ENABLED by user")
@@ -1154,9 +1270,21 @@ def do_merge(
     if cmn.smartresize_enabled:
         progress("[Policy Override] SmartResize ENABLED by user")
 
+    if cmn.keep_zero_fill:
+        progress("[Policy Override] Keep Zero Fill ENABLED by user")
+
+    if cmn.bloat_mode:
+        progress("[Policy Override] Bloat Mode ENABLED by user")
+
+    if cmn.allow_synthetic_custom_merge:
+        progress("[Policy Override] Synthetic Custom Merges ENABLED by user")
+    
+    if cmn.allow_non_float_merges:
+        progress("[Policy Override] Non-Float Merges ENABLED by user")
+
+
     # Pass-through policy toggles used by initialize_task() eligibility logic
-    cmn.allow_synthetic_custom_merge = bool(allow_synthetic_custom_merge)
-    cmn.allow_non_float_merges = bool(allow_non_float_merges)
+
 
     print(
         f"[Policy] same_arch={cmn.same_arch} | "
@@ -1164,7 +1292,9 @@ def do_merge(
         f"sacred={'ON' if cmn.sacred_enabled else 'OFF'} | "
         f"smartresize={'ON' if cmn.smartresize_enabled else 'OFF'} | "
         f"synthetic_custom={'ON' if cmn.allow_synthetic_custom_merge else 'OFF'} | "
-        f"non_float_merges={'ON' if cmn.allow_non_float_merges else 'OFF'}"
+        f"non_float_merges={'ON' if cmn.allow_non_float_merges else 'OFF'} | "
+        f"keep_zero_fill={'ON' if cmn.keep_zero_fill else 'OFF'} | "
+        f"bloat_mode={'ON' if cmn.bloat_mode else 'OFF'} "
     )
 
     # ------------------------------------------------------------
@@ -1361,12 +1491,10 @@ def initialize_task(task):
             has_all_sources = False
             break
 
-    allow_synthetic = getattr(
-        cmn, "allow_synthetic_custom_merge",
-        cmn.opts.get("allow_synthetic_custom_merge", False)
-    )
+    allow_synthetic = bool(getattr(cmn, "allow_synthetic_custom_merge"))
 
-    keep_zero_fill = cmn.opts.get("keep_zero_fill", False)
+
+    keep_zero_fill = cmn.keep_zero_fill
 
     synthetic_allowed = (
         allow_synthetic
@@ -1478,15 +1606,40 @@ def initialize_task(task):
             print(f"[Sparse] FAILED {key} from {cp_path}: {e}")
 
     # =====================================================
+    # 3.5) SCALAR ROUTING (MANDATORY, POLICY-GATED)
+    # =====================================================
+    if tensors and all(isinstance(t, torch.Tensor) and t.ndim == 0 for t in tensors):
+        try:
+            scalar_op = route_scalar_op(key, *tensors)
+
+            if scalar_op is None:
+                merge_stats.scalar_rejected += 1
+                print(f"[ScalarRejected] {key}")
+
+            else:
+                out = scalar_op.merge()
+                if out is not None:
+                    merge_stats.scalar_merges += 1
+                    print(f"[ScalarMerge] {key} ← {scalar_op.__class__.__name__}")
+                    return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
+
+                merge_stats.scalar_rejected += 1
+                print(f"[ScalarRejected] {key} (op returned None)")
+
+        except Exception as e:
+            merge_stats.scalar_failed += 1
+            print(f"[ScalarMerge:FAILED] {key}: {type(e).__name__}: {e}")
+            print("[ScalarFallback] Continuing fallback ladder")
+
+
+    # =====================================================
     # 4a) POLICY LADDER
     # =====================================================
-    allow_non_float = getattr(
-        cmn, "allow_non_float_merges",
-        cmn.opts.get("allow_non_float_merges", False)
-    )
+    allow_non_float = cmn.allow_non_float_merges
 
     if tensors and not cmn.is_mergeable_tensor(tensors[0]):
         if not allow_non_float:
+
             try:
                 op = cmn.copy_fallback(key, tensors, prefer=0)
                 out = op.merge()
@@ -1531,7 +1684,7 @@ def initialize_task(task):
             except Exception as e:
                 print(f"[FinalCopy] FAILED {key}: {e}")
 
-        if target_shape is not None and cmn.opts.get("keep_zero_fill", True):
+        if target_shape is not None and cmn.keep_zero_fill:
             merge_stats.zero_filled += 1
             print(f"[ZeroFill] {key}")
             return key, torch.zeros(
