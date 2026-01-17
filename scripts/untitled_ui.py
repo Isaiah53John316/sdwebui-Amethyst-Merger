@@ -974,7 +974,7 @@ def on_ui_tabs():
                                     "label": "CLIP / VAE Strength",
                                     "info": "Lower values preserve semantic & decoding stability"
                                 },
-                                default=0.6
+                                default=0.35
                             )
 
                             cmn.opts.create_option(
@@ -987,7 +987,7 @@ def on_ui_tabs():
                                     "label": "CLIP / VAE Confidence",
                                     "info": "Lower = more conservative blending"
                                 },
-                                default=0.35
+                                default=0.20
                             )
 
                             cmn.opts.create_option(
@@ -1000,7 +1000,7 @@ def on_ui_tabs():
                                     "label": "CLIP / VAE Temperature",
                                     "info": "Higher = gentler, smoother weighting"
                                 },
-                                default=2.0
+                                default=3.0
                             )
 
                         # -------------------------------------------------

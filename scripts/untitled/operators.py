@@ -281,7 +281,15 @@ class Operation:
     """
     def __init__(self, key, *sources):
         self.key = key
-        self.sources = tuple(sources)
+
+        lifted = []
+        for src in sources:
+            if isinstance(src, (int, float)):
+                lifted.append(ScalarConst(key, src))
+            else:
+                lifted.append(src)
+
+        self.sources = tuple(lifted)
 
         # Optional knobs many ops use (kept for hashing stability)
         self.alpha = None
@@ -421,6 +429,18 @@ class Operation:
         Prevents broadcasting and catastrophic allocation.
         """
         return cmn.safe_apply(op, a, b, self.key)
+    
+class ScalarConst(Operation):
+    def __init__(self, key, value: float):
+        super().__init__(key)
+        self.value = float(value)
+
+    def oper(self):
+        return torch.tensor(
+            self.value,
+            device=cmn.get_device(),
+            dtype=cmn.get_dtype()
+        )
 
 class ScalarGuard(Operation):
     """
