@@ -4836,7 +4836,7 @@ class HybridCascade(Operation):
         # CLIP/VAE profile (gentler)
         clip_vae_mix: float = 0.60,
         clip_vae_conf: float = 0.35,
-        clip_vae_temp: float = 2.0,
+        clip_vae_temp: float = 2.5,
 
         # Noise/time profile (very gentle)
         noise_mix: float = 0.40,
@@ -4854,7 +4854,7 @@ class HybridCascade(Operation):
         traindiff_strength: float = 0.50,
 
         # Optional: TIES before detail ops
-        use_ties: bool = False,
+        use_ties: bool = True,
         ties_density: float = 0.35,
         ties_seed: int = 42,
 

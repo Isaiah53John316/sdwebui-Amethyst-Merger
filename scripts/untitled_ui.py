@@ -690,12 +690,12 @@ def on_ui_tabs():
                             )
                             specific_selectors_first = gr.Checkbox(
                                 label="Style-First Weight Matching",
-                                value=False,
+                                value=True,
                                 info="Apply narrow regex rules before broad ones. Stronger style transfer; safer OFF by default."
                             )
                             allow_exact_key_fallback = gr.Checkbox(
                                 label="Allow Exact-Key Selector Fallback",
-                                value=False,
+                                value=True,
                                 info=(
                                 "If a selector fails to compile as regex, treat it as an exact tensor key.\n"
                                 "Useful for copy-paste from logs or surgical fixes.\n"
@@ -704,7 +704,7 @@ def on_ui_tabs():
                             )
                             allow_glob_fallback = gr.Checkbox(
                                 label="Allow Glob Selector Fallback (Expert)",
-                                value=False,
+                                value=True,
                                 info=(
                                 "If regex AND exact-key matching fail, treat selector as a glob (* ? []).\n"
                                 "⚠️ Can match many tensors.\n"
@@ -724,17 +724,17 @@ def on_ui_tabs():
                             )
                             allow_synthetic_custom_merge = gr.Checkbox(
                                 label="Allow Synthetic Custom Merges (Unsafe)",
-                                value=False,
+                                value=True,
                                 info="May inject zero-filled or resized tensors into custom merge math."
                             )
                             allow_non_float_merges = gr.Checkbox(
                                 label="Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
-                                value=False,
+                                value=True,
                                 info="Allow numeric merging of integer / boolean tensors "
                             )
                             allow_scalar_merges = gr.Checkbox(
                                 label="Allow Scalar Tensor Merges (Advanced)",
-                                value=False,
+                                value=True,
                                 info=(
                                 "Enable controlled merging of 0-D tensors (scalars) such as logit_scale.\n"
                                 "Only whitelisted keys are allowed. Expert use only."
@@ -1232,7 +1232,7 @@ def on_ui_tabs():
                             "label": "Style-First Weight Matching",
                             "info": "Apply narrow regex rules before broad ones. Stronger style transfer."
                         },
-                            False
+                            True
                         )
                         cmn.opts.create_option(
                             'allow_exact_key_fallback',
@@ -1244,7 +1244,7 @@ def on_ui_tabs():
                             "Safe, single-key only."
                             )
                         },
-                            False
+                            True
                         )
 
                         cmn.opts.create_option(
@@ -1257,7 +1257,7 @@ def on_ui_tabs():
                             "⚠️ Can affect many tensors. Expert use only."
                             )
                         },
-                            False
+                            True
                         )
 
                         cmn.opts.create_option(
@@ -1272,7 +1272,7 @@ def on_ui_tabs():
                             "Applies only to approved scalar keys."
                             )
                         },
-                            False
+                            True
                         )
 
                         cmn.opts.create_option(
@@ -1302,7 +1302,7 @@ def on_ui_tabs():
                             "label": "Allow Synthetic Tensors for Custom Merges (Unsafe)",
                             "info": "May inject zero-filled or resized tensors into custom merge math. "
                         },
-                            False
+                            True
                         )
                         cmn.opts.create_option(
                             'allow_non_float_merges',
@@ -1311,7 +1311,7 @@ def on_ui_tabs():
                             "label": "Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
                             "info": "Allow numeric merging of integer or boolean tensors such as position_ids or attention masks."
                         },
-                            False   
+                            True   
                         )
 
 
@@ -2439,15 +2439,15 @@ def start_merge(
     )
 
     specific_selectors_first = bool(
-        pick(specific_selectors_first, "specific_selectors_first", False)
+        pick(specific_selectors_first, "specific_selectors_first", True)
     )
 
     allow_glob_fallback = bool(
-        pick(allow_glob_fallback, "allow_glob_fallback", False)
+        pick(allow_glob_fallback, "allow_glob_fallback", True)
     )
 
     allow_exact_key_fallback = bool(
-        pick(allow_exact_key_fallback, "allow_exact_key_fallback", False)
+        pick(allow_exact_key_fallback, "allow_exact_key_fallback", True)
     )
 
     # Hard safety clamp
@@ -2464,15 +2464,15 @@ def start_merge(
     )
 
     allow_synthetic_custom_merge = bool(
-        pick(allow_synthetic_custom_merge, "allow_synthetic_custom_merge", False)
+        pick(allow_synthetic_custom_merge, "allow_synthetic_custom_merge", True)
     )
 
     allow_non_float_merges = bool(
-        pick(allow_non_float_merges, "allow_non_float_merges", False)
+        pick(allow_non_float_merges, "allow_non_float_merges", True)
     )
 
     allow_scalar_merges = bool(
-        cmn.opts.get("allow_scalar_merges", False)
+        cmn.opts.get("allow_scalar_merges", True)
     )
 
     assert isinstance(allow_scalar_merges, bool), \

@@ -1323,10 +1323,10 @@ class HybridCascadeCalc(CalcMode):
         model_b,
         model_c,
         model_d,
-        alpha=0.5,   # confidence
-        beta=0.35,   # depth bias
-        gamma=0.5,   # TrainDiff strength
-        delta=0.35,  # DARE/WISE density
+        alpha=0.55,   # confidence
+        beta=0.45,   # depth bias
+        gamma=0.3,   # TrainDiff strength
+        delta=0.3,  # DARE/WISE density
         epsilon=0.0, # TIES density
         **kwargs
     ):
