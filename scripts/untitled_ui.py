@@ -1205,7 +1205,7 @@ def on_ui_tabs():
                         },
                             False
                         )
-
+ 
                         cmn.opts.create_option(
                             'force_sacred_keys',
                             gr.Checkbox,

@@ -1823,7 +1823,7 @@ class safe_open_multiple:
 
         self._contexts.clear()
         self.open_files.clear()
-
+ 
 # 3. clear_cache — tiny improvement
 def clear_cache():
     """Clear everything so the next merge starts completely clean"""

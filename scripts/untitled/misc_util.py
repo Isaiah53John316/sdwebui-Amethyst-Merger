@@ -170,7 +170,7 @@ def target_to_regex(target_input: str | list) -> str:
         targets = [t.strip() for t in str(target_input).split(',') if t.strip()]
 
     patterns = []
-
+ 
     for target in targets:
         if not target:
             continue

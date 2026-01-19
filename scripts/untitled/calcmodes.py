@@ -1250,7 +1250,7 @@ class HybridCascadeSimple3Calc(CalcMode):
 
     slid_c_info = "Confidence (0 = stable, 1 = aggressive hybrid)"
     slid_c_config = (0.0, 1.0, 0.01)
-
+ 
     def modify_recipe(
         recipe, key,
         model_a, model_b, model_c, model_d,

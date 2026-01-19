@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from modules import shared
 from safetensors.torch import safe_open
-
+ 
 SACRED_PATTERNS = (
     # ── Sampling-critical (noise / timestep math) ──
     "conv_in.",

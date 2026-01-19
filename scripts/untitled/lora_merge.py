@@ -412,7 +412,7 @@ def merge_loras_resilient(lora_paths: list[str], output_path: str, weights=None,
             if progress:
                 progress(f"  Empty or corrupted LoRA: {filename}")
             continue
-
+ 
         if merged is None:
             # First LoRA defines the base
             merged = {k: t.clone() * weight for k, t in lora_dict.items()}
