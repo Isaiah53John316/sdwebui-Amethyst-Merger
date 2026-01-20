@@ -244,6 +244,19 @@ class MergerContext:
         self.stop = False
         self.interrupted = False
 
+        # Fallback / copy behavior
+        self.keep_zero_fill = True
+        self.bloat_mode = False
+
+        # Merge permissions
+        self.allow_non_float_merges = True
+        self.allow_synthetic_custom_merge = True
+        self.allow_glob_fallback = True
+        self.allow_exact_key_fallback = True
+
+        # Scalar policy
+        self.allow_scalar_merges = True
+
     # -------------------------------------------------
     # Accessors
     # -------------------------------------------------
@@ -291,6 +304,17 @@ class MergerContext:
         if isinstance(self.opts, dict):
             return self.opts.get(key, default)
         return default
+    
+    def copy_fallback(self, key: str, tensors, prefer=0):
+        from scripts.untitled.operators import CopyPrimary
+
+        return CopyPrimary(
+            key=key,
+            primary_path=self.primary,
+            stats=getattr(self, "merge_stats", None),
+            keep_zero_fill=bool(self.keep_zero_fill),
+            bloat_mode=bool(self.bloat_mode),
+        )
 
     # -------------------------------------------------
     # Fallback helpers

@@ -2485,6 +2485,18 @@ def start_merge(
         f"{'ENABLED' if cmn.allow_scalar_merges else 'DISABLED'}"
     )
 
+    cmn.keep_zero_fill = keep_zero_fill
+    cmn.bloat_mode = bloat_mode
+
+    cmn.dual_soul_enabled = dual_soul_toggle
+    cmn.sacred_enabled = sacred_keys_toggle
+    cmn.smartresize_enabled = smartresize_toggle
+
+    cmn.allow_glob_fallback = allow_glob_fallback
+    cmn.allow_exact_key_fallback = allow_exact_key_fallback
+    cmn.allow_synthetic_custom_merge = allow_synthetic_custom_merge
+    cmn.allow_non_float_merges = allow_non_float_merges
+
     # ------------------------------------------------------------
     # Debug: prove who won (UI vs opts)
     # ------------------------------------------------------------

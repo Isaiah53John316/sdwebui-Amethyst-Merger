@@ -1112,6 +1112,10 @@ def do_merge(
 
     threads = int(cmn.opts.get("threads", 8))
 
+    copy_vae_from_primary = bool(int(copy_vae_from_primary))
+    copy_clip_from_primary = bool(int(copy_clip_from_primary))
+
+
     # ------------------------------------------------------------
     # 0. Disk IO monitor (optional)
     # ------------------------------------------------------------

@@ -15,7 +15,6 @@ from typing import List, Optional
 
 # Scalar merge policy (advanced, OFF by default)
 # Scalars are routed via ScalarGuard / ScaleOnly in initialize_task()
-cmn.allow_scalar_merges = False  # UI toggle (default OFF)
 
 cmn.scalar_whitelist = {
     "logit_scale",
@@ -713,7 +712,7 @@ class CopyPrimary(Operation):
 
     """
 
-    def __init__(self, key, primary_path, stats=None, keep_zero_fill=False, bloat_mode=False):
+    def __init__(self, key, primary_path, keep_zero_fill: bool, bloat_mode: bool, stats=None,):
         super().__init__(key)
         self.primary_path = primary_path
         self.stats = stats
