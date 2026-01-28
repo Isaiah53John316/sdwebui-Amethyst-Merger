@@ -50,7 +50,7 @@ class MergeInterruptedError(Exception):
     def __init__(self,*args):
         super().__init__(*args)
 
-VALUE_NAMES = ('alpha','beta','gamma','delta')
+VALUE_NAMES = ('alpha','beta','gamma','delta','epsilon','zeta','eta','theta','iota','kappa','lambda','mu','nu','xi','omicron','pi','rho','sigma','tau','upsilon')
 
 mergemode_selection = {obj.name: obj for obj in calcmodes.MERGEMODES_LIST}
 calcmode_selection  = {obj.name: obj for obj in calcmodes.CALCMODES_LIST}
@@ -198,7 +198,7 @@ def parse_arguments(
     progress,
     mergemode_name, calcmode_name,
     model_a, model_b, model_c, model_d,
-    slider_a, slider_b, slider_c, slider_d, slider_e,
+    slider_a, slider_b, slider_c, slider_d, slider_e, slider_f, slider_g, slider_h, slider_i, slider_j, slider_k, slider_l, slider_m, slider_n, slider_o, slider_p, slider_q, slider_r, slider_s, slider_t,
     editor, discard, clude, clude_mode,
     seed, enable_sliders, *custom_sliders
 ):
@@ -270,13 +270,28 @@ def parse_arguments(
         if not editor_text:
             raise ValueError("Weight editor is empty or only comments")
 
-        # Replace slider_a ... slider_e with numeric values
+        # Replace slider_a ... slider_t with numeric values
         slider_map = {
             'slider_a': float(slider_a),
             'slider_b': float(slider_b),
             'slider_c': float(slider_c),
             'slider_d': float(slider_d),
             'slider_e': float(slider_e),
+            'slider_f': float(slider_f),
+            'slider_g': float(slider_g),
+            'slider_h': float(slider_h),
+            'slider_i': float(slider_i),
+            'slider_j': float(slider_j),
+            'slider_k': float(slider_k),
+            'slider_l': float(slider_l),
+            'slider_m': float(slider_m),
+            'slider_n': float(slider_n),
+            'slider_o': float(slider_o),
+            'slider_p': float(slider_p),
+            'slider_q': float(slider_q),
+            'slider_r': float(slider_r),
+            'slider_s': float(slider_s),
+            'slider_t': float(slider_t),
         }
 
         editor_text = re.sub(
@@ -346,17 +361,8 @@ def parse_arguments(
 
     return parsed_targets, checkpoints, mergemode, calcmode, seed
 
-def assign_weights_to_keys(
-    targets,
-    keys,
-    specific_selectors_first: bool,
+def assign_weights_to_keys(cmn, targets, keys, already_assigned=None):
 
-    # NEW selector handling toggles (UI-driven)
-    allow_exact_key_fallback: bool,
-    allow_glob_fallback: bool,
-
-    already_assigned=None,
-):
     """
     Assign per-key merge weights using selector rules.
 
@@ -431,6 +437,13 @@ def assign_weights_to_keys(
     # ─────────────────────────────────────────────
     # Early exits
     # ─────────────────────────────────────────────
+    cmn.specific_selectors_first = bool(cmn.specific_selectors_first)
+    cmn.allow_exact_key_fallback = bool(cmn.allow_exact_key_fallback)
+    cmn.allow_glob_fallback = bool(cmn.allow_glob_fallback)
+
+    if already_assigned is not None and not isinstance(already_assigned, dict):
+        raise TypeError("already_assigned must be a dict or None")
+
     if not targets or not keys:
         return already_assigned.copy() if already_assigned else {}
 
@@ -466,7 +479,7 @@ def assign_weights_to_keys(
         # -------------------------
         # 2) EXACT-KEY FALLBACK
         # -------------------------
-        if allow_exact_key_fallback and selector in unassigned_keys:
+        if cmn.allow_exact_key_fallback and selector in unassigned_keys:
             matches.append(([selector], weights, selector, "exact"))
             merge_stats.selector_exact += 1
             continue
@@ -474,7 +487,7 @@ def assign_weights_to_keys(
         # -------------------------
         # 3) GLOB FALLBACK (EXPLICIT)
         # -------------------------
-        if allow_exact_key_fallback and allow_glob_fallback:
+        if cmn.allow_exact_key_fallback and cmn.allow_glob_fallback:
             try:
                 globbed = [
                     k for k in unassigned_keys
@@ -497,8 +510,8 @@ def assign_weights_to_keys(
             f"[Selector ERROR] Selector '{selector}' did not match any keys.\n"
             f"Resolution attempted:\n"
             f"  • regex             : FAILED\n"
-            f"  • exact-key fallback : {'ENABLED' if allow_exact_key_fallback else 'DISABLED'}\n"
-            f"  • glob fallback      : {'ENABLED' if allow_glob_fallback else 'DISABLED'}\n\n"
+            f"  • exact-key fallback : {'ENABLED' if cmn.allow_exact_key_fallback else 'DISABLED'}\n"
+            f"  • glob fallback      : {'ENABLED' if cmn.allow_glob_fallback else 'DISABLED'}\n\n"
             f"Fix one of the following:\n"
             f"  • Correct the selector syntax\n"
             f"  • Enable exact-key fallback and use a full key name\n"
@@ -512,7 +525,7 @@ def assign_weights_to_keys(
     # ─────────────────────────────────────────────
     # Selector precedence policy
     # ─────────────────────────────────────────────
-    if specific_selectors_first:
+    if cmn.specific_selectors_first:
         matches.sort(key=lambda x: (len(x[0]), x[2]))
         policy = "SPECIFIC → BROAD (style-forward)"
     else:
@@ -540,9 +553,9 @@ def assign_weights_to_keys(
 
     print(
         f"[Merger] Weight assignment → {assigned_count}/{len(keys)} keys matched "
-        f"(specific_first={specific_selectors_first}, "
-        f"exact_fallback={allow_exact_key_fallback}, "
-        f"glob_fallback={allow_glob_fallback})"
+        f"(specific_first={cmn.specific_selectors_first}, "
+        f"exact_fallback={cmn.allow_exact_key_fallback}, "
+        f"glob_fallback={cmn.allow_glob_fallback})"
     )
 
     return result
@@ -562,6 +575,21 @@ def create_tasks(
     gamma,
     delta,
     epsilon,
+    zeta,
+    eta,
+    theta,
+    iota,
+    kappa,
+    lambda_,
+    mu,
+    nu,
+    xi,
+    omicron,
+    pi,
+    rho,
+    sigma,
+    tau,
+    upsilon,
     
 ):
 
@@ -585,7 +613,7 @@ def create_tasks(
 
     # Treat sliders as active if *any* contributes non-zero signal
     sliders_active = any(
-        float(v) != 0.0 for v in (alpha, beta, gamma, delta, epsilon)
+        float(v) != 0.0 for v in (alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon)
     )
 
     # Defensive normalization
@@ -597,6 +625,7 @@ def create_tasks(
         # Discard policy (absolute)
         # -------------------------------------------------
         if key in discard_keys:
+            progress(f"[Discarded] {key}")
             continue
 
         # -------------------------------------------------
@@ -604,6 +633,18 @@ def create_tasks(
         # -------------------------------------------------
         if key in assigned_keys:
             rule = assigned_keys[key]
+            
+        # Validate per-key rule
+            if not isinstance(rule, dict):
+                raise TypeError(
+                    f"[TaskBuild ERROR] Rule for key '{key}' is not a dict: {rule!r}"
+                )
+            for k in rule:
+                if not isinstance(k, str):
+                    raise TypeError(
+                        f"[TaskBuild ERROR] Rule key for '{key}' must be str, got {type(k).__name__}"
+                    )
+
             try:
                 custom_count += 1
 
@@ -646,6 +687,21 @@ def create_tasks(
                     gamma=gamma,
                     delta=delta,
                     epsilon=epsilon,
+                    zeta=zeta,
+                    eta=eta,
+                    theta=theta,
+                    iota=iota,
+                    kappa=kappa,
+                    lambda_=lambda_,
+                    mu=mu,
+                    nu=nu,
+                    xi=xi,
+                    omicron=omicron,
+                    pi=pi,
+                    rho=rho,
+                    sigma=sigma,
+                    tau=tau,
+                    upsilon=upsilon,
                 )
 
                 final_recipe = calcmode.modify_recipe(
@@ -657,6 +713,21 @@ def create_tasks(
                     gamma=gamma,
                     delta=delta,
                     epsilon=epsilon,
+                    zeta=zeta,
+                    eta=eta,
+                    theta=theta,
+                    iota=iota,
+                    kappa=kappa,
+                    lambda_=lambda_,
+                    mu=mu,
+                    nu=nu,
+                    xi=xi,
+                    omicron=omicron,
+                    pi=pi,
+                    rho=rho,
+                    sigma=sigma,
+                    tau=tau,
+                    upsilon=upsilon,
                 )
 
                 tasks.append(final_recipe)
@@ -667,7 +738,7 @@ def create_tasks(
                     f"[TaskBuild ERROR] Global merge failed\n"
                     f"  • Key      : {key}\n"
                     f"  • Sliders  : "
-                    f"α={alpha}, β={beta}, γ={gamma}, δ={delta}, ε={epsilon}\n"
+                    f"α={alpha}, β={beta}, γ={gamma}, δ={delta}, ε={epsilon}, ζ={zeta}, η={eta}, θ={theta}, ι={iota}, κ={kappa}, λ={lambda_}, μ={mu}, ν={nu}, ξ={xi}, ο={omicron}, π={pi}, ρ={rho}, σ={sigma}, τ={tau}, υ={upsilon}\n"
                     f"  • Error    : {e}"
                 ) from e
 
@@ -704,7 +775,7 @@ def prepare_merge(
     merge_mode_selector, calc_mode_selector,
     model_a, model_b, model_c, model_d,
 
-    alpha, beta, gamma, delta, epsilon,
+    alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
 
     weight_editor, preset_output,
     discard, clude, clude_mode,
@@ -712,18 +783,19 @@ def prepare_merge(
 
     *custom_sliders,
 
-    copy_vae_from_primary: bool,
-    copy_clip_from_primary: bool,
-    keep_zero_fill: bool,
-    bloat_mode: bool,
-    dual_soul_toggle: bool,
-    sacred_keys_toggle: bool,
-    smartresize_toggle: bool,
-    specific_selectors_first: bool,
-    allow_glob_fallback: bool,
-    allow_exact_key_fallback: bool,
-    allow_synthetic_custom_merge: bool,
-    allow_non_float_merges: bool,
+    copy_vae_from_primary= False,
+    copy_clip_from_primary= False,
+    keep_zero_fill= True,
+    bloat_mode= False,
+    dual_soul_toggle= False,
+    sacred_keys_toggle= False,
+    smartresize_toggle= True,
+    specific_selectors_first= True,
+    allow_glob_fallback= True,
+    allow_exact_key_fallback= True,
+    allow_synthetic_custom_merge= True,
+    allow_non_float_merges= True,
+    allow_scalar_merges= True,
 ):
 
     # ------------------------------------------------------------
@@ -752,6 +824,23 @@ def prepare_merge(
     cmn.interrupted = False
     cmn.stop = False
 
+    # ─────────────────────────────────────────────
+    # Set all policy flags from UI parameters (CRITICAL)
+    # ─────────────────────────────────────────────
+    cmn.dual_soul_toggle            = bool(dual_soul_toggle)
+    cmn.sacred_toggle               = bool(sacred_keys_toggle)
+    cmn.smartresize_toggle          = bool(smartresize_toggle)
+    cmn.keep_zero_fill              = bool(keep_zero_fill)
+    cmn.bloat_mode                  = bool(bloat_mode)
+    cmn.allow_synthetic_custom_merge = bool(allow_synthetic_custom_merge)
+    cmn.allow_non_float_merges      = bool(allow_non_float_merges)
+    cmn.specific_selectors_first    = bool(specific_selectors_first)
+    cmn.allow_glob_fallback         = bool(allow_glob_fallback)
+    cmn.allow_exact_key_fallback    = bool(allow_exact_key_fallback)
+    cmn.allow_scalar_merges         = bool(allow_scalar_merges)
+    cmn.copy_vae_from_primary       = bool(copy_vae_from_primary)
+    cmn.copy_clip_from_primary      = bool(copy_clip_from_primary)
+
     # Reset merge stats (safe, no-op if unsupported)
     try:
         cmn.merge_stats.reset()
@@ -770,7 +859,7 @@ def prepare_merge(
         merge_mode_selector,
         calc_mode_selector,
         model_a, model_b, model_c, model_d,
-        alpha, beta, gamma, delta, epsilon,
+        alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
         weight_editor,
         discard,
         clude,
@@ -866,13 +955,7 @@ def prepare_merge(
         # ─────────────────────────────────────────────
         # 7. Create tasks (policy-aware)
         # ─────────────────────────────────────────────
-        assigned_keys = assign_weights_to_keys(
-            targets,
-            keys,
-            specific_selectors_first=specific_selectors_first,
-            allow_exact_key_fallback=allow_exact_key_fallback,
-            allow_glob_fallback=allow_glob_fallback,
-        )
+        assigned_keys = assign_weights_to_keys(cmn, targets, keys)
 
         tasks = create_tasks(
             progress,
@@ -888,6 +971,21 @@ def prepare_merge(
             gamma=gamma,
             delta=delta,
             epsilon=epsilon,
+            zeta=zeta,
+            eta=eta,
+            theta=theta,
+            iota=iota,
+            kappa=kappa,
+            lambda_=lambda_,
+            mu=mu,
+            nu=nu,
+            xi=xi,
+            omicron=omicron,
+            pi=pi,
+            rho=rho,
+            sigma=sigma,
+            tau=tau,
+            upsilon=upsilon,
         )
 
         if not tasks:
@@ -904,16 +1002,6 @@ def prepare_merge(
             progress,
 
             merge_stats=merge_stats,
-
-            keep_zero_fill=keep_zero_fill,
-            bloat_mode=bloat_mode,
-            copy_vae_from_primary=copy_vae_from_primary,
-            copy_clip_from_primary=copy_clip_from_primary,
-            dual_soul_toggle=dual_soul_toggle,
-            sacred_keys_toggle=sacred_keys_toggle,
-            smartresize_toggle=smartresize_toggle,
-            allow_synthetic_custom_merge=allow_synthetic_custom_merge,
-            allow_non_float_merges=allow_non_float_merges,
         )
 
     # IMPORTANT: checkpoint handles are now closed
@@ -1082,15 +1170,6 @@ def do_merge(
     checkpoints, tasks, state_dict, progress,
     *,
     merge_stats,
-    copy_vae_from_primary: bool,
-    copy_clip_from_primary: bool,
-    keep_zero_fill: bool,
-    bloat_mode: bool,
-    dual_soul_toggle: bool,
-    sacred_keys_toggle: bool,
-    smartresize_toggle: bool,
-    allow_synthetic_custom_merge: bool,
-    allow_non_float_merges: bool,
     timer=None,
 
 ):
@@ -1111,10 +1190,6 @@ def do_merge(
     progress("### Starting merge ###")
 
     threads = int(cmn.opts.get("threads", 8))
-
-    copy_vae_from_primary = bool(int(copy_vae_from_primary))
-    copy_clip_from_primary = bool(int(copy_clip_from_primary))
-
 
     # ------------------------------------------------------------
     # 0. Disk IO monitor (optional)
@@ -1255,23 +1330,17 @@ def do_merge(
     # Facts only
     cmn.mixed_arch = not cmn.same_arch
 
-    # These flags are for initialize_task() to consult.
-    cmn.dual_soul_enabled   = bool(dual_soul_toggle)
-    cmn.sacred_enabled      = bool(sacred_keys_toggle)
-    cmn.smartresize_enabled = bool(smartresize_toggle)
-    cmn.keep_zero_fill = bool(keep_zero_fill)
-    cmn.bloat_mode     = bool(bloat_mode)
-    cmn.allow_synthetic_custom_merge = bool(allow_synthetic_custom_merge)
-    cmn.allow_non_float_merges       = bool(allow_non_float_merges)
+    # NOTE: All cmn policy flags were already set in prepare_merge()
+    # before assign_weights_to_keys() was called. do_merge() simply
+    # uses the already-configured cmn values. No need to re-set them here.
 
-
-    if cmn.dual_soul_enabled:
+    if cmn.dual_soul_toggle:
         progress("[Policy Override] Dual-Soul ENABLED by user")
 
-    if cmn.sacred_enabled:
+    if cmn.sacred_toggle:
         progress("[Policy Override] Sacred keys ENABLED by user")
 
-    if cmn.smartresize_enabled:
+    if cmn.smartresize_toggle:
         progress("[Policy Override] SmartResize ENABLED by user")
 
     if cmn.keep_zero_fill:
@@ -1286,27 +1355,54 @@ def do_merge(
     if cmn.allow_non_float_merges:
         progress("[Policy Override] Non-Float Merges ENABLED by user")
 
+    if cmn.specific_selectors_first:
+        progress("[Policy Override] Specific Selectors First ENABLED by user")
+
+    if cmn.allow_glob_fallback:
+        progress("[Policy Override] Glob Fallback ENABLED by user")
+
+    if cmn.allow_exact_key_fallback:
+        progress("[Policy Override] Exact-Key Fallback ENABLED by user")
+
+    if cmn.allow_scalar_merges:
+        progress("[Policy Override] Scalar Merges ENABLED by user")
+
+    if cmn.copy_vae_from_primary:
+        progress("[Policy Override] Copy VAE from primary ENABLED by user")
+
+    if cmn.copy_clip_from_primary:
+        progress("[Policy Override] Copy CLIP from primary ENABLED by user")
 
     # Pass-through policy toggles used by initialize_task() eligibility logic
 
 
     print(
         f"[Policy] same_arch={cmn.same_arch} | "
-        f"dual_soul={'ON' if cmn.dual_soul_enabled else 'OFF'} | "
-        f"sacred={'ON' if cmn.sacred_enabled else 'OFF'} | "
-        f"smartresize={'ON' if cmn.smartresize_enabled else 'OFF'} | "
+        f"dual_soul={'ON' if cmn.dual_soul_toggle else 'OFF'} | "
+        f"sacred={'ON' if cmn.sacred_toggle else 'OFF'} | "
+        f"smartresize={'ON' if cmn.smartresize_toggle else 'OFF'} | "
         f"synthetic_custom={'ON' if cmn.allow_synthetic_custom_merge else 'OFF'} | "
         f"non_float_merges={'ON' if cmn.allow_non_float_merges else 'OFF'} | "
         f"keep_zero_fill={'ON' if cmn.keep_zero_fill else 'OFF'} | "
-        f"bloat_mode={'ON' if cmn.bloat_mode else 'OFF'} "
+        f"bloat_mode={'ON' if cmn.bloat_mode else 'OFF'} | "
+        f"specific_selectors_first={'ON' if cmn.specific_selectors_first else 'OFF'} | "
+        f"glob_fallback={'ON' if cmn.allow_glob_fallback else 'OFF'} | "
+        f"exact_key_fallback={'ON' if cmn.allow_exact_key_fallback else 'OFF'} | "
+        f"scalar_merges={'ON' if cmn.allow_scalar_merges else 'OFF'} | "
+        f"copy_vae_from_primary={'ON' if cmn.copy_vae_from_primary else 'OFF'} | "
+        f"copy_clip_from_primary={'ON' if cmn.copy_clip_from_primary else 'OFF'}"
     )
 
     # ------------------------------------------------------------
     # 3.5 Target shape map (SmartResize reference)
+    # IMPORTANT:
+    # do_merge NEVER resizes tensors.
+    # This map is read-only shape authority for initialize_task().
+
     # ------------------------------------------------------------
     cmn.cross_arch_target_shapes.clear()
 
-    if cmn.smartresize_enabled and cmn.primary in cmn.loaded_checkpoints:
+    if cmn.smartresize_toggle and cmn.primary in cmn.loaded_checkpoints:
         pf = cmn.loaded_checkpoints[cmn.primary]
         if pf is None:
             raise RuntimeError("Primary checkpoint failed to open")
@@ -1394,11 +1490,11 @@ def do_merge(
     # ------------------------------------------------------------
     # 6.5 Post-merge component policy (VAE / CLIP / Flux encoders)
     # ------------------------------------------------------------
-    if cmn.primary and (copy_vae_from_primary or copy_clip_from_primary):
+    if cmn.primary and (cmn.copy_vae_from_primary or cmn.copy_clip_from_primary):
         pf = cmn.loaded_checkpoints.get(cmn.primary)
         progress(
             f"[Policy] Post-merge overrides: "
-            f"copy_vae={copy_vae_from_primary}, copy_clip={copy_clip_from_primary}"
+            f"copy_vae={cmn.copy_vae_from_primary}, copy_clip={cmn.copy_clip_from_primary}"
         )
 
         if pf is None:
@@ -1410,7 +1506,7 @@ def do_merge(
             # -------------------------
             # VAE / latent decoder
             # -------------------------
-            if copy_vae_from_primary:
+            if cmn.copy_vae_from_primary:
                 for k in pf.keys():
                     if cmn.is_vae_key(k):
                         state_dict[k] = pf.get_tensor(k).cpu()
@@ -1430,7 +1526,7 @@ def do_merge(
             # -------------------------
             # Text / conditioning encoders
             # -------------------------
-            if copy_clip_from_primary:
+            if cmn.copy_clip_from_primary:
                 for k in pf.keys():
                     if cmn.is_clip_key(k):
                         state_dict[k] = pf.get_tensor(k).cpu()
@@ -1473,9 +1569,13 @@ def initialize_task(task):
 
     print(
         f"[INIT] initialize_task | "
-        f"dual_soul={cmn.dual_soul_enabled} "
-        f"sacred={cmn.sacred_enabled} "
-        f"smartresize={cmn.smartresize_enabled}"
+        f"dual_soul={cmn.dual_soul_toggle} "
+        f"sacred={cmn.sacred_toggle} "
+        f"smartresize={cmn.smartresize_toggle} "
+        f"keep_zero_fill={cmn.keep_zero_fill} "
+        f"allow_synthetic={cmn.allow_synthetic_custom_merge} "
+        f"allow_non_float={cmn.allow_non_float_merges} "
+        f"allow_scalar={cmn.allow_scalar_merges}"
     )
 
     key = task.key
@@ -1495,15 +1595,9 @@ def initialize_task(task):
             has_all_sources = False
             break
 
-    allow_synthetic = bool(getattr(cmn, "allow_synthetic_custom_merge"))
+    allow_synthetic = bool(getattr(cmn, "allow_synthetic_custom_merge", True))
 
-
-    keep_zero_fill = cmn.keep_zero_fill
-
-    synthetic_allowed = (
-        allow_synthetic
-        and (cmn.smartresize_enabled or keep_zero_fill)
-    )
+    synthetic_allowed = bool(cmn.allow_synthetic_custom_merge)
 
     eligible_custom = has_all_sources or synthetic_allowed
 
@@ -1516,7 +1610,7 @@ def initialize_task(task):
     # =====================================================
     # 1) DUAL-SOUL SACRED PRESERVATION
     # =====================================================
-    if cmn.dual_soul_enabled and cmn.sacred_enabled and cmn.is_sacred_key(key):
+    if cmn.dual_soul_toggle and cmn.sacred_toggle and cmn.is_sacred_key(key):
         f = cmn.loaded_checkpoints.get(cmn.primary)
 
         if f and cmn.has_tensor(f, key):
@@ -1524,7 +1618,7 @@ def initialize_task(task):
                 t = cmn.get_tensor(f, key)
 
                 if (
-                    cmn.smartresize_enabled
+                    cmn.smartresize_toggle
                     and target_shape is not None
                     and t.shape != target_shape
                 ):
@@ -1585,7 +1679,7 @@ def initialize_task(task):
             t = cmn.get_tensor(f, key)
 
             if (
-                cmn.smartresize_enabled
+                cmn.smartresize_toggle
                 and target_shape is not None
                 and t.shape != target_shape
             ):
@@ -1612,29 +1706,33 @@ def initialize_task(task):
     # =====================================================
     # 3.5) SCALAR ROUTING (MANDATORY, POLICY-GATED)
     # =====================================================
-    if tensors and all(isinstance(t, torch.Tensor) and t.ndim == 0 for t in tensors):
-        try:
-            scalar_op = route_scalar_op(key, *tensors)
+    if not cmn.allow_scalar_merges:
+        if tensors and all(isinstance(t, torch.Tensor) and t.ndim == 0 for t in tensors):
+            merge_stats.scalar_rejected += 1
+            print(f"[ScalarSkipped][PolicyDisabled] {key}")
+    else:
+        if tensors and all(isinstance(t, torch.Tensor) and t.ndim == 0 for t in tensors):
+            try:
+                scalar_op = route_scalar_op(key, *tensors)
 
-            if scalar_op is None:
-                merge_stats.scalar_rejected += 1
-                print(f"[ScalarRejected] {key}")
+                if scalar_op is None:
+                    merge_stats.scalar_rejected += 1
+                    print(f"[ScalarRejected] {key}")
 
-            else:
-                out = scalar_op.merge()
-                if out is not None:
-                    merge_stats.scalar_merges += 1
-                    print(f"[ScalarMerge] {key} ← {scalar_op.__class__.__name__}")
-                    return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
+                else:
+                    out = scalar_op.merge()
+                    if out is not None:
+                        merge_stats.scalar_merges += 1
+                        print(f"[ScalarMerge] {key} ← {scalar_op.__class__.__name__}")
+                        return key, out.to(cmn.get_device(), dtype=cmn.get_dtype())
 
-                merge_stats.scalar_rejected += 1
-                print(f"[ScalarRejected] {key} (op returned None)")
+                    merge_stats.scalar_rejected += 1
+                    print(f"[ScalarRejected] {key} (op returned None)")
 
-        except Exception as e:
-            merge_stats.scalar_failed += 1
-            print(f"[ScalarMerge:FAILED] {key}: {type(e).__name__}: {e}")
-            print("[ScalarFallback] Continuing fallback ladder")
-
+            except Exception as e:
+                merge_stats.scalar_failed += 1
+                print(f"[ScalarMerge:FAILED] {key}: {type(e).__name__}: {e}")
+                print("[ScalarFallback] Continuing fallback ladder")
 
     # =====================================================
     # 4a) POLICY LADDER
@@ -1666,7 +1764,7 @@ def initialize_task(task):
                 t = cmn.get_tensor(f, key)
 
                 if (
-                    cmn.smartresize_enabled
+                    cmn.smartresize_toggle
                     and target_shape is not None
                     and t.shape != target_shape
                 ):

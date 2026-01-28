@@ -164,7 +164,7 @@ _DEFAULT_SLIDER_MARKER = (-1, 2, 0.01)  # This is perfect. Keep exactly like thi
 
 def _choose_slider_configs(mergemode, calcmode):
     """
-    Return slider configs + info strings for a/b/c/d/e.
+    Return slider configs + info strings for all 20 sliders (a-t).
     CalcMode overrides MergeMode only if it explicitly defines a slider config
     different from the sentinel value.
     """
@@ -174,38 +174,41 @@ def _choose_slider_configs(mergemode, calcmode):
         getattr(calcmode, 'slid_a_config', None) != _DEFAULT_SLIDER_MARKER
     )
 
-    if use_calc:
-        a_cfg  = getattr(calcmode, 'slid_a_config',  mergemode.slid_a_config)
-        a_info = getattr(calcmode, 'slid_a_info',   mergemode.slid_a_info)
-        b_cfg  = getattr(calcmode, 'slid_b_config',  mergemode.slid_b_config)
-        b_info = getattr(calcmode, 'slid_b_info',    mergemode.slid_b_info)
-        c_cfg  = getattr(calcmode, 'slid_c_config',  mergemode.slid_c_config)
-        c_info = getattr(calcmode, 'slid_c_info',    mergemode.slid_c_info)
-        d_cfg  = getattr(calcmode, 'slid_d_config',  mergemode.slid_d_config)
-        d_info = getattr(calcmode, 'slid_d_info',    mergemode.slid_d_info)
-        e_cfg  = getattr(calcmode, 'slid_e_config',  mergemode.slid_e_config)
-        e_info = getattr(calcmode, 'slid_e_info',    mergemode.slid_e_info)
-    else:
-        a_cfg, a_info = mergemode.slid_a_config, mergemode.slid_a_info
-        b_cfg, b_info = mergemode.slid_b_config, mergemode.slid_b_info
-        c_cfg, c_info = mergemode.slid_c_config, mergemode.slid_c_info
-        d_cfg, d_info = mergemode.slid_d_config, mergemode.slid_d_info
-        e_cfg, e_info = mergemode.slid_e_config, mergemode.slid_e_info
-
-    return (a_cfg, a_info, b_cfg, b_info, c_cfg, c_info, d_cfg, d_info, e_cfg, e_info)
+    sliders = []
+    slider_letters = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t']
+    
+    for letter in slider_letters:
+        cfg_attr = f'slid_{letter}_config'
+        info_attr = f'slid_{letter}_info'
+        
+        if use_calc:
+            cfg = getattr(calcmode, cfg_attr, getattr(mergemode, cfg_attr))
+            info = getattr(calcmode, info_attr, getattr(mergemode, info_attr))
+        else:
+            cfg = getattr(mergemode, cfg_attr)
+            info = getattr(mergemode, info_attr)
+        
+        sliders.extend([cfg, info])
+    
+    return tuple(sliders)
 
 
 def _required_counts(mergemode, calcmode):
     """
     Safely calculate how many sliders and models are actually needed.
-    Handles all edge cases and guarantees 1–5 sliders, 1–4 models.
+    Handles all edge cases and guarantees 1–20 sliders, 1–4 models.
     """
-    base_sliders = getattr(mergemode, 'input_sliders', 5) or 5
+    base_sliders = getattr(mergemode, 'input_sliders', 20) or 20
     base_models  = getattr(mergemode, 'input_models', 4) or 4
 
     # Count how many sliders the CalcMode actually customizes
     custom_slider_attrs = ('slid_a_config', 'slid_b_config', 'slid_c_config',
-                           'slid_d_config', 'slid_e_config')
+                           'slid_d_config', 'slid_e_config', 'slid_f_config',
+                           'slid_g_config', 'slid_h_config', 'slid_i_config',
+                           'slid_j_config', 'slid_k_config', 'slid_l_config',
+                           'slid_m_config', 'slid_n_config', 'slid_o_config',
+                           'slid_p_config', 'slid_q_config', 'slid_r_config',
+                           'slid_s_config', 'slid_t_config')
     custom_slider_count = sum(
         1 for attr in custom_slider_attrs
         if getattr(calcmode, attr, None) not in (None, _DEFAULT_SLIDER_MARKER)
@@ -230,13 +233,15 @@ def _required_counts(mergemode, calcmode):
         req_models = base_models
 
     # Clamp to valid ranges
-    req_sliders = max(1, min(int(req_sliders), 5))
+    req_sliders = max(1, min(int(req_sliders), 20))
     req_models  = max(1, min(int(req_models), 4))
 
     return req_sliders, req_models
 
 
 def mode_changed(merge_mode_name, calc_mode_name):
+    import inspect
+    
     mergemode = merger.mergemode_selection[merge_mode_name]
     calcmode = merger.calcmode_selection[calc_mode_name]
 
@@ -244,42 +249,65 @@ def mode_changed(merge_mode_name, calc_mode_name):
     merge_desc = mergemode.description
     calc_desc = calcmode.description
 
-    # Slider configs (5 supported)
+    # Slider configs (20 supported)
     configs = _choose_slider_configs(mergemode, calcmode)
-    a_cfg, a_info, b_cfg, b_info, c_cfg, c_info, d_cfg, d_info, e_cfg, e_info = configs
+    
+    # Unpack all 20 sliders (40 values total: 20 configs + 20 infos)
+    sliders_data = []
+    for i in range(20):
+        cfg = configs[i*2]
+        info = configs[i*2 + 1]
+        sliders_data.append((cfg, info))
 
     # Required counts
     req_sliders, req_models = _required_counts(mergemode, calcmode)
 
-    # Help text
+    # Extract default slider values from calcmode.modify_recipe signature
+    try:
+        sig = inspect.signature(calcmode.modify_recipe)
+        defaults = {}
+        for param_name, param in sig.parameters.items():
+            if param.default != inspect.Parameter.empty:
+                defaults[param_name] = param.default
+    except:
+        defaults = {}
+    
+    # Map slider letters to parameter names
+    slider_params = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta', 
+                     'iota', 'kappa', 'lambda_', 'mu', 'nu', 'xi', 'omicron', 'pi', 'rho', 'sigma', 'tau', 'upsilon']
+    
+    # Help text - show first 5 sliders in help
     header = f"{mergemode.name} • {calcmode.name}"
     slider_help_text = (
         f"<pre style='font-family: monospace; background: #111; padding: 12px; border-radius: 6px;'>"
         f"{header}\n\n"
-        f"α (alpha)  : {a_info}\n"
-        f"β (beta)   : {b_info}\n"
-        f"γ (gamma)  : {c_info}\n"
-        f"δ (delta)  : {d_info}\n"
-        f"ε (epsilon): {e_info}\n\n"
+        f"α (alpha)  : {sliders_data[0][1]}\n"
+        f"β (beta)   : {sliders_data[1][1]}\n"
+        f"γ (gamma)  : {sliders_data[2][1]}\n"
+        f"δ (delta)  : {sliders_data[3][1]}\n"
+        f"ε (epsilon): {sliders_data[4][1]}\n\n"
         f"Required: {req_sliders} slider(s), {req_models} model(s)"
         f"</pre>"
     )
 
     # Slider updates (dynamic min/max/label + hide unused)
     slider_updates = []
-    slider_labels = ['α', 'β', 'γ', 'δ', 'ε']
-    slider_infos = [a_info, b_info, c_info, d_info, e_info]
-    slider_cfgs = [a_cfg, b_cfg, c_cfg, d_cfg, e_cfg]
+    slider_labels = ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'τ', 'υ']
+    slider_letters = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t']
 
-    for i in range(5):
-        cfg = slider_cfgs[i]
-        info = slider_infos[i]
-        label = f"slider_{['a','b','c','d','e'][i]} [{slider_labels[i]}] ({info})"
+    for i in range(20):
+        cfg, info = sliders_data[i]
+        label = f"slider_{slider_letters[i]} [{slider_labels[i]}] ({info})"
+        
+        # Get default value for this slider from calcmode defaults
+        param_name = slider_params[i]
+        default_value = defaults.get(param_name, 0.5)  # Fallback to 0.5 if not found
 
         if i < req_sliders:
             update = gr.update(
                 minimum=cfg[0], maximum=cfg[1], step=cfg[2],
                 label=label,
+                value=default_value,  # Apply calcmode's default value
                 interactive=True, visible=True
             )
         else:
@@ -307,16 +335,9 @@ def mode_changed(merge_mode_name, calc_mode_name):
     return [
         gr.update(value=merge_desc),
         gr.update(value=calc_desc),
-        slider_updates[0],  # alpha
-        slider_updates[1],  # beta
-        slider_updates[2],  # gamma
-        slider_updates[3],  # delta
-        slider_updates[4],  # epsilon
+        *slider_updates,  # All 20 sliders
         gr.update(value=slider_help_text),
-        model_updates[0],   # model_a
-        model_updates[1],   # model_b
-        model_updates[2],   # model_c
-        model_updates[3],   # model_d
+        *model_updates,   # All 4 models
         merge_button_update
     ]
 # ---------------------------
@@ -628,10 +649,14 @@ def on_ui_tabs():
                         # ─────────────────────────────────────────────────────────────
                         # MERGE MODE RADIO — FIXED FOR YOUR SETUP (Dec 2025, Radio Edition)
                         # ─────────────────────────────────────────────────────────────
+                        saved_merge_mode = cmn.opts.get('merge_mode', 'Weight-Sum')
+                        if saved_merge_mode not in mergemode_selection:
+                            saved_merge_mode = 'Weight-Sum'
+                            
                         merge_mode_selector = gr.Radio(
                             label="Merge Mode",
                             choices=list(mergemode_selection.keys()),  # Real modes only
-                            value="Weight-Sum",                        # Hard-coded safe default
+                            value=saved_merge_mode,                    # Load from saved options
                             type="value",
                             interactive=True,
                             elem_id="amethyst_merge_mode_radio"
@@ -639,175 +664,139 @@ def on_ui_tabs():
 
                         merge_mode_desc = gr.Textbox(
                             label="Merge Mode Description",
-                            value=mergemode_selection[list(mergemode_selection.keys())[0]].description,
+                            value=mergemode_selection[saved_merge_mode].description,
                             interactive=False,
                             lines=2
                         )
 
                         with gr.Row():
+                            saved_calc_mode = cmn.opts.get('calc_mode', list(calcmode_selection.keys())[0])
+                            if saved_calc_mode not in calcmode_selection:
+                                saved_calc_mode = list(calcmode_selection.keys())[0]
+                                
                             calc_mode_selector = gr.Radio(
                                 label='Calculation Mode (how to execute):',
                                 choices=list(calcmode_selection.keys()),
-                                value=list(calcmode_selection.keys())[0],
+                                value=saved_calc_mode,                 # Load from saved options
                                 scale=3
                             )
 
                         calc_mode_desc = gr.Textbox(
                             label="Calculation Mode Description",
-                            value=calcmode_selection[list(calcmode_selection.keys())[0]].description,
+                            value=calcmode_selection[saved_calc_mode].description,
                             interactive=False,
                             lines=2
                         )
 
-                        with gr.Row():
-                            keep_zero_fill = gr.Checkbox(
-                                label="Kitchen-Sink Mode (Preserve All Keys)",
-                                value=True,
-                                info="Zero-fill missing keys — true kitchen-sink for future merging"
-                            )
-                            bloat_mode = gr.Checkbox(
-                                label="Legacy Bloat Mode",
-                                value=False,
-                                info="Pad tensors for max file size (~7.5GB+) — like old mergers"
-                            )
-                            
-                            dual_soul_toggle = gr.Checkbox(
-                                label="Dual-Soul Mode (Cross-Arch Safety)",
-                                value=False,
-                                info="Force cross-architecture protection logic even if detection fails"
-                            )
-
-                            sacred_keys_toggle = gr.Checkbox(
-                                label="Preserve Sacred Keys",
-                                value=False,
-                                info="Force preservation of noise / timestep / input layers"
-                            )
-
-                            smartresize_toggle = gr.Checkbox(
-                                label="Force SmartResize",
-                                value=True,
-                                info="Force tensor resizing to primary shapes when mismatched"
-                            )
-                            specific_selectors_first = gr.Checkbox(
-                                label="Style-First Weight Matching",
-                                value=True,
-                                info="Apply narrow regex rules before broad ones. Stronger style transfer; safer OFF by default."
-                            )
-                            allow_exact_key_fallback = gr.Checkbox(
-                                label="Allow Exact-Key Selector Fallback",
-                                value=True,
-                                info=(
-                                "If a selector fails to compile as regex, treat it as an exact tensor key.\n"
-                                "Useful for copy-paste from logs or surgical fixes.\n"
-                                "Safe: affects only one tensor."
+                        with gr.Accordion("Merge Behavior Options", open=False):
+                            with gr.Row():
+                                keep_zero_fill = gr.Checkbox(
+                                    label="Kitchen-Sink Mode (Preserve All Keys)",
+                                    value=cmn.opts.get('keep_zero_fill', True),
+                                    info="Zero-fill missing keys — true kitchen-sink for future merging"
                                 )
-                            )
-                            allow_glob_fallback = gr.Checkbox(
-                                label="Allow Glob Selector Fallback (Expert)",
-                                value=True,
-                                info=(
-                                "If regex AND exact-key matching fail, treat selector as a glob (* ? []).\n"
-                                "⚠️ Can match many tensors.\n"
-                                "For expert artistic workflows only."
+                                bloat_mode = gr.Checkbox(
+                                    label="Legacy Bloat Mode",
+                                    value=cmn.opts.get('bloat_mode', False),
+                                    info="Pad tensors for max file size (~7.5GB+) — like old mergers"
                                 )
-                            )
-
-                            copy_vae = gr.Checkbox(
-                                label="Copy VAE from Primary (Recommended)",
-                                value=False,
-                                info="Preserve decoding stability and color fidelity"
-                            )
-                            copy_clip = gr.Checkbox(
-                                label="Copy CLIP from Primary (Recommended)",
-                                value=False,
-                                info="Preserve prompt semantics and text understanding"
-                            )
-                            allow_synthetic_custom_merge = gr.Checkbox(
-                                label="Allow Synthetic Custom Merges (Unsafe)",
-                                value=True,
-                                info="May inject zero-filled or resized tensors into custom merge math."
-                            )
-                            allow_non_float_merges = gr.Checkbox(
-                                label="Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
-                                value=True,
-                                info="Allow numeric merging of integer / boolean tensors "
-                            )
-                            allow_scalar_merges = gr.Checkbox(
-                                label="Allow Scalar Tensor Merges (Advanced)",
-                                value=True,
-                                info=(
-                                "Enable controlled merging of 0-D tensors (scalars) such as logit_scale.\n"
-                                "Only whitelisted keys are allowed. Expert use only."
+                                
+                                dual_soul_toggle = gr.Checkbox(
+                                    label="Dual-Soul Mode (Cross-Arch Safety)",
+                                    value=cmn.opts.get('dual_soul_toggle', False),
+                                    info="Force cross-architecture protection logic even if detection fails"
                                 )
 
-                            )
-                        # Kitchen-Sink Mode (zero-fill) — save to options
+                                sacred_keys_toggle = gr.Checkbox(
+                                    label="Preserve Sacred Keys",
+                                    value=cmn.opts.get('sacred_keys_toggle', False),
+                                    info="Force preservation of noise / timestep / input layers"
+                                )
 
-                        keep_zero_fill.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=keep_zero_fill,
-                            outputs=None
-                        )
-                        bloat_mode.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=bloat_mode,
-                            outputs=None
-                        )
-                        dual_soul_toggle.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=dual_soul_toggle,
-                            outputs=None
-                        )
-                        sacred_keys_toggle.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=sacred_keys_toggle,
-                            outputs=None
-                        )
-                        smartresize_toggle.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=smartresize_toggle,
-                            outputs=None
-                        )
-                        specific_selectors_first.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=specific_selectors_first,
-                            outputs=None
-                        )
-                        allow_exact_key_fallback.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=allow_exact_key_fallback,
-                            outputs=None
-                        )
-                        allow_glob_fallback.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=allow_glob_fallback,
-                            outputs=None
-                        )   
-                        copy_vae.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=copy_vae,        
-                            outputs=None
-                        )
-                        copy_clip.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=copy_clip,
-                            outputs=None
-                        )
-                        allow_synthetic_custom_merge.change(
-                            fn=lambda v: cmn.opts.save(),
-                            inputs=allow_synthetic_custom_merge,
-                            outputs=None
-                        )
-                        allow_non_float_merges.change(
-                            fn=lambda v: cmn.opts.save(),
-                            inputs=allow_non_float_merges,
-                            outputs=None
-                        )
-                        allow_scalar_merges.change(
-                            fn=lambda _: cmn.opts.save(),
-                            inputs=allow_scalar_merges,
-                            outputs=None
-                        )
+                            with gr.Row():
+                                smartresize_toggle = gr.Checkbox(
+                                    label="Force SmartResize",
+                                    value=cmn.opts.get('smart_resize_toggle', True),
+                                    info="Force tensor resizing to primary shapes when mismatched"
+                                )
+                                specific_selectors_first = gr.Checkbox(
+                                    label="Style-First Weight Matching",
+                                    value=cmn.opts.get('specific_selectors_first', True),
+                                    info="Apply narrow regex rules before broad ones. Stronger style transfer; safer OFF by default."
+                                )
+                                allow_exact_key_fallback = gr.Checkbox(
+                                    label="Allow Exact-Key Selector Fallback",
+                                    value=cmn.opts.get('allow_exact_key_fallback', True),
+                                    info=(
+                                    "If a selector fails to compile as regex, treat it as an exact tensor key.\n"
+                                    "Useful for copy-paste from logs or surgical fixes.\n"
+                                    "Safe: affects only one tensor."
+                                    )
+                                )
+                                allow_glob_fallback = gr.Checkbox(
+                                    label="Allow Glob Selector Fallback (Expert)",
+                                    value=cmn.opts.get('allow_glob_fallback', True),
+                                    info=(
+                                    "If regex AND exact-key matching fail, treat selector as a glob (* ? []).\n"
+                                    "⚠️ Can match many tensors.\n"
+                                    "For expert artistic workflows only."
+                                    )
+                                )
+
+                            with gr.Row():
+                                copy_vae_from_primary = gr.Checkbox(
+                                    label="Copy VAE from Primary (Recommended)",
+                                    value=cmn.opts.get('copy_vae_from_primary', False),
+                                    info="Preserve decoding stability and color fidelity"
+                                )
+                                copy_clip_from_primary = gr.Checkbox(
+                                    label="Copy CLIP from Primary (Recommended)",
+                                    value=cmn.opts.get('copy_clip_from_primary', False),
+                                    info="Preserve prompt semantics and text understanding"
+                                )
+                                allow_synthetic_custom_merge = gr.Checkbox(
+                                    label="Allow Synthetic Custom Merges (Unsafe)",
+                                    value=cmn.opts.get('allow_synthetic_custom_merge', True),
+                                    info="May inject zero-filled or resized tensors into custom merge math."
+                                )
+                                allow_non_float_merges = gr.Checkbox(
+                                    label="Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
+                                    value=cmn.opts.get('allow_non_float_merges', True),
+                                    info="Allow numeric merging of integer / boolean tensors "
+                                )
+                                allow_scalar_merges = gr.Checkbox(
+                                    label="Allow Scalar Tensor Merges (Advanced)",
+                                    value=cmn.opts.get('allow_scalar_merges', True),
+                                    info=(
+                                    "Enable controlled merging of 0-D tensors (scalars) such as logit_scale.\n"
+                                    "Only whitelisted keys are allowed. Expert use only."
+                                    )
+
+                                )
+                        # === Auto-save all merge interface checkboxes ===
+                        # These checkboxes are the single source of truth for these options
+                        # They persist via auto-save callbacks and are passed directly to start_merge()
+                        
+                        def save_and_update_option(key):
+                            """Factory for option save callbacks"""
+                            def _save(value):
+                                cmn.opts.options[key] = value
+                                cmn.opts.save()
+                            return _save
+                        
+                        keep_zero_fill.change(fn=save_and_update_option('keep_zero_fill'), inputs=keep_zero_fill, outputs=None)
+                        bloat_mode.change(fn=save_and_update_option('bloat_mode'), inputs=bloat_mode, outputs=None)
+                        dual_soul_toggle.change(fn=save_and_update_option('dual_soul_toggle'), inputs=dual_soul_toggle, outputs=None)
+                        sacred_keys_toggle.change(fn=save_and_update_option('sacred_keys_toggle'), inputs=sacred_keys_toggle, outputs=None)
+                        smartresize_toggle.change(fn=save_and_update_option('smart_resize_toggle'), inputs=smartresize_toggle, outputs=None)
+                        specific_selectors_first.change(fn=save_and_update_option('specific_selectors_first'), inputs=specific_selectors_first, outputs=None)
+                        allow_exact_key_fallback.change(fn=save_and_update_option('allow_exact_key_fallback'), inputs=allow_exact_key_fallback, outputs=None)
+                        allow_glob_fallback.change(fn=save_and_update_option('allow_glob_fallback'), inputs=allow_glob_fallback, outputs=None)
+                        copy_vae_from_primary.change(fn=save_and_update_option('copy_vae_from_primary'), inputs=copy_vae_from_primary, outputs=None)
+                        copy_clip_from_primary.change(fn=save_and_update_option('copy_clip_from_primary'), inputs=copy_clip_from_primary, outputs=None)
+                        allow_synthetic_custom_merge.change(fn=save_and_update_option('allow_synthetic_custom_merge'), inputs=allow_synthetic_custom_merge, outputs=None)
+                        allow_scalar_merges.change(fn=save_and_update_option('allow_scalar_merges'), inputs=allow_scalar_merges, outputs=None)
+                        allow_non_float_merges.change(fn=save_and_update_option('allow_non_float_merges'), inputs=allow_non_float_merges, outputs=None)
    
 
                     slider_help = gr.Textbox(label="Slider Meaning", value="", interactive=False, lines=6, placeholder="Slider help will appear here when you change merge/calc modes.")
@@ -818,7 +807,25 @@ def on_ui_tabs():
                         beta  = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_b [β] (beta)",  info='-', value=0.5, elem_classes=['main_sliders'])
                         gamma = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_c [γ] (gamma)", info='-', value=0.5, elem_classes=['main_sliders'])
                         delta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_d [δ] (delta)", info='-', value=0.5, elem_classes=['main_sliders'])
-                        epsilon = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_e [ε] (epsilon)", info='-', value=0.5, elem_classes=['main_sliders'])  # Added slider e
+                        epsilon = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_e [ε] (epsilon)", info='-', value=0.5, elem_classes=['main_sliders'])
+                    with gr.Row(equal_height=True):
+                        zeta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_f [ζ] (zeta)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        eta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_g [η] (eta)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        theta = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_h [θ] (theta)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        iota = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_i [ι] (iota)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        kappa = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_j [κ] (kappa)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                    with gr.Row(equal_height=True):
+                        lambda_ = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_k [λ] (lambda)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        mu = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_l [μ] (mu)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        nu = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_m [ν] (nu)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        xi = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_n [ξ] (xi)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        omicron = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_o [ο] (omicron)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                    with gr.Row(equal_height=True):
+                        pi = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_p [π] (pi)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        rho = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_q [ρ] (rho)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        sigma = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_r [σ] (sigma)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        tau = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_s [τ] (tau)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
+                        upsilon = gr.Slider(minimum=-1, step=0.0000001, maximum=2, label="slider_t [υ] (upsilon)", info='-', value=0.5, elem_classes=['main_sliders'], visible=False)
                     # CUSTOM SLIDERS UI — Elite, Dynamic, 5-Slider Safe
                     with ui_components.InputAccordion(False, label="Custom Sliders") as enable_sliders:
                         with gr.Accordion("Custom Slider Presets", open=True):
@@ -858,9 +865,6 @@ def on_ui_tabs():
                                 gr.update(value=len(values)),
                                 *[gr.update(value=v) for v in values]
                             )
-
-                        def update_slider_visibility(count):
-                            return gr.update(visible=count > 0)
 
                         # Wire preset loading
                         sliders_preset_load.click(
@@ -1184,136 +1188,10 @@ def on_ui_tabs():
                             },
                             default=8192
                         )
-                        cmn.opts.create_option(
-                            'keep_zero_fill',
-                            gr.Checkbox,
-                            {"label": "Kitchen-Sink Mode (Preserve All Keys)"},
-                            True
-                        )
-                        cmn.opts.create_option(
-                            'bloat_mode',
-                            gr.Checkbox,
-                            {"label": "Legacy Bloat Mode (Max File Size)"},
-                            False
-                        )
-                        cmn.opts.create_option(
-                            'force_cross_arch',
-                            gr.Checkbox,
-                        {
-                            "label": "Force Dual-Soul Mode",
-                            "info": "Override detection and force cross-architecture merge logic"
-                        },
-                            False
-                        )
- 
-                        cmn.opts.create_option(
-                            'force_sacred_keys',
-                            gr.Checkbox,
-                        {
-                            "label": "Force Sacred Key Preservation",
-                            "info": "Always preserve noise & timestep layers from primary"
-                        },
-                            False
-                        )
 
-                        cmn.opts.create_option(
-                            'force_smartresize',
-                            gr.Checkbox,
-                        {
-                            "label": "Force SmartResize",
-                            "info": "Always resize tensors to primary shape when mismatched"
-                        },
-                            True
-                        )
-                        cmn.opts.create_option(
-                            'specific_selectors_first',
-                            gr.Checkbox,
-                        {
-                            "label": "Style-First Weight Matching",
-                            "info": "Apply narrow regex rules before broad ones. Stronger style transfer."
-                        },
-                            True
-                        )
-                        cmn.opts.create_option(
-                            'allow_exact_key_fallback',
-                            gr.Checkbox,
-                        {
-                            "label": "Allow Exact-Key Selector Fallback",
-                            "info": (
-                            "If regex selector fails, treat selector as an exact tensor key.\n"
-                            "Safe, single-key only."
-                            )
-                        },
-                            True
-                        )
-
-                        cmn.opts.create_option(
-                            'allow_glob_fallback',
-                            gr.Checkbox,
-                        {
-                            "label": "Allow Glob Selector Fallback (Expert)",
-                            "info": (
-                            "If regex and exact-key matching fail, use glob patterns (* ? []).\n"
-                            "⚠️ Can affect many tensors. Expert use only."
-                            )
-                        },
-                            True
-                        )
-
-                        cmn.opts.create_option(
-                            'allow_scalar_merges',
-                            gr.Checkbox,
-                        {
-                            "label": "Allow Scalar Tensor Merges (Advanced)",
-                            "info": (
-                            "Enable explicit handling of 0-D (scalar) tensors such as logit_scale.\n"
-                            "• OFF: Scalars are copied from primary (default, safest)\n"
-                            "• ON: Whitelisted scalars may be numerically merged\n"
-                            "Applies only to approved scalar keys."
-                            )
-                        },
-                            True
-                        )
-
-                        cmn.opts.create_option(
-                            'copy_vae_from_primary',
-                            gr.Checkbox,
-                        {
-                            "label": "Copy VAE from Primary (Recommended)",
-                            "info": "Preserve decoding stability and color fidelity"
-                        },
-                            False
-                        )
-
-                        cmn.opts.create_option(
-                            'copy_clip_from_primary',
-                            gr.Checkbox,
-                        {
-                            "label": "Copy CLIP from Primary (Recommended)",
-                            "info": "Preserve prompt semantics and text understanding"
-                        },
-                            False
-                        )
-
-                        cmn.opts.create_option(
-                            'allow_synthetic_custom_merge',
-                            gr.Checkbox,
-                        {
-                            "label": "Allow Synthetic Tensors for Custom Merges (Unsafe)",
-                            "info": "May inject zero-filled or resized tensors into custom merge math. "
-                        },
-                            True
-                        )
-                        cmn.opts.create_option(
-                            'allow_non_float_merges',
-                            gr.Checkbox,
-                        {
-                            "label": "Allow Non-Floating Tensor Merges (CLIP / VAE Destructive)",
-                            "info": "Allow numeric merging of integer or boolean tensors such as position_ids or attention masks."
-                        },
-                            True   
-                        )
-
+                        # Note: All checkbox options are now managed via the merge interface checkboxes above
+                        # They are registered with cmn.opts.components for persistence and auto-save
+                        # This eliminates duplication while maintaining the rich UI/UX of the merge interface
 
                         def update_cache_size(value=None):
                             if value is None:
@@ -1456,8 +1334,8 @@ def on_ui_tabs():
                     weight_editor = gr.Textbox(
                         label="Weight Editor (JSON)",
                         lines=10,
-                        placeholder='all: slider_a, slider_b, slider_c, slider_d',
-                        value="all: slider_a, slider_b, slider_c, slider_d"
+                        placeholder='all: slider_a, slider_b, slider_c, slider_d, slider_e',
+                        value="all: slider_a, slider_b, slider_c, slider_d, slider_e"
                     )
                     # Validation output
                     validation_output = gr.Textbox(
@@ -1507,19 +1385,49 @@ def on_ui_tabs():
                         inputs=[merge_mode_selector, calc_mode_selector],
                         outputs=[
                             merge_mode_desc, calc_mode_desc,
-                            alpha, beta, gamma, delta, epsilon,
+                            alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
                             slider_help,
                             model_a, model_b, model_c, model_d,
                             merge_button
                         ],
                         show_progress="hidden"
                     )
+                    # Auto-save merge mode selection
+                    merge_mode_selector.change(
+                        fn=lambda x: (cmn.opts.options.update({'merge_mode': x}), cmn.opts.save()),
+                        inputs=merge_mode_selector,
+                        outputs=None,
+                        queue=False
+                    )
+                    
                     calc_mode_selector.change(
                         fn=mode_changed,
                         inputs=[merge_mode_selector, calc_mode_selector],
                         outputs=[
                             merge_mode_desc, calc_mode_desc,
-                            alpha, beta, gamma, delta, epsilon,
+                            alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
+                            slider_help,
+                            model_a, model_b, model_c, model_d,
+                            merge_button
+                        ],
+                        show_progress="hidden"
+                    )
+                    # Auto-save calc mode selection
+                    calc_mode_selector.change(
+                        fn=lambda x: (cmn.opts.options.update({'calc_mode': x}), cmn.opts.save()),
+                        inputs=calc_mode_selector,
+                        outputs=None,
+                        queue=False
+                    )
+
+                    # === INITIALIZE SLIDER CONFIGS ON PAGE LOAD ===
+                    # This fires when the page first loads, applying saved calc/merge mode to sliders
+                    cmn.blocks.load(
+                        fn=mode_changed,
+                        inputs=[merge_mode_selector, calc_mode_selector],
+                        outputs=[
+                            merge_mode_desc, calc_mode_desc,
+                            alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
                             slider_help,
                             model_a, model_b, model_c, model_d,
                             merge_button
@@ -1539,7 +1447,7 @@ def on_ui_tabs():
                             merge_mode_selector,
                             calc_mode_selector,
                             model_a, model_b, model_c, model_d,
-                            alpha, beta, gamma, delta, epsilon,
+                            alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
                             weight_editor,
                             preset_output,              # ← Preset JSON
                             discard,
@@ -1547,7 +1455,8 @@ def on_ui_tabs():
                             clude_mode,
                             merge_seed,
                             enable_sliders,
-                            slider_slider, 
+                            copy_vae_from_primary,
+                            copy_clip_from_primary,
                             keep_zero_fill,    
                             bloat_mode,
                             dual_soul_toggle,
@@ -2382,7 +2291,7 @@ def start_merge(
     save_name, save_settings, finetune,
     merge_mode_selector, calc_mode_selector,
     model_a, model_b, model_c, model_d,
-    alpha, beta, gamma, delta, epsilon,
+    alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda_, mu, nu, xi, omicron, pi, rho, sigma, tau, upsilon,
     weight_editor, preset_output,
     discard, clude, clude_mode,
     merge_seed, enable_sliders,
@@ -2398,8 +2307,23 @@ def start_merge(
     allow_exact_key_fallback,
     allow_synthetic_custom_merge,
     allow_non_float_merges,
+    allow_scalar_merges,
     *custom_sliders
 ):
+    # DEBUG: Log what parameters start_merge() received from UI
+    print(f"[DEBUG] start_merge() received from UI:")
+    print(f"  copy_vae_from_primary={copy_vae_from_primary!r} (type: {type(copy_vae_from_primary).__name__})")
+    print(f"  copy_clip_from_primary={copy_clip_from_primary!r} (type: {type(copy_clip_from_primary).__name__})")
+    print(f"  keep_zero_fill={keep_zero_fill!r} (type: {type(keep_zero_fill).__name__})")
+    print(f"  bloat_mode={bloat_mode!r}")
+    print(f"  smart_resize_toggle={smartresize_toggle!r}")
+    print(f"  dual_soul_toggle={dual_soul_toggle!r}")
+    
+    # DEBUG: Show what's in cmn.opts at merge time
+    print(f"\n[DEBUG] Current options in cmn.opts.options:")
+    print(f"  copy_vae_from_primary: {cmn.opts.get('copy_vae_from_primary')}")
+    print(f"  keep_zero_fill: {cmn.opts.get('keep_zero_fill')}")
+    print(f"  smart_resize_toggle: {cmn.opts.get('smart_resize_toggle')}")
     progress = Progress()
 
     # ------------------------------------------------------------
@@ -2427,15 +2351,15 @@ def start_merge(
     )
 
     dual_soul_toggle = bool(
-        pick(dual_soul_toggle, "force_cross_arch", False)
+        pick(dual_soul_toggle, "dual_soul_toggle", False)
     )
 
     sacred_keys_toggle = bool(
-        pick(sacred_keys_toggle, "force_sacred_keys", False)
+        pick(sacred_keys_toggle, "sacred_keys_toggle", False)
     )
 
     smartresize_toggle = bool(
-        pick(smartresize_toggle, "force_smartresize", True)
+        pick(smartresize_toggle, "smart_resize_toggle", True)
     )
 
     specific_selectors_first = bool(
@@ -2472,13 +2396,11 @@ def start_merge(
     )
 
     allow_scalar_merges = bool(
-        cmn.opts.get("allow_scalar_merges", True)
+        pick(allow_scalar_merges, "allow_scalar_merges", True)
     )
 
     assert isinstance(allow_scalar_merges, bool), \
         "allow_scalar_merges must be a boolean"
-
-    cmn.allow_scalar_merges = allow_scalar_merges
 
     print(
         f"[Policy] Scalar merges "
@@ -2488,14 +2410,19 @@ def start_merge(
     cmn.keep_zero_fill = keep_zero_fill
     cmn.bloat_mode = bloat_mode
 
-    cmn.dual_soul_enabled = dual_soul_toggle
-    cmn.sacred_enabled = sacred_keys_toggle
-    cmn.smartresize_enabled = smartresize_toggle
+    cmn.dual_soul_toggle = dual_soul_toggle
+    cmn.sacred_toggle = sacred_keys_toggle
+    cmn.smartresize_toggle = smartresize_toggle
 
     cmn.allow_glob_fallback = allow_glob_fallback
     cmn.allow_exact_key_fallback = allow_exact_key_fallback
     cmn.allow_synthetic_custom_merge = allow_synthetic_custom_merge
     cmn.allow_non_float_merges = allow_non_float_merges
+
+    cmn.allow_scalar_merges = allow_scalar_merges
+
+    cmn.copy_vae_from_primary = copy_vae_from_primary
+    cmn.copy_clip_from_primary = copy_clip_from_primary
 
     # ------------------------------------------------------------
     # Debug: prove who won (UI vs opts)
@@ -2549,6 +2476,21 @@ def start_merge(
             gamma,
             delta,
             epsilon,
+            zeta,
+            eta,
+            theta,
+            iota,
+            kappa,
+            lambda_,
+            mu,
+            nu,
+            xi,
+            omicron,
+            pi,
+            rho,
+            sigma,
+            tau,
+            upsilon,
             weight_editor,
             preset_output or "",
             discard or "",
@@ -2571,6 +2513,7 @@ def start_merge(
             allow_exact_key_fallback=allow_exact_key_fallback,
             allow_synthetic_custom_merge=allow_synthetic_custom_merge,
             allow_non_float_merges=allow_non_float_merges,
+            allow_scalar_merges=allow_scalar_merges
         )
 
 

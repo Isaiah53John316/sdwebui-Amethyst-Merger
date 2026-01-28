@@ -14,7 +14,7 @@ class MergeMode:
     name = 'mergemode'
     description = 'description'
     input_models = 4
-    input_sliders = 5 
+    input_sliders = 20 
 
     slid_a_info = '-'
     slid_a_config = (-1, 2, 0.01)
@@ -26,8 +26,38 @@ class MergeMode:
     slid_d_config = (-1, 2, 0.01)
     slid_e_info = '-' 
     slid_e_config = (-1, 2, 0.01)
+    slid_f_info = '-'
+    slid_f_config = (-1, 2, 0.01)
+    slid_g_info = '-'
+    slid_g_config = (-1, 2, 0.01)
+    slid_h_info = '-'
+    slid_h_config = (-1, 2, 0.01)
+    slid_i_info = '-'
+    slid_i_config = (-1, 2, 0.01)
+    slid_j_info = '-'
+    slid_j_config = (-1, 2, 0.01)
+    slid_k_info = '-'
+    slid_k_config = (-1, 2, 0.01)
+    slid_l_info = '-'
+    slid_l_config = (-1, 2, 0.01)
+    slid_m_info = '-'
+    slid_m_config = (-1, 2, 0.01)
+    slid_n_info = '-'
+    slid_n_config = (-1, 2, 0.01)
+    slid_o_info = '-'
+    slid_o_config = (-1, 2, 0.01)
+    slid_p_info = '-'
+    slid_p_config = (-1, 2, 0.01)
+    slid_q_info = '-'
+    slid_q_config = (-1, 2, 0.01)
+    slid_r_info = '-'
+    slid_r_config = (-1, 2, 0.01)
+    slid_s_info = '-'
+    slid_s_config = (-1, 2, 0.01)
+    slid_t_info = '-'
+    slid_t_config = (-1, 2, 0.01)
 
-    def create_recipe(self, key, model_a, model_b, model_c, model_d, seed=False, alpha=0, beta=0, gamma=0, delta=0, epsilon=0) -> opr.Operation:
+    def create_recipe(self, key, model_a, model_b, model_c, model_d, seed=False, alpha=0, beta=0, gamma=0, delta=0, epsilon=0, zeta=0, eta=0, theta=0, iota=0, kappa=0, lambda_=0, mu=0, nu=0, xi=0, omicron=0, pi=0, rho=0, sigma=0, tau=0, upsilon=0) -> opr.Operation:
         """Create the base operation tree structure"""
         raise NotImplementedError
 
@@ -1284,34 +1314,81 @@ CALCMODES_LIST.append(HybridCascadeSimple3Calc)
 class HybridCascadeCalc(CalcMode):
     name = "HybridCascade"
     description = (
-        "Block-aware hybrid merge that automatically selects "
-        "the safest or most expressive operator per layer "
-        "(AdaptiveLERP / DAREWISE / TrainDiff / TIES)"
+        "Block-aware hybrid merge with 20 sliders for full control "
+        "(confidence, depth bias, TrainDiff, TIES, DAREWISE, CLIP/VAE, Noise, UNet)"
     )
-    compatible_modes = ["Weight-Sum", "Add Difference", "QuadSum"]
+    compatible_modes = ['all']
     input_models = 4  # works with 2–4
 
     # ----------------------------------
-    # Slider definitions (A–E)
+    # Slider definitions (A–T = 20 sliders)
     # ----------------------------------
 
-    slid_a_info = "Global Confidence (0 = stable, 1 = expressive)"
+    # Core personality & depth
+    slid_a_info = "A: Global Confidence (0=stable, 1=expressive)"
     slid_a_config = (0.0, 1.0, 0.01)
 
-    slid_b_info = "Depth Bias Strength (early stable → late expressive)"
+    slid_b_info = "B: None"
     slid_b_config = (0.0, 1.0, 0.01)
 
-    slid_c_info = "TrainDiff Strength (training-style delta injection)"
+    slid_c_info = "C: TrainDiff Strength (0=off, 1=full)"
     slid_c_config = (0.0, 1.0, 0.01)
 
-    slid_d_info = "DARE/WISE Density (detail vs sparsity)"
+    slid_d_info = "D: DARE/WISE Density (sparsity control)"
     slid_d_config = (0.05, 0.6, 0.01)
 
-    slid_e_info = "TIES Pre-sparsity (0 = off)"
+    slid_e_info = "E: TIES Pre-sparsity (0=off)"
     slid_e_config = (0.0, 0.6, 0.01)
 
-    # slid_f_info = "Weight Temperature (advanced)"      # ← intentionally disabled
-    # slid_f_config = (0.5, 3.0, 0.05)
+    # Depth bias parameters
+    slid_f_info = "F: Depth → Confidence (detail willingness)"
+    slid_f_config = (0.0, 1.0, 0.01)
+
+    slid_g_info = "G: Depth → Mix (LERP vs MEAN)"
+    slid_g_config = (0.0, 1.0, 0.01)
+
+    slid_h_info = "H: Depth → TrainDiff (scaling)"
+    slid_h_config = (0.0, 1.0, 0.01)
+
+    slid_i_info = "I: Depth Curve (concentration)"
+    slid_i_config = (0.1, 3.0, 0.05)
+
+    slid_j_info = "J: Depth Response Gain (nonlinearity)"
+    slid_j_config = (0.5, 2.5, 0.05)
+
+    # AdaptiveLERP confidence curve
+    slid_k_info = "K: UNet LERP Early Conf (early blocks)"
+    slid_k_config = (0.0, 1.0, 0.01)
+
+    slid_l_info = "L: UNet LERP Late Conf (late blocks)"
+    slid_l_config = (0.0, 1.0, 0.01)
+
+    slid_m_info = "M: UNet LERP Curve (shape)"
+    slid_m_config = (0.5, 3.0, 0.05)
+
+    # TIES depth bias
+    slid_n_info = "N: TIES Density Early (early sparsity)"
+    slid_n_config = (0.0, 0.8, 0.01)
+
+    slid_o_info = "O: TIES Density Late (late sparsity)"
+    slid_o_config = (0.0, 0.8, 0.01)
+
+    slid_p_info = "P: TIES Depth Curve (bias shape)"
+    slid_p_config = (0.5, 3.0, 0.05)
+
+    # AnchoredSLERP & detail ops
+    slid_q_info = "Q: AnchoredSLERP Step (detail intensity)"
+    slid_q_config = (0.1, 1.5, 0.05)
+
+    slid_r_info = "R: AnchoredSLERP Conf Min (threshold)"
+    slid_r_config = (0.0, 1.0, 0.01)
+
+    # Advanced: CLIP/VAE & Noise profiles
+    slid_s_info = "S: CLIP/VAE Mix (stability)"
+    slid_s_config = (0.0, 1.0, 0.01)
+
+    slid_t_info = "T: Noise Mix (time embed stability)"
+    slid_t_config = (0.0, 1.0, 0.01)
 
     # ----------------------------------
     # Recipe builder
@@ -1323,11 +1400,26 @@ class HybridCascadeCalc(CalcMode):
         model_b,
         model_c,
         model_d,
-        alpha=0.55,   # confidence
-        beta=0.45,   # depth bias
-        gamma=0.3,   # TrainDiff strength
-        delta=0.3,  # DARE/WISE density
-        epsilon=0.0, # TIES density
+        alpha=0.55,   # A: confidence
+        beta=0.45,    # B: None
+        gamma=0.3,    # C: TrainDiff strength
+        delta=0.3,    # D: DARE/WISE density
+        epsilon=0.35,  # E: TIES density
+        zeta=0.35,    # F: depth_conf_strength
+        eta=0.25,     # G: depth_mix_strength
+        theta=0.20,   # H: depth_traindiff_strength
+        iota=1.25,    # I: depth_curve
+        kappa=1.25,   # J: depth_response_gain
+        lambda_=0.40, # K: unet_lerp_conf_early
+        mu=0.70,      # L: unet_lerp_conf_late
+        nu=1.35,      # M: unet_lerp_conf_curve
+        xi=0.45,      # N: ties_density_early
+        omicron=0.18, # O: ties_density_late
+        pi_=1.25,     # P: ties_depth_curve
+        rho=0.75,     # Q: anchored_slerp_max_step
+        sigma=0.42,   # R: anchored_slerp_conf_min
+        tau=0.60,     # S: clip_vae_mix
+        upsilon=0.40, # T: noise_mix
         **kwargs
     ):
         a = opr.LoadTensor(key, model_a)
@@ -1346,7 +1438,7 @@ class HybridCascadeCalc(CalcMode):
             tensors.append(d)
             weights.append(1.0)
 
-        # Normalize weights (primary-dominant handled inside HybridCascade)
+        # Normalize weights
         total = sum(weights)
         weights = [w / total for w in weights]
 
@@ -1355,30 +1447,73 @@ class HybridCascadeCalc(CalcMode):
             weights,
             *tensors,
 
-            # ---- global personality ----
+            # -------- Global personality --------
             confidence=alpha,
 
-            # ---- depth bias ----
+            # -------- Depth bias controls --------
             depth_bias_enabled=True,
-            depth_conf_strength=beta,
-            depth_mix_strength=beta * 0.75,
-            depth_traindiff_strength=beta,
+            depth_conf_strength=zeta,
+            depth_mix_strength=eta,
+            depth_traindiff_strength=theta,
+            depth_curve=iota,
+            depth_response_gain=kappa,
 
-            # ---- TrainDiff ----
+            # -------- AdaptiveLERP confidence curve --------
+            unet_lerp_conf_early=lambda_,
+            unet_lerp_conf_late=mu,
+            unet_lerp_conf_curve=nu,
+
+            # -------- TrainDiff --------
             use_traindiff=gamma > 0.01,
             traindiff_strength=gamma,
+            traindiff_top_k=3,
+            traindiff_zero_center=True,
+            traindiff_max_delta_ratio=1.25,
 
-            # ---- DARE / WISE ----
+            # -------- TIES --------
+            use_ties=epsilon > 0.01,
+            ties_density=epsilon,
+            ties_depth_bias_enabled=True,
+            ties_density_early=xi,
+            ties_density_late=omicron,
+            ties_depth_curve=pi_,
+            ties_attention_selective=True,
+            ties_attention_include_outproj=False,
+            ties_attention_density_scale=0.75,
+
+            # -------- DARE / WISE --------
             dare_density=delta,
             wise_density=delta,
             dare_dropout=0.10,
             wise_dropout=0.30,
+            darewise_conf_min=0.52,
 
-            # ---- optional TIES ----
-            use_ties=epsilon > 0.01,
-            ties_density=epsilon,
+            # -------- AnchoredSLERP --------
+            use_anchored_slerp=True,
+            anchored_slerp_max_step=rho,
+            anchored_slerp_conf_min=sigma,
+            anchored_slerp_depth_curve=1.10,
 
+            # -------- CLIP/VAE & Noise profiles --------
+            clip_vae_mix=tau,
+            clip_vae_conf=0.35,
+            clip_vae_temp=2.5,
+            noise_mix=upsilon,
+            noise_conf=0.25,
+            noise_temp=2.5,
+
+            # -------- UNet general --------
+            unet_mix=1.0,
+            unet_temp=1.0,
+
+            # -------- Seeds & misc --------
             seed=cmn.last_merge_seed or 42,
+            ties_seed=42,
+            
+            # -------- Learned depth (auto-stabilize) --------
+            learned_depth_enabled=True,
+            learned_depth_blend=0.40,
+            learned_depth_curve=1.20,
         )
 
 
@@ -1387,8 +1522,8 @@ CALCMODES_LIST.append(HybridCascadeCalc)
 class HybridCascadeLiteCalc(CalcMode):
     name = "Hybrid Cascade Lite"
     description = "Key-aware, depth-biased adaptive merge (fallback-safe)"
-    compatible_modes = ["Weight-Sum", "Add Difference",]
-    input_models = 2
+    compatible_modes = ['All']
+    input_models = 4
 
     slid_a_info = "Blend ratio (0 = A, 1 = B)"
     slid_a_config = (0.0, 1.0, 0.01)
@@ -1417,6 +1552,8 @@ class HybridCascadeLiteCalc(CalcMode):
     ):
         a = opr.LoadTensor(key, model_a)
         b = opr.LoadTensor(key, model_b)
+        c = opr.LoadTensor(key, model_c)
+        d = opr.LoadTensor(key, model_d)
 
         weights = [1.0 - alpha, alpha]
 
@@ -1425,6 +1562,8 @@ class HybridCascadeLiteCalc(CalcMode):
             weights,
             a,
             b,
+            c,
+            d,
             base_mix=beta,
             confidence=gamma,
             depth_bias=delta,

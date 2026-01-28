@@ -494,7 +494,7 @@ def save_state_dict(
         desc = "custom merge"
 
     metadata = {
-        "modelspec.author": "Amethyst Merger",
+        "modelspec.author": "Unknown",
         "modelspec.description": desc,
         "modelspec.format": "safetensors",
     }

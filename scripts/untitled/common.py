@@ -7,81 +7,31 @@ from modules import shared
 from safetensors.torch import safe_open
  
 SACRED_PATTERNS = (
-    # ── Sampling-critical (noise / timestep math) ──
-    "conv_in.",
-    "input_blocks.0.0.",
+    # ── Noise / timestep math (highest risk) ──
     "time_embed.",
     "time_embedding",
     "timestep_embed",
     "timestep_embedding",
-    "time_in.",
-    "vector_in.",
-    "img_in.",
+    "sigma_embed",
+    "learned_sigma",
     "offset_noise",
     "noise_offset",
     "noise_augmentor",
-    "learned_sigma",
-    "sigma_embed",
 
-    # ── Input stems / patch embeddings ──
-    "patch_embed",
-    "patch_embedding",
-    "input_proj",
-    "input_projection",
-    "stem.",
-    "image_embed",
-    "image_embedding",
+    # ── Input stem / first convolution ──
+    "conv_in.",
+    "input_blocks.0.0.",
 
-    # ── Latent space (VAE scale & decode stability) ──
+    # ── VAE core (decode stability) ──
     "first_stage_model.",
     "vae.",
-    "encoder.",
-    "decoder.",
     "quant_conv.",
     "post_quant_conv.",
 
-    # ── Semantic space (CLIP / text encoders) ──
-    "cond_stage_model.",
-    "conditioner.",
-    "text_model.",
-    "text_model.embeddings",
-    "token_embedding",
-    "position_embedding",
-    "positional_embedding",
-    "text_projection",
+    # ── CLIP scale & projection (scalar-sensitive) ──
     "logit_scale",
-
-    # ── Cross-modal gating & modulation ──
-    "gate",
-    "gating",
-    "modulator",
-    "modulation",
-    "scale_shift",
-    "scale_and_shift",
-    "affine",
-
-    # ── Adaptive / conditional normalization ──
-    "adaptive_norm",
-    "conditional_norm",
-    "ada_norm",
-    "ada_layernorm",
-    "ada_ln",
-
-    # ── Flux / SD3 / modern transformer stems ──
-    "single_blocks",
-    "double_blocks",
-    "img_proj",
-    "txt_proj",
-    "x_embedder",
-    "context_embedder",
-    "t_embedder",
-
-    # ── Positional embeddings (architecture-agnostic) ──
-    "pos_embed",
-    "position_emb",
-    "position_ids",
+    "text_projection",
 )
-
 
 # ============================================================
 # MODEL COMPONENT PREFIXES
@@ -236,9 +186,9 @@ class MergerContext:
         # ─────────────────────────────────────────────
         # POLICY FLAGS (explicit, no magic attributes)
         # ─────────────────────────────────────────────
-        self.dual_soul_enabled = False
-        self.sacred_enabled = False
-        self.smartresize_enabled = True
+        self.dual_soul_toggle = False
+        self.sacred_toggle = False
+        self.smartresize_toggle = True
 
         # Execution control
         self.stop = False
@@ -251,11 +201,18 @@ class MergerContext:
         # Merge permissions
         self.allow_non_float_merges = True
         self.allow_synthetic_custom_merge = True
+
+        # Selector resolution
+        self.specific_selectors_first = True
         self.allow_glob_fallback = True
         self.allow_exact_key_fallback = True
 
         # Scalar policy
         self.allow_scalar_merges = True
+
+        # Component copying
+        self.copy_vae_from_primary = False
+        self.copy_clip_from_primary = False
 
     # -------------------------------------------------
     # Accessors
@@ -360,9 +317,9 @@ class MergerContext:
             confidence=float(self.get_opt("fallback_confidence", 0.5)),
 
             # CLIP / VAE (safer)
-            clip_mix=float(self.get_opt("clip_vae_lerp_mix", 0.6)),
-            clip_conf=float(self.get_opt("clip_vae_confidence", 0.35)),
-            clip_temp=float(self.get_opt("clip_vae_lerp_temp", 2.0)),
+            clip_mix=float(self.get_opt("clip_vae_lerp_mix", 0.35)),
+            clip_conf=float(self.get_opt("clip_vae_confidence", 0.20)),
+            clip_temp=float(self.get_opt("clip_vae_lerp_temp", 3.0)),
 
             # Noise / timestep (ultra-safe)
             noise_mix=float(self.get_opt("noise_lerp_mix", 0.4)),
@@ -483,22 +440,20 @@ def safe_apply(op, base, other, key=None):
     if not isinstance(base, torch.Tensor) or not isinstance(other, torch.Tensor):
         if key:
             print(f"[SafeOp] Non-tensor operand skipped: {key}")
-        return base
+        return None
 
-    # 🚨 Scalars are forbidden
     if base.ndim == 0 or other.ndim == 0:
         if key:
             print(f"[SafeOp] Scalar operand blocked: {key}")
-        return base
+        return None
 
-    # Shape enforcement
     if base.shape != other.shape:
         if key:
             print(
                 f"[SafeOp] Shape mismatch skipped: {key} "
                 f"{tuple(base.shape)} vs {tuple(other.shape)}"
             )
-        return base
+        return None
 
     return op(base, other)
 
