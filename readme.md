@@ -1,32 +1,13 @@
 # Personal Edits and Fixes:
-- UI updated - Huge WIP.
-- Performance optimizations and memory optimizations.
-- LoRA tab fixes. Autosave toggle added. Model now loads after merge even if you don't choose to save to disk for better testing of LoRA to checkpoint merges. 
-- Be sure to enter name for the checkpoint to be saved on LoRA Tab for saving (same for LoRA to LoRA). 2 - 6+ LoRAs can be merged at once now into the same checkpoint with individual weight adjustment.
-- LoRA to LoRA merge now has checkboxes for selection and can now merge differant tensor sizes together. 
-- Fixed save with model_ema removed from Discard causing crash. Removing clip from excluded does allow the clip to be merged changing the output.
-- History and Preset Tab added.
-
-- SD 1.5 and FLUX to SDXL model merge capability added via switch. Highly suggest a very low ingest rate. Experiment with different merge modes. Some work better than others. SLERP and Add Dissimilarities to start.
-- May new Merge modes added. Everything up to SLERP should work fine. Use the mode switch if you plan to do cross model merging. I've yet to do proper testing with the rest. Please report any errors encountered - be careful of memory overflow errors.
-- Updated DARE and Train Differance and Smooth Mix (only A - B) with additional Smooth Mix Train Diff mixed mode for 3 model ingest.
-- 
-- ---------------------------------------------------------------------------------------------------------
-
-- Works now with Dev branch of Automatic1111 - needed for 50xx: This is not required for normal function: 
-- I suggest updating your xformers for performance increase with additional line of "set XFORMERS_PACKAGE=xformers==0.0.30" in your start.bat, and using the most recent Flash Attention for the Python version you use. 
-- I use 3.11 Python and 12:8 CUDA in Automatic1111 so for me it would be: https://github.com/PLISGOOD/flash-attention-windows-wheels/releases/tag/v2.7.4.post1. Update in venv - Use a AI to help figure out which version you need and how to install it.
-- Use these command lines in the start.bat to force enable for 50xx users. "set COMMANDLINE_ARGS=--force-enable-xformers --xformers-flash-attention".
-
------------------------------------------------------------------------------------------------------------
+- Main: This version is old and will be replaced soon. I just need to test certain merge modes first.
+- Dev: Use this version unless you have trouble with cross arch merging or Lora merging.
+- Cross architecture merging.
+- Many more merge modes.
+- Detailed toggles for how to handle keys.
 
 Planned:
-- Cleanup UI
-- Save loaded checkpoint on LoRA tab. 
-- Save loaded checkpoint FP32 support. 
-- Forge ( & Neo ) support - it probably will need a seperate branch - hopefully not.
-- Make it so Dissimular tensor sizes are possible to merge from Lora to Checkpoint. Lora to Lora tensor size mismatch already works - so you could just do that first and then ingest the resulting Lora into Checkpoint as things stand now.
-
+- Dev version is far more robust and updated, however it has not been fully tested for cross-arch merging. Its mainly for sdxl to sdxl at the moment, however the capability is there.
+- 
 - Please report any errors with logs.
 
 Feel free to use anything you see. Many thanks and credit to all below for all their hard work.
